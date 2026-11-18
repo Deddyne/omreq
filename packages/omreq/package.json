@@ -2,7 +2,7 @@
   "name": "omreq",
   "version": "0.0.0-internal.1",
   "private": true,
-  "description": "Internal qualification prototype of a Rust HTTP client for Node and Bun",
+  "description": "HTTP client for Node.js and Bun that looks like Chrome on the wire (TLS, HTTP/2, headers), powered by Rust and BoringSSL",
   "license": "MIT",
   "type": "commonjs",
   "main": "./dist/index.js",

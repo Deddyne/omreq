@@ -94,6 +94,8 @@ pub fn check_profile(text: String) -> Result<String> {
                 ca: None,
                 trust_store: None,
                 cookies: true,
+                proxies: Vec::new(),
+                resolve: Default::default(),
             },
         );
         if validation.is_err() {

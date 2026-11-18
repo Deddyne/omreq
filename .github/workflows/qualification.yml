@@ -30,7 +30,7 @@ jobs:
       - run: test "$(uname -m)" = arm64
       - run: npm install --global pnpm@11.22.0
       - run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index

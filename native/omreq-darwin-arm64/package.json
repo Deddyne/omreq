@@ -2,7 +2,7 @@
   "name": "omreq-darwin-arm64",
   "version": "0.0.0-internal.1",
   "private": true,
-  "description": "Internal macOS arm64 native binary for Omreq qualification",
+  "description": "macOS arm64 native module for omreq",
   "main": "omreq.node",
   "os": ["darwin"],
   "cpu": ["arm64"],

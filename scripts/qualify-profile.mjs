@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { checkProfile, getRuntimeInfo, parseProfile } from '../packages/omreq/dist/index.mjs';
 import { artifactIdentity } from './artifact-identity.mjs';
 
-const candidatePath = 'profiles/chrome-157-macos-arm64.candidate.json';
+const candidatePath = 'profiles/chrome-157-macos.json';
 const profile = parseProfile(await readFile(candidatePath, 'utf8'));
 const samples = Number(process.argv[2] ?? 16);
 if (!Number.isSafeInteger(samples) || samples < 2 || samples > 64)

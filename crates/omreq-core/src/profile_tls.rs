@@ -286,10 +286,8 @@ mod tests {
     }
     #[test]
     fn candidate_ids_are_in_the_pinned_chromium_root_set() {
-        let input: Value = serde_json::from_str(include_str!(
-            "../../../profiles/chrome-157-macos-arm64.candidate.json"
-        ))
-        .unwrap();
+        let input: Value =
+            serde_json::from_str(include_str!("../../../profiles/chrome-157-macos.json")).unwrap();
         let tls = build(&normalize(&input["transport"]["tls"], "auto").unwrap()).unwrap();
         let mut ids = tls.trust_anchors.unwrap().into_owned();
         while !ids.is_empty() {

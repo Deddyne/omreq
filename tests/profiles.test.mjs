@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import test from 'node:test';
+import { fixture } from '../fixtures/server.mjs';
 import {
   checkProfile,
   createClient,
@@ -10,15 +11,13 @@ import {
   getProfile,
   getRuntimeInfo,
   isOmreqError,
+  listProfiles,
   OmreqError,
   parseProfile,
   serializeProfile,
 } from '../packages/omreq/dist/index.mjs';
 
-const profileText = readFileSync(
-  new URL('../profiles/custom-default.json', import.meta.url),
-  'utf8',
-);
+const profileText = readFileSync(new URL('../profiles/neutral.json', import.meta.url), 'utf8');
 const canonical = (v) =>
   Array.isArray(v)
     ? `[${v.map(canonical).join(',')}]`
@@ -39,7 +38,7 @@ test('T22: TS/JSON, canonical effective digest and immutable snapshots', async (
   const b = await checkProfile(json);
   assert.equal(a.profileDigest, b.profileDigest);
   assert.equal(a.compatible, true);
-  assert.equal(a.verification, 'custom-unverified');
+  assert.equal(a.verification, 'bundled-verified', 'the neutral profile is bundled');
   assert.equal(
     a.profileDigest,
     createHash('sha256').update(canonical(a.normalizedConfig)).digest('hex'),
@@ -104,7 +103,9 @@ test('T22: parser rejects duplicates, invalid JSON, accessors, cycles, unknown f
   const cyclic = JSON.parse(profileText);
   cyclic.transport = cyclic;
   assert.throws(() => defineProfile(cyclic), { code: 'ERR_PROFILE_INVALID' });
-  assert.throws(() => getProfile('chrome'), { code: 'ERR_PROFILE_UNKNOWN' });
+  assert.throws(() => getProfile('chrome-999'), { code: 'ERR_PROFILE_UNKNOWN' });
+  assert.equal(getProfile('chrome'), getProfile('chrome157'));
+  assert.equal(getProfile('neutral'), getProfile('omreq/custom-default'));
 });
 test('T22: unsupported capability is rejected before native request', async () => {
   const p = JSON.parse(profileText);
@@ -143,4 +144,34 @@ test('T22: native boundary validates schema, duplicate keys and integral decimal
     b = JSON.parse(addon.checkProfile(decimal));
   assert.equal(a.profileDigest, b.profileDigest);
   assert.equal(b.normalizedConfig.transport.http2.initialWindowSize, 123456);
+});
+
+test('named profiles: chrome is the default, neutral opts out of emulation', async () => {
+  const s = await fixture();
+  const chrome = createClient();
+  const neutral = createClient({ profile: 'neutral' });
+  try {
+    const sent = async (client) => (await (await client.get(`${s.url}/echo`)).json()).headers;
+    const browser = await sent(chrome);
+    assert.match(browser['user-agent'], /Chrome\/157/);
+    assert.equal(browser['sec-ch-ua-platform'], '"macOS"');
+    assert.equal(browser['accept-encoding'], 'gzip, deflate, br, zstd');
+    assert.match((await sent(neutral))['user-agent'], /^Omreq\//);
+    assert.equal(chrome.getInfo().profileId, 'chrome/157.0.8103.79-macos-arm64');
+    assert.equal(chrome.getInfo().verification, 'bundled-verified');
+    const listed = listProfiles();
+    assert.deepEqual(
+      listed.map((p) => [p.name, p.default]),
+      [
+        ['chrome157', true],
+        ['neutral', false],
+      ],
+    );
+    assert.deepEqual(listed[0].aliases, ['chrome', 'chrome/157.0.8103.79-macos-arm64']);
+    assert.throws(() => createClient({ profile: 'firefox' }), { code: 'ERR_PROFILE_UNKNOWN' });
+  } finally {
+    await chrome.close();
+    await neutral.close();
+    await s.close();
+  }
 });

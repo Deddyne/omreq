@@ -16,7 +16,8 @@ function redirect(res, location, cookies) {
 
 test('T06/T12: automatic cookies share the complete request header count and byte limits', async () => {
   const s = await fixture();
-  const c = createClient();
+  // The neutral profile adds two headers, so the limits below are reached by cookies.
+  const c = createClient({ profile: 'neutral' });
   try {
     await c.cookies.setCookie(`a=${'a'.repeat(3500)}; Path=/`, s.url);
     await c.cookies.setCookie(`b=${'b'.repeat(3500)}; Path=/`, s.url);

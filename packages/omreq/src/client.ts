@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { performance } from 'node:perf_hooks';
 import { invalid, keys, nativeError, OmreqError, positive } from './errors.js';
 import {
@@ -14,7 +15,15 @@ import {
   type NativeOperation,
   type ProfileCheck,
 } from './native.js';
-import { defineProfile, getProfile, type ProfileV1, serializeProfile } from './profile.js';
+import {
+  DEFAULT_PROFILE,
+  defineProfile,
+  getProfile,
+  isBundledProfile,
+  type ProfileName,
+  type ProfileV1,
+  serializeProfile,
+} from './profile.js';
 import {
   type DecodeOptions,
   OmreqResponse,
@@ -61,9 +70,37 @@ export interface RequestOptions extends RedirectOptions {
    */
   decompress?: boolean;
 }
+/**
+ * Proxy routes. `url` carries all traffic; `http`/`https` override it per
+ * target scheme. URLs use http, https, socks4, socks4a, socks5 or socks5h and
+ * may embed `user:password@` credentials. `noProxy` lists hosts, domains
+ * (matching subdomains), IPs or CIDR ranges that connect directly; `*`
+ * bypasses every proxy.
+ */
+export interface ProxyOptions {
+  url?: string | URL;
+  http?: string | URL;
+  https?: string | URL;
+  noProxy?: string | readonly string[];
+}
 export interface ClientOptions extends RedirectOptions {
+  /**
+   * A proxy URL, explicit routes, or `'env'` to read HTTP_PROXY, HTTPS_PROXY,
+   * ALL_PROXY and NO_PROXY once at construction. Omitted or `false`: direct
+   * connections; environment variables are never applied implicitly.
+   */
+  proxy?: string | URL | ProxyOptions | 'env' | false;
+  /**
+   * Fixed IP addresses per host name, used instead of DNS (like curl
+   * `--resolve`). The port and TLS server name still come from the URL.
+   */
+  resolve?: Readonly<Record<string, string | readonly string[]>>;
   cookies?: boolean;
-  profile?: string | ProfileV1;
+  /**
+   * `'chrome'` (default, the newest bundled Chrome), `'chrome157'`,
+   * `'neutral'` (no browser emulation) or a custom profile from defineProfile.
+   */
+  profile?: ProfileName | ProfileV1;
   baseUrl?: string | URL;
   headers?: HeaderInput;
   ca?: string;
@@ -81,6 +118,12 @@ export interface ClientOptions extends RedirectOptions {
   timeouts?: Timeouts;
   /** Default for RequestOptions.decompress; true when omitted. */
   decompress?: boolean;
+}
+export interface CloseOptions {
+  /** Let admitted requests and their bodies finish before closing. */
+  graceful?: boolean;
+  /** Upper bound for a graceful drain; remaining work is then cancelled. */
+  timeoutMs?: number;
 }
 export interface OriginAdmissionStats {
   readonly origin: string;
@@ -180,7 +223,109 @@ const clientKeys = [
   'connectMs',
   'timeouts',
   'decompress',
+  'proxy',
+  'resolve',
 ];
+function resolveMap(value: ClientOptions['resolve']): Record<string, string[]> {
+  if (value === undefined) return {};
+  if (typeof value !== 'object' || value === null || Array.isArray(value))
+    invalid('resolve: expected an object of host names to IP addresses');
+  const out: Record<string, string[]> = {};
+  const entries = Object.entries(value);
+  if (entries.length > 1024) invalid('resolve: at most 1024 hosts');
+  for (const [name, addrs] of entries) {
+    let host: string;
+    try {
+      host = new URL(`http://${name}/`).hostname;
+    } catch {
+      invalid(`resolve: invalid host name ${JSON.stringify(name)}`);
+    }
+    if (host !== name.toLowerCase() || host.startsWith('[') || isIP(host) !== 0)
+      invalid(`resolve: invalid host name ${JSON.stringify(name)}`);
+    const list = typeof addrs === 'string' ? [addrs] : addrs;
+    if (!Array.isArray(list) || list.length === 0 || list.length > 32)
+      invalid(`resolve.${name}: expected 1 to 32 IP addresses`);
+    out[host] = list.map((ip: unknown) => {
+      const text = typeof ip === 'string' ? ip.replace(/^\[(.*)\]$/, '$1') : '';
+      if (isIP(text) === 0) invalid(`resolve.${name}: ${JSON.stringify(ip)} is not an IP address`);
+      return text;
+    });
+  }
+  return out;
+}
+const PROXY_SCHEMES = ['http:', 'https:', 'socks4:', 'socks4a:', 'socks5:', 'socks5h:'];
+interface ProxyRoute {
+  scope: 'all' | 'http' | 'https';
+  url: string;
+  noProxy: string | null;
+}
+function proxyUrl(value: unknown, path: string): string {
+  if (!(typeof value === 'string' || value instanceof URL))
+    invalid(`${path}: expected a proxy URL`);
+  let text = String(value).trim();
+  // Environment values are often bare host:port.
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) text = `http://${text}`;
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    invalid(`${path}: expected a proxy URL`);
+  }
+  if (!PROXY_SCHEMES.includes(url.protocol) || url.hostname === '')
+    invalid(`${path}: expected an http, https, socks4, socks4a, socks5 or socks5h URL`);
+  if ((url.pathname !== '/' && url.pathname !== '') || url.search || url.hash)
+    invalid(`${path}: a proxy URL has no path, query or fragment`);
+  return url.href.replace(/\/$/, '');
+}
+function noProxyList(value: unknown, path: string): string | null {
+  if (value === undefined || value === null) return null;
+  const items =
+    typeof value === 'string'
+      ? value.split(',')
+      : Array.isArray(value) && value.every((v) => typeof v === 'string')
+        ? (value as string[])
+        : invalid(`${path}: expected a string or string array`);
+  const list = items.map((v) => v.trim()).filter(Boolean);
+  if (list.some((v) => /[\s,]/.test(v)))
+    invalid(`${path}: entries cannot contain spaces or commas`);
+  return list.length ? list.join(',') : null;
+}
+function env(name: string): string | undefined {
+  const value = process.env[name] ?? process.env[name.toLowerCase()];
+  return value?.trim() ? value : undefined;
+}
+/** Resolves the proxy option into ordered native routes. */
+export function proxyRoutes(option: ClientOptions['proxy']): ProxyRoute[] {
+  if (option === undefined || option === false) return [];
+  if (option === 'env') {
+    const all = env('ALL_PROXY');
+    // HTTP_PROXY is attacker-controlled in CGI ("httpoxy"); ignore it there.
+    const http = process.env.REQUEST_METHOD ? env('http_proxy') : env('HTTP_PROXY');
+    const https = env('HTTPS_PROXY');
+    const noProxy = env('NO_PROXY');
+    return proxyRoutes({
+      ...(all === undefined ? {} : { url: all }),
+      ...(http === undefined ? {} : { http }),
+      ...(https === undefined ? {} : { https }),
+      ...(noProxy === undefined ? {} : { noProxy }),
+    });
+  }
+  if (typeof option === 'string' || option instanceof URL)
+    return [{ scope: 'all', url: proxyUrl(option, 'proxy'), noProxy: null }];
+  if (typeof option !== 'object' || option === null)
+    invalid('proxy: expected a URL, an object, "env" or false');
+  keys(option, ['url', 'http', 'https', 'noProxy'], 'proxy');
+  const noProxy = noProxyList(option.noProxy, 'proxy.noProxy');
+  const routes: ProxyRoute[] = [];
+  // "*" bypasses every proxy (curl semantics), IP literals included.
+  const direct = noProxy?.split(',').includes('*') ?? false;
+  for (const scope of ['http', 'https'] as const)
+    if (option[scope] !== undefined)
+      routes.push({ scope, url: proxyUrl(option[scope], `proxy.${scope}`), noProxy });
+  if (option.url !== undefined)
+    routes.push({ scope: 'all', url: proxyUrl(option.url, 'proxy.url'), noProxy });
+  return direct ? [] : routes;
+}
 /** Trims the cookie WSP (space and HTAB) that Set-Cookie parsing ignores. */
 function trimWsp(value: string): string {
   return value.replace(/^[ \t]+|[ \t]+$/g, '');
@@ -311,6 +456,8 @@ function normalizedUrl(
 export class OmreqClient {
   readonly #profile: ProfileV1;
   readonly #options: ClientOptions;
+  readonly #proxies: readonly ProxyRoute[];
+  readonly #resolve: Readonly<Record<string, string[]>>;
   readonly #headers: HeaderInput;
   readonly #base: string | undefined;
   #native: NativeClient | undefined;
@@ -328,6 +475,9 @@ export class OmreqClient {
   #live = 0;
   #nextId = 0;
   #drained: (() => void) | undefined;
+  /** Set by a graceful close: new requests are refused, admitted ones finish. */
+  #draining = false;
+  #idle: (() => void)[] = [];
   // Request-independent layers, validated once.
   readonly #baseHeaders: ReadonlyMap<string, readonly Pair[]>;
   readonly #baseOverrides: readonly string[];
@@ -383,7 +533,7 @@ export class OmreqClient {
       typeof options.profile === 'string'
         ? getProfile(options.profile)
         : options.profile === undefined
-          ? getProfile('omreq/custom-default')
+          ? getProfile(DEFAULT_PROFILE)
           : defineProfile(options.profile);
     this.#headers = snapshotHeaders(options.headers);
     this.#base = options.baseUrl === undefined ? undefined : normalizedUrl(options.baseUrl);
@@ -423,6 +573,8 @@ export class OmreqClient {
       invalid('ca: expected PEM certificates');
     if (options.trustStore !== undefined && !['bundled', 'chromium'].includes(options.trustStore))
       invalid('trustStore: expected bundled or chromium');
+    this.#proxies = proxyRoutes(options.proxy);
+    this.#resolve = resolveMap(options.resolve);
     this.#options = {
       ...options,
       ...redirectPolicy(options),
@@ -488,6 +640,8 @@ export class OmreqClient {
             ca: this.#options.ca ?? null,
             trustStore: this.#options.trustStore ?? 'bundled',
             cookies: this.#options.cookies ?? true,
+            proxies: this.#proxies,
+            resolve: this.#resolve,
           }),
         );
         this.#native = native;
@@ -552,7 +706,10 @@ export class OmreqClient {
     const finish = () => {
       if (released) return;
       released = true;
-      if (admitted) this.#admitted--;
+      if (admitted && --this.#admitted === 0) {
+        const idle = this.#idle.splice(0);
+        for (const resolve of idle) resolve();
+      }
       if (onAbort) signal?.removeEventListener('abort', onAbort);
       this.#retained -= retained;
       retained = 0;
@@ -735,7 +892,7 @@ export class OmreqClient {
           this.#initializingRequests--;
           clearTimeout(initTimer);
         }
-        this.#assertOpen();
+        this.#assertOpen(false);
       }
       const admittedAt = performance.now();
       // A blocked JS thread can delay the timer callback. Check monotonic time
@@ -853,8 +1010,9 @@ export class OmreqClient {
       throw converted;
     }
   }
-  #assertOpen(): void {
-    if (this.#state === 'closing' || this.#state === 'closed')
+  /** `accepting`: also refuse new work while a graceful close drains. */
+  #assertOpen(accepting = true): void {
+    if (this.#state === 'closing' || this.#state === 'closed' || (accepting && this.#draining))
       throw new OmreqError('ERR_CLIENT_CLOSED', 'queue', 'Client is closed');
   }
   #verb(
@@ -897,10 +1055,26 @@ export class OmreqClient {
   [Symbol.asyncDispose](): Promise<void> {
     return this.close();
   }
-  close(): Promise<void> {
+  /**
+   * Closes the client. By default active and queued requests are cancelled.
+   * With `graceful: true` new requests are refused while admitted ones (and
+   * their response bodies) finish; after `timeoutMs` the rest is cancelled.
+   */
+  close(options: CloseOptions = {}): Promise<void> {
     if (this.#close) return this.#close;
-    this.#state = 'closing';
+    try {
+      if (!options || typeof options !== 'object') invalid('close options: expected an object');
+      keys(options, ['graceful', 'timeoutMs'], 'close');
+      if (options.graceful !== undefined && typeof options.graceful !== 'boolean')
+        invalid('close.graceful: expected a boolean');
+      if (options.timeoutMs !== undefined) positive(options.timeoutMs, 'close.timeoutMs');
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    this.#draining = true;
     this.#close = (async () => {
+      if (options.graceful) await this.#drain(options.timeoutMs);
+      this.#state = 'closing';
       try {
         if (this.#init) await this.#init.catch(() => {});
         for (const upload of this.#uploads) upload.stop();
@@ -918,6 +1092,27 @@ export class OmreqClient {
     })();
     return this.#close;
   }
+  async #drain(timeoutMs: number | undefined): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired =
+      timeoutMs === undefined
+        ? undefined
+        : new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, timeoutMs);
+          });
+    let timedOut = false;
+    void expired?.then(() => {
+      timedOut = true;
+    });
+    try {
+      while (this.#admitted > 0 && !timedOut) {
+        const idle = new Promise<void>((resolve) => this.#idle.push(resolve));
+        await (expired ? Promise.race([idle, expired]) : idle);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   getInfo() {
     return Object.freeze({
       state: this.#state,
@@ -925,7 +1120,7 @@ export class OmreqClient {
       profileId: this.#profile.id,
       profileDigest: this.#profileCheck?.profileDigest ?? null,
       engineBuildId: this.#profileCheck?.engineBuildId ?? null,
-      verification: 'custom-unverified',
+      verification: isBundledProfile(this.#profile) ? 'bundled-verified' : 'custom-unverified',
       trustStore: this.#options.trustStore ?? 'bundled',
       stage: 'internal-prototype',
     });

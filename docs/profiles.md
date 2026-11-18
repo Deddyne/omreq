@@ -12,8 +12,20 @@ import { createClient, defineProfile } from 'omreq';
 const client = createClient({ profile: defineProfile({ /* ... */ }) });
 ```
 
-When no profile is given, the client uses the bundled `omreq/custom-default` profile:
-transport defaults plus `user-agent: Omreq/<version>` and `accept: */*`.
+Most code only picks a bundled profile by name:
+
+| Name | Profile |
+| --- | --- |
+| `chrome` | the newest bundled Chrome — the default |
+| `chrome157` | Chrome 157.0.8103.79 on macOS ([`profiles/chrome-157-macos.json`](../profiles/chrome-157-macos.json)) |
+| `neutral` | transport defaults, `user-agent: Omreq/<version>`, `accept: */*` |
+
+```ts
+createClient(); // same as { profile: 'chrome' }
+createClient({ profile: 'neutral' });
+```
+
+The rest of this page is about writing your own profile.
 
 ## Why profiles
 
@@ -176,11 +188,23 @@ console.log(report.profileDigest, report.engineBuildId);
 ```ts
 import { getProfile, listProfiles } from 'omreq';
 
-listProfiles(); // [{ id: 'omreq/custom-default', revision: 1, ... }]
-const base = getProfile('omreq/custom-default');
+listProfiles();
+// [{ name: 'chrome157', aliases: ['chrome', …], default: true, … },
+//  { name: 'neutral', aliases: ['omreq/custom-default'], default: false, … }]
+
+// Start from a bundled profile and change one thing
+const base = getProfile('chrome');
+const custom = defineProfile({
+  ...structuredClone(base),
+  id: 'acme/chrome-de',
+  headers: base.headers.map(([name, value]) =>
+    name === 'accept-language' ? [name, 'de-DE,de;q=0.9'] : [name, value],
+  ),
+});
 ```
 
-Only `omreq/custom-default` is bundled. It is a neutral client profile, not a browser
-imitation. `profiles/chrome-157-macos-arm64.candidate.json` shows a full browser-shaped
-profile; it is compared byte-for-byte against a real Chrome on the wire by the project's
-qualification scripts and is not exported as a bundled profile.
+Bundled Chrome profiles are compared byte-for-byte with a real Chrome of the same version:
+the TLS ClientHello (GREASE values and permuted extensions normalized), the HTTP/1 request
+and the HTTP/2 connection preface, SETTINGS, WINDOW_UPDATE and first HEADERS frame. A
+`checkProfile` report and `client.getInfo()` say `verification: 'bundled-verified'` for an
+unmodified bundled profile and `'custom-unverified'` otherwise.

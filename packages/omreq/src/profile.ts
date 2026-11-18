@@ -1,5 +1,5 @@
 import type { Node as JsonNode, ParseError } from 'jsonc-parser';
-import defaultProfile from './default-profile.json';
+import bundledProfiles from './bundled-profiles.json';
 import { OmreqError } from './errors.js';
 import { MAX_HEADER_BYTES, MAX_HEADER_PAIRS, PROFILE_FORBIDDEN_HEADERS } from './headers.js';
 import { loadNative, type ProfileCheck } from './native.js';
@@ -18,7 +18,21 @@ export type ProfileV1 = DeepReadonly<ProfileInputV1>;
 // to be validated again; their canonical serialization is cached alongside.
 const validated = new WeakMap<object, string | undefined>();
 let jsonc: typeof import('jsonc-parser') | undefined;
-let builtinDefault: ProfileV1 | undefined;
+/**
+ * Bundled profile names. `'chrome'` is the newest bundled Chrome and the
+ * default; `'neutral'` is a plain client without browser emulation.
+ */
+export type ProfileName = 'chrome' | 'chrome157' | 'neutral';
+type BundledName = keyof typeof bundledProfiles;
+const ALIASES: Readonly<Record<string, BundledName>> = {
+  chrome: 'chrome157',
+  chrome157: 'chrome157',
+  'chrome/157.0.8103.79-macos-arm64': 'chrome157',
+  neutral: 'neutral',
+  'omreq/custom-default': 'neutral',
+};
+export const DEFAULT_PROFILE: ProfileName = 'chrome';
+const builtins = new Map<BundledName, ProfileV1>();
 function bad(path: string, message: string): never {
   throw new OmreqError('ERR_PROFILE_INVALID', 'configuration', `${path || '/'}: ${message}`);
 }
@@ -167,27 +181,51 @@ export function serializeProfile(profile: ProfileV1): string {
   }
   return text;
 }
-export function getProfile(id: string): ProfileV1 {
-  if (id !== 'omreq/custom-default')
+/** A bundled profile by name (`'chrome'`, `'chrome157'`, `'neutral'`) or id. */
+export function getProfile(name: ProfileName | (string & {})): ProfileV1 {
+  const key = typeof name === 'string' ? ALIASES[name] : undefined;
+  if (key === undefined)
     throw new OmreqError(
       'ERR_PROFILE_UNKNOWN',
       'configuration',
-      `No qualified bundled profile named ${id}`,
+      `Unknown profile ${JSON.stringify(name)}; expected one of ${Object.keys(ALIASES)
+        .filter((k) => !k.includes('/'))
+        .join(', ')}`,
     );
-  builtinDefault ??= defineProfile(defaultProfile);
-  return builtinDefault;
+  let profile = builtins.get(key);
+  if (!profile) {
+    profile = defineProfile(bundledProfiles[key]);
+    builtins.set(key, profile);
+  }
+  return profile;
+}
+/** True when the profile is byte-for-byte one of the bundled profiles. */
+export function isBundledProfile(profile: ProfileV1): boolean {
+  const text = serializeProfile(profile);
+  return (Object.keys(bundledProfiles) as BundledName[]).some(
+    (name) => serializeProfile(getProfile(name)) === text,
+  );
 }
 export function listProfiles() {
-  return Object.freeze([
-    {
-      id: 'omreq/custom-default',
-      revision: 1,
-      verification: 'custom-unverified' as const,
-      target: Object.freeze({ family: 'custom', platform: 'generic' }),
-    },
-  ]);
+  return Object.freeze(
+    (Object.keys(bundledProfiles) as BundledName[]).map((name) => {
+      const p = getProfile(name);
+      return Object.freeze({
+        name,
+        aliases: Object.freeze(
+          Object.keys(ALIASES).filter((k) => ALIASES[k] === name && k !== name),
+        ),
+        id: p.id,
+        revision: p.revision,
+        default: ALIASES[DEFAULT_PROFILE] === name,
+        verification: 'bundled-verified' as const,
+        target: p.target,
+      });
+    }),
+  );
 }
 export async function checkProfile(input: ProfileV1 | ProfileInputV1): Promise<ProfileCheck> {
   const p = defineProfile(input);
-  return JSON.parse(loadNative().checkProfile(serializeProfile(p))) as ProfileCheck;
+  const report = JSON.parse(loadNative().checkProfile(serializeProfile(p))) as ProfileCheck;
+  return isBundledProfile(p) ? { ...report, verification: 'bundled-verified' } : report;
 }

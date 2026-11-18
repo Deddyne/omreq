@@ -10,9 +10,14 @@ const generated = await compileFromFile(source, {
   additionalProperties: false,
 });
 await writeFile('packages/omreq/src/profile-types.ts', generated);
+// Bundled profiles by name. The newest Chrome is the default ('chrome').
+const bundled = {
+  chrome157: JSON.parse(await readFile('profiles/chrome-157-macos.json', 'utf8')),
+  neutral: JSON.parse(await readFile('profiles/neutral.json', 'utf8')),
+};
 await writeFile(
-  'packages/omreq/src/default-profile.json',
-  await readFile('profiles/custom-default.json'),
+  'packages/omreq/src/bundled-profiles.json',
+  `${JSON.stringify(bundled, null, 2)}\n`,
 );
 
 await writeFile('packages/omreq/src/bridge-version.json', await readFile('bridge.json'));

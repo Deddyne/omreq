@@ -12,10 +12,7 @@ import {
   parseProfile,
 } from '../packages/omreq/dist/index.mjs';
 
-const text = readFileSync(
-  new URL('../profiles/chrome-157-macos-arm64.candidate.json', import.meta.url),
-  'utf8',
-);
+const text = readFileSync(new URL('../profiles/chrome-157-macos.json', import.meta.url), 'utf8');
 const profile = parseProfile(text);
 const reference = parseClientHello(
   readFileSync(new URL('../fixtures/references/chrome157/clienthello.bin', import.meta.url)),
@@ -58,7 +55,7 @@ test('G1: candidate TLS first flight matches independent Chrome structure', asyn
     await request;
     const report = await checkProfile(profile);
     assert.equal(report.compatible, true);
-    assert.equal(report.verification, 'custom-unverified');
+    assert.equal(report.verification, 'bundled-verified');
   } finally {
     clearTimeout(timer);
     await c.close();

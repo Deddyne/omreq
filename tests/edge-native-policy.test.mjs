@@ -8,10 +8,7 @@ import test from 'node:test';
 import { fixture } from '../fixtures/server.mjs';
 import { checkProfile, createClient } from '../packages/omreq/dist/index.mjs';
 
-const profileText = readFileSync(
-  new URL('../profiles/custom-default.json', import.meta.url),
-  'utf8',
-);
+const profileText = readFileSync(new URL('../profiles/neutral.json', import.meta.url), 'utf8');
 const custom = (mutate) => {
   const p = JSON.parse(profileText);
   mutate(p);

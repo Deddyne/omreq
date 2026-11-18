@@ -303,7 +303,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const CUSTOM: &str = include_str!("../../../profiles/custom-default.json");
+    const CUSTOM: &str = include_str!("../../../profiles/neutral.json");
     #[test]
     fn schema_and_digest() {
         let p = Profile::parse(CUSTOM).unwrap();

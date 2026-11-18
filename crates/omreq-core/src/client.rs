@@ -155,6 +155,56 @@ pub struct ClientConfig {
     pub trust_store: Option<String>,
     #[serde(default = "enabled")]
     pub cookies: bool,
+    /// Proxies in match order; the first one whose scope and no-proxy list
+    /// accept a target carries it. Empty means direct connections only.
+    #[serde(default)]
+    pub proxies: Vec<ProxyConfig>,
+    /// Fixed addresses per lowercase host name, bypassing DNS (like curl
+    /// --resolve). The port always comes from the URL.
+    #[serde(default)]
+    pub resolve: std::collections::BTreeMap<String, Vec<std::net::IpAddr>>,
+}
+/// One proxy route. `scope` selects target schemes (`all`, `http`, `https`);
+/// `url` is `http`, `https`, `socks4`, `socks4a`, `socks5` or `socks5h`,
+/// optionally with `user:password@` credentials.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProxyConfig {
+    pub scope: String,
+    pub url: String,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+}
+impl ProxyConfig {
+    fn build(&self) -> Result<wreq::Proxy> {
+        let invalid = || {
+            Error::new(
+                "ERR_INVALID_ARGUMENT",
+                "configuration",
+                "proxy: expected an http, https, socks4, socks4a, socks5 or socks5h URL",
+            )
+        };
+        let parsed = url::Url::parse(&self.url).map_err(|_| invalid())?;
+        if !matches!(
+            parsed.scheme(),
+            "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+        ) || parsed.host_str().is_none_or(str::is_empty)
+        {
+            return Err(invalid());
+        }
+        let proxy = match self.scope.as_str() {
+            "all" => wreq::Proxy::all(self.url.as_str()),
+            "http" => wreq::Proxy::http(self.url.as_str()),
+            "https" => wreq::Proxy::https(self.url.as_str()),
+            _ => return Err(invalid()),
+        }
+        .map_err(|_| invalid())?;
+        Ok(proxy.no_proxy(
+            self.no_proxy
+                .as_deref()
+                .and_then(wreq::NoProxy::from_string),
+        ))
+    }
 }
 fn enabled() -> bool {
     true
@@ -643,6 +693,7 @@ impl CoreClient {
         let mut builder = Client::builder()
             .emulation(emulation)
             .socket_observer(Arc::new(connections.clone()))
+            // Environment and system proxies are never applied implicitly.
             .no_proxy()
             .retry(wreq::retry::Policy::never())
             .retry_canceled_requests(false)
@@ -659,6 +710,22 @@ impl CoreClient {
             .pool_max_idle_per_host(config.max_connections_per_origin)
             .pool_max_size(config.max_connections)
             .pool_idle_timeout(Duration::from_secs(30));
+        for proxy in &config.proxies {
+            builder = builder.proxy(proxy.build()?);
+        }
+        for (host, addrs) in &config.resolve {
+            if host.is_empty() || addrs.is_empty() || addrs.len() > 32 {
+                return Err(Error::new(
+                    "ERR_INVALID_ARGUMENT",
+                    "configuration",
+                    "resolve: expected 1 to 32 addresses per host",
+                ));
+            }
+            builder = builder.resolve_to_addrs(
+                host.clone(),
+                addrs.iter().map(|ip| std::net::SocketAddr::new(*ip, 0)),
+            );
+        }
         match profile.effective["transport"]["httpVersion"].as_str() {
             Some("1.1") => builder = builder.http1_only(),
             // HTTP/2 prior knowledge is forbidden for plain HTTP; execute checks the URL.
@@ -1992,7 +2059,7 @@ mod tests {
     use super::*;
     fn client() -> CoreClient {
         CoreClient::new(
-            &Profile::parse(include_str!("../../../profiles/custom-default.json")).unwrap(),
+            &Profile::parse(include_str!("../../../profiles/neutral.json")).unwrap(),
             ClientConfig {
                 max_active_operations: 1,
                 max_queued_operations: 1,
@@ -2004,6 +2071,8 @@ mod tests {
                 ca: None,
                 trust_store: None,
                 cookies: true,
+                proxies: Vec::new(),
+                resolve: Default::default(),
             },
         )
         .unwrap()

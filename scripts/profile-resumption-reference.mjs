@@ -8,9 +8,7 @@ import { http2WireFixture } from '../fixtures/http2-wire.mjs';
 import { runProfileClient } from '../fixtures/profile-client.mjs';
 import { parseProfile } from '../packages/omreq/dist/index.mjs';
 
-const profile = parseProfile(
-  await readFile('profiles/chrome-157-macos-arm64.candidate.json', 'utf8'),
-);
+const profile = parseProfile(await readFile('profiles/chrome-157-macos.json', 'utf8'));
 const out = 'artifacts/qualification/chrome157-resumption';
 const writeReference = process.argv.includes('--write-reference');
 assert(

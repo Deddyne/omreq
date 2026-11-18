@@ -12,6 +12,8 @@ All examples are TypeScript (ESM). CommonJS works the same way through
 - [Redirects](#redirects)
 - [Cookies](#cookies)
 - [Errors](#errors)
+- [Proxies](#proxies)
+- [DNS overrides](#dns-overrides)
 - [Limits and statistics](#limits-and-statistics)
 - [TLS and certificates](#tls-and-certificates)
 - [Profiles](#profiles)
@@ -19,8 +21,9 @@ All examples are TypeScript (ESM). CommonJS works the same way through
 ## Client lifecycle
 
 `createClient()` is synchronous and lazy: the native module loads and the transport
-starts on the first request. One client owns its connection pool, cookie jar and
-admission queues, so create one per configuration and reuse it.
+starts on the first request. One client owns its connection pool, TLS session cache,
+cookie jar and admission queues, so create one per configuration and reuse it. By
+default it presents itself as the newest bundled Chrome; see [Profiles](#profiles).
 
 ```ts
 import { createClient } from 'omreq';
@@ -41,6 +44,14 @@ try {
 
 ```ts
 await using client = createClient();
+```
+
+`close()` cancels whatever is still running. A graceful close refuses new requests but
+lets admitted ones, including their response bodies, finish first; `timeoutMs` bounds the
+wait, after which the rest is cancelled:
+
+```ts
+await client.close({ graceful: true, timeoutMs: 10_000 });
 ```
 
 ## Making requests
@@ -215,6 +226,9 @@ Timeouts are set per client and overridden per request. Values are milliseconds.
 | `timeouts.consumerIdleMs` | 60 000 | your code not reading an open body (`null` disables) |
 | `timeouts.totalMs` | `null` | the whole operation, including the body |
 
+`headersMs` starts when the request is dispatched, so it includes connecting; `connectMs`
+separately bounds every TCP and TLS connect.
+
 ```ts
 const client = createClient({ connectMs: 5_000, timeouts: { headersMs: 10_000 } });
 await client.get('slow', { timeouts: { totalMs: 2_000 } });
@@ -299,6 +313,54 @@ try {
 | `ERR_CLIENT_CLOSED` | the client was closed |
 | `ERR_INVALID_ARGUMENT` | a bad option or input |
 
+## Proxies
+
+```ts
+// One proxy for everything; credentials may be embedded (percent-encode special characters)
+createClient({ proxy: 'http://user:pass@proxy.example.com:8080' });
+
+// SOCKS: socks5h and socks4a resolve the target name at the proxy
+createClient({ proxy: 'socks5h://127.0.0.1:1080' });
+
+// Per target scheme, with direct connections for some hosts
+createClient({
+  proxy: {
+    http: 'http://proxy-a:3128',
+    https: 'http://proxy-b:3128',
+    noProxy: ['localhost', '.internal.example', '10.0.0.0/8'],
+  },
+});
+
+// HTTP_PROXY, HTTPS_PROXY, ALL_PROXY and NO_PROXY (or lowercase), read once
+createClient({ proxy: 'env' });
+```
+
+| Proxy URL scheme | Behavior |
+| --- | --- |
+| `http://` | plain HTTP is forwarded; HTTPS goes through a CONNECT tunnel |
+| `https://` | the same, with TLS to the proxy |
+| `socks5://`, `socks4://` | target name resolved locally |
+| `socks5h://`, `socks4a://` | target name resolved by the proxy |
+
+`noProxy` entries are host names (matching subdomains), IP addresses or CIDR ranges;
+`'*'` disables the proxy. Without a `proxy` option the client always connects directly and
+ignores proxy environment variables. HTTPS targets are tunnelled, so the TLS fingerprint
+and certificate verification stay end-to-end. Proxy failures reject with `ERR_PROXY`.
+
+## DNS overrides
+
+`resolve` pins host names to addresses, like curl's `--resolve`. The port, `Host` header
+and TLS server name still come from the URL; several addresses are tried in turn.
+
+```ts
+const client = createClient({
+  resolve: {
+    'api.example.com': '203.0.113.10',
+    'cdn.example.com': ['2001:db8::1', '203.0.113.11'],
+  },
+});
+```
+
 ## Limits and statistics
 
 All limits are enforced natively and can be tuned per client:
@@ -344,7 +406,24 @@ Chromium root store.
 
 A profile describes how the client looks on the wire: TLS versions, cipher suites,
 groups and extensions, HTTP/2 settings and pseudo-header order, HTTP/1 header casing and
-default headers. See [profiles.md](profiles.md).
+default headers. Pick a bundled one by name:
+
+```ts
+createClient(); // 'chrome': the newest bundled Chrome (Chrome 157)
+createClient({ profile: 'chrome157' }); // an exact version
+createClient({ profile: 'neutral' }); // no browser emulation
+```
+
+The Chrome profiles send Chrome's navigation headers. For API traffic, override the
+ones that should differ:
+
+```ts
+const api = createClient({
+  headers: { accept: 'application/json', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' },
+});
+```
+
+Or define your own — see [profiles.md](profiles.md):
 
 ```ts
 import { createClient, defineProfile } from 'omreq';

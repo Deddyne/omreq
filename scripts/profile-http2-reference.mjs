@@ -17,9 +17,7 @@ try {
   await browser.close();
   browser = undefined;
   fixture.label('omreq');
-  const profile = parseProfile(
-    await readFile('profiles/chrome-157-macos-arm64.candidate.json', 'utf8'),
-  );
+  const profile = parseProfile(await readFile('profiles/chrome-157-macos.json', 'utf8'));
   const clientResult = await runProfileClient(runtime, {
     profile,
     ca: fixture.ca,

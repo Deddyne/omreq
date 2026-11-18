@@ -211,7 +211,7 @@
     ]
   ],
   "provenance": {
-    "source": "Controlled local headed Chrome 157.0.8103.79, en-US document navigation, fresh/reused HTTP2 connection; candidate under qualification",
+    "source": "Headed Chrome 157.0.8103.79 on macOS arm64, en-US document navigation; TLS, HTTP/1 and HTTP/2 bytes verified against live capture",
     "date": "2026-11-15"
   }
 }

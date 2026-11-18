@@ -6,10 +6,7 @@ import { nodeWireFixture } from '../fixtures/node-wire.mjs';
 import { createClient, defineProfile, parseProfile } from '../packages/omreq/dist/index.mjs';
 
 const profile = parseProfile(
-  readFileSync(
-    new URL('../profiles/chrome-157-macos-arm64.candidate.json', import.meta.url),
-    'utf8',
-  ),
+  readFileSync(new URL('../profiles/chrome-157-macos.json', import.meta.url), 'utf8'),
 );
 const reference = JSON.parse(
   readFileSync(
@@ -17,6 +14,18 @@ const reference = JSON.parse(
     'utf8',
   ),
 );
+// A TLS 1.2 ticket is opaque server data: its length depends on the server's
+// TLS library (the reference was captured against another Node release), so
+// only whether a ticket is presented is compared here. The reference scripts
+// compare exact lengths against one shared server.
+function serverIndependent(hello) {
+  return {
+    ...hello,
+    extensions: hello.extensions.map((e) =>
+      e.id === 35 ? { id: 35, ticket: e.ticketLength > 0 } : e,
+    ),
+  };
+}
 for (const scenario of reference.scenarios)
   test(`G1/T23: ${scenario.tlsVersion} resumption matches Chrome and is isolated by client`, async () => {
     const fixture = await nodeWireFixture({
@@ -51,8 +60,10 @@ for (const scenario of reference.scenarios)
         const actual = firstSnapshot.handshakes[connection.handshake].hello;
         assert.equal(connection.cipher, expected.cipher);
         assert.deepEqual(
-          normalizedClientHello(actual),
-          normalizedClientHello(parseClientHello(Buffer.from(expected.rawHex, 'hex'))),
+          serverIndependent(normalizedClientHello(actual)),
+          serverIndependent(
+            normalizedClientHello(parseClientHello(Buffer.from(expected.rawHex, 'hex'))),
+          ),
         );
         if (scenario.tlsVersion === 'TLSv1.3')
           assert.equal(
