@@ -77,6 +77,7 @@ test('T21: lazy missing/mismatched native errors in isolated packages', async ()
         symlinkSync(
           dirname(require.resolve(`${dep}/package.json`)),
           join(dir, 'node_modules', dep),
+          'junction',
         );
       if (kind !== 'missing') {
         const native = join(dir, 'node_modules', nativePackage);

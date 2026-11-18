@@ -22,6 +22,7 @@ function isolated(stub) {
     symlinkSync(
       dirname(require.resolve(`${dependency}/package.json`)),
       join(dir, 'node_modules', dependency),
+      'junction',
     );
   if (stub !== undefined) {
     const native = join(dir, 'node_modules', nativePackage);
