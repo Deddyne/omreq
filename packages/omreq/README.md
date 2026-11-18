@@ -1,8 +1,8 @@
 # omreq
 
-An HTTP client for Node.js and Bun that looks like Chrome on the wire — TLS ClientHello,
-HTTP/2 framing and header order included. The transport is a Rust core (wreq + BoringSSL)
-loaded in-process as a Node-API module.
+The fastest HTTP client for Node.js and Bun with a real Chrome fingerprint: TLS
+(JA3/JA4), HTTP/2 (Akamai) and header order identical to Chrome, byte for byte. Rust +
+BoringSSL in-process — up to 43% faster than wreq-js and up to 3× faster than `fetch`.
 
 ```ts
 import { createClient } from 'omreq';

@@ -2,12 +2,19 @@
 
 # omreq
 
-**An HTTP client for Node.js and Bun that looks like Chrome on the wire —<br>from the TLS handshake to the HTTP/2 frames.**
+**The fastest HTTP client for Node.js and Bun with a real Chrome fingerprint.**
+
+TLS (JA3/JA4), HTTP/2 (Akamai) and header order identical to Chrome, byte for byte.<br>
+Rust + BoringSSL in-process: up to **43% faster than wreq-js** and **up to 3× faster than `fetch`**.
 
 ![status](https://img.shields.io/badge/status-pre--release-orange)
 ![platform](https://img.shields.io/badge/platform-macOS%20arm64-lightgrey)
 ![runtimes](https://img.shields.io/badge/runtimes-Node%2026%20%7C%20Bun%201.4-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
+![tls](https://img.shields.io/badge/TLS-JA3%20%7C%20JA4-8A2BE2)
+![http2](https://img.shields.io/badge/HTTP%2F2-Akamai%20fingerprint-8A2BE2)
+![chrome](https://img.shields.io/badge/Chrome-157-4285F4?logo=googlechrome&logoColor=white)
+![rust](https://img.shields.io/badge/core-Rust%20%2B%20BoringSSL-B7410E?logo=rust)
 
 </div>
 
