@@ -4,8 +4,10 @@ import { launchReferenceChrome } from '../fixtures/chrome.mjs';
 import { http2WireFixture } from '../fixtures/http2-wire.mjs';
 import { runProfileClient } from '../fixtures/profile-client.mjs';
 import { parseProfile } from '../packages/omreq/dist/index.mjs';
+import { selectedProfile } from './profile-catalog.mjs';
 
 const runtime = process.argv[2] ?? 'node';
+const entry = selectedProfile();
 if (!['node', 'bun'].includes(runtime)) throw Error('Expected node or bun');
 const fixture = await http2WireFixture();
 let browser;
@@ -17,7 +19,7 @@ try {
   await browser.close();
   browser = undefined;
   fixture.label('omreq');
-  const profile = parseProfile(await readFile('profiles/chrome-157-macos.json', 'utf8'));
+  const profile = parseProfile(await readFile(entry.path, 'utf8'));
   const clientResult = await runProfileClient(runtime, {
     profile,
     ca: fixture.ca,
@@ -58,7 +60,7 @@ try {
     })),
     requests: fixture.requests,
   };
-  const out = `artifacts/qualification/chrome157-http2-${runtime}`;
+  const out = `${entry.qualification}-http2-${runtime}`;
   await mkdir(out, { recursive: true });
   await writeFile(`${out}/report.json`, `${JSON.stringify(report, null, 2)}\n`);
   console.log(

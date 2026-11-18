@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { artifactIdentity, sha256 } from './artifact-identity.mjs';
 import { currentTarget } from './native-target.mjs';
+import { latestChrome } from './profile-catalog.mjs';
 
 const source = 'artifacts/qualification';
 const identity = await artifactIdentity();
@@ -47,7 +48,7 @@ for (const name of [
 const runtimes = JSON.parse(await readFile(`${source}/runtime-matrix.json`, 'utf8'));
 for (const runtime of runtimes)
   await cp(`${source}/${runtime.log}`, `${destination}/${runtime.log}`);
-await cp(`${source}/chrome157`, `${destination}/wire`, { recursive: true });
+await cp(`${source}/${latestChrome().name}`, `${destination}/wire`, { recursive: true });
 await cp(`${currentTarget().dir}/build-manifest.json`, `${destination}/build-manifest.json`);
 await cp('patches/cookies.json', `${destination}/cookie-provenance.json`);
 await cp('THIRD_PARTY_NOTICES.md', `${destination}/THIRD_PARTY_NOTICES.md`);

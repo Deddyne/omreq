@@ -1,15 +1,21 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { checkProfile, getRuntimeInfo, parseProfile } from '../packages/omreq/dist/index.mjs';
 import { artifactIdentity } from './artifact-identity.mjs';
+import { selectedProfile } from './profile-catalog.mjs';
 
-const candidatePath = 'profiles/chrome-157-macos.json';
+const entry = selectedProfile();
+// Child scripts qualify the same profile.
+process.env.OMREQ_PROFILE = entry.name;
+const candidatePath = entry.path;
 const profile = parseProfile(await readFile(candidatePath, 'utf8'));
-const samples = Number(process.argv[2] ?? 16);
+const samples = Number(process.argv.slice(2).find((a) => /^\d+$/.test(a)) ?? 16);
 if (!Number.isSafeInteger(samples) || samples < 2 || samples > 64)
   throw Error('Expected 2–64 TLS samples');
-const out = 'artifacts/qualification/chrome157';
+const out = entry.qualification;
+// After a full match, record the captures as the regression references in fixtures/.
+const writeReferences = process.argv.includes('--write-references');
 await mkdir(out, { recursive: true });
 const identity = await artifactIdentity();
 const { nativeSha256 } = identity;
@@ -40,7 +46,10 @@ for (let i = 0; i < samples; i++) {
     profile.target.version,
     'Reference Chrome version changed; choose and requalify a new target',
   );
-  assert(result.tlsFirstFlightMatch);
+  assert(
+    result.tlsFirstFlightMatch,
+    `TLS differs from Chrome: compare normalizedReference and normalizedCandidate in ${dir}/report.json, then update transport.tls in ${candidatePath}`,
+  );
   tls.push({
     sample: i + 1,
     referenceBytes: result.reference.clientHelloBytes,
@@ -56,9 +65,7 @@ for (let i = 0; i < samples; i++) {
 const http2 = [];
 for (const runtime of ['node', 'bun']) {
   const log = await run('node', ['scripts/profile-http2-reference.mjs', runtime]);
-  const report = JSON.parse(
-    await readFile(`artifacts/qualification/chrome157-http2-${runtime}/report.json`, 'utf8'),
-  );
+  const report = JSON.parse(await readFile(`${out}-http2-${runtime}/report.json`, 'utf8'));
   assert(report.exactPrefixMatch);
   await writeFile(`${out}/http2-${runtime}.json`, `${JSON.stringify(report, null, 2)}\n`);
   http2.push({ runtime, exactPrefixMatch: true, comparedBytes: report.comparedBytes });
@@ -67,18 +74,19 @@ for (const runtime of ['node', 'bun']) {
 const http1 = [];
 for (const runtime of ['node', 'bun']) {
   const log = await run('node', ['scripts/profile-http1-reference.mjs', runtime]);
-  const result = JSON.parse(
-    await readFile(`artifacts/qualification/chrome157-http1-${runtime}/report.json`, 'utf8'),
-  );
+  const result = JSON.parse(await readFile(`${out}-http1-${runtime}/report.json`, 'utf8'));
   assert(result.exactRequestMatch);
   await writeFile(`${out}/http1-${runtime}.json`, `${JSON.stringify(result, null, 2)}\n`);
   http1.push({ runtime, exactRequestMatch: true, comparedBytes: result.reference.length });
   process.stdout.write(log);
 }
-process.stdout.write(await run('node', ['scripts/profile-resumption-reference.mjs']));
-const resumption = JSON.parse(
-  await readFile('artifacts/qualification/chrome157-resumption/report.json', 'utf8'),
+process.stdout.write(
+  await run('node', [
+    'scripts/profile-resumption-reference.mjs',
+    ...(writeReferences ? ['--write-reference'] : []),
+  ]),
 );
+const resumption = JSON.parse(await readFile(`${out}-resumption/report.json`, 'utf8'));
 assert.equal(resumption.nativeSha256, nativeSha256);
 assert.equal(resumption.status, 'matched-in-scoped-TLS12-and-TLS13-resumption-tests');
 await writeFile(`${out}/resumption.json`, `${JSON.stringify(resumption, null, 2)}\n`);
@@ -108,3 +116,33 @@ const report = {
 };
 await writeFile(`${out}/report.json`, `${JSON.stringify(report, null, 2)}\n`);
 console.log(`Saved ${out}/report.json`);
+if (writeReferences) {
+  const refs = entry.references;
+  await mkdir(refs, { recursive: true });
+  await copyFile(`${out}/tls-1/chrome-clienthello.bin`, `${refs}/clienthello.bin`);
+  await copyFile(`${out}/tls-1/report.json`, `${refs}/tls-capture.json`);
+  const { clientResult: _, ...http2Capture } = JSON.parse(
+    await readFile(`${out}/http2-node.json`, 'utf8'),
+  );
+  await writeFile(`${refs}/http2-capture.json`, `${JSON.stringify(http2Capture, null, 2)}\n`);
+  await writeFile(
+    `${refs}/README.md`,
+    `# Chrome ${entry.major} reference evidence
+
+Captured on macOS ${profile.target.architecture} from the installed Chrome ${profile.target.version}
+by \`pnpm profile:new\` (or \`pnpm profile:qualify --profile ${entry.name} --write-references\`),
+after the profile matched it byte for byte.
+
+- \`clienthello.bin\`: raw TLS first flight to a loopback TCP listener.
+- \`tls-capture.json\`: parsed Chrome and Omreq first flights with the normalization applied
+  (random values, extension permutation, ECH GREASE payload size).
+- \`http2-capture.json\`: two document navigations to a local HTTP/2 fixture; exact bytes from
+  the client preface through the second HEADERS frame, plus decoded request headers.
+- \`resumption-capture.json\`: fresh and resumed TLS 1.2/1.3 ClientHellos.
+
+These are scenario-scoped test vectors used by \`pnpm test\`, not a claim about all browser
+activity.
+`,
+  );
+  console.log(`Recorded references in ${refs}`);
+}

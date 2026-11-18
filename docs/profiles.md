@@ -17,6 +17,7 @@ Most code only picks a bundled profile by name:
 | Name | Profile |
 | --- | --- |
 | `chrome` | the newest bundled Chrome — the default |
+| `chrome158` | Chrome 158.0.8127.37 on macOS ([`profiles/chrome-158-macos.json`](../profiles/chrome-158-macos.json)) |
 | `chrome157` | Chrome 157.0.8103.79 on macOS ([`profiles/chrome-157-macos.json`](../profiles/chrome-157-macos.json)) |
 | `neutral` | transport defaults, `user-agent: Omreq/<version>`, `accept: */*` |
 
@@ -189,7 +190,8 @@ console.log(report.profileDigest, report.engineBuildId);
 import { getProfile, listProfiles } from 'omreq';
 
 listProfiles();
-// [{ name: 'chrome157', aliases: ['chrome', …], default: true, … },
+// [{ name: 'chrome157', aliases: […], default: false, … },
+//  { name: 'chrome158', aliases: ['chrome', …], default: true, … },
 //  { name: 'neutral', aliases: ['omreq/custom-default'], default: false, … }]
 
 // Start from a bundled profile and change one thing
@@ -208,3 +210,26 @@ the TLS ClientHello (GREASE values and permuted extensions normalized), the HTTP
 and the HTTP/2 connection preface, SETTINGS, WINDOW_UPDATE and first HEADERS frame. A
 `checkProfile` report and `client.getInfo()` say `verification: 'bundled-verified'` for an
 unmodified bundled profile and `'custom-unverified'` otherwise.
+
+## Adding a new Chrome version
+
+When Chrome updates, install it on a Mac and run:
+
+```bash
+pnpm profile:new
+```
+
+The script drives the installed Chrome against local fixtures (no network), takes
+its request headers, HTTP/2 SETTINGS, window, priority and header order, and writes
+`profiles/chrome-<major>-macos.json` starting from the previous version. It then
+compares the new profile with that Chrome byte for byte: 16 TLS first flights,
+HTTP/2 and HTTP/1 on Node and Bun, and TLS 1.2/1.3 resumption. On a match the
+captures are saved to `fixtures/references/chrome<major>/` and become regression
+tests, `pnpm generate` registers the name, and `chrome` points to the new version.
+
+If TLS changed, the script stops and names the report to look at. Update
+`transport.tls` by hand, then rerun only the check:
+
+```bash
+pnpm profile:qualify --profile chrome159 --write-references
+```

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { artifactIdentity } from './artifact-identity.mjs';
+import { latestChrome } from './profile-catalog.mjs';
 
 const root = 'artifacts/qualification';
 mkdirSync(root, { recursive: true });
@@ -70,7 +71,7 @@ for (const [id, bin, args] of commands) {
   }
 }
 assert.deepEqual(await artifactIdentity(), identity, 'Artifacts changed during qualification');
-const profile = JSON.parse(readFileSync(`${root}/chrome157/report.json`, 'utf8'));
+const profile = JSON.parse(readFileSync(`${root}/${latestChrome().name}/report.json`, 'utf8'));
 assert.equal(profile.nativeSha256, identity.nativeSha256);
 assert.equal(profile.javascriptSha256, identity.javascriptSha256);
 writeFileSync(

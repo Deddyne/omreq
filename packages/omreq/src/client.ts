@@ -97,7 +97,7 @@ export interface ClientOptions extends RedirectOptions {
   resolve?: Readonly<Record<string, string | readonly string[]>>;
   cookies?: boolean;
   /**
-   * `'chrome'` (default, the newest bundled Chrome), `'chrome157'`,
+   * `'chrome'` (default, the newest bundled Chrome), `'chrome158'`,
    * `'neutral'` (no browser emulation) or a custom profile from defineProfile.
    */
   profile?: ProfileName | ProfileV1;

@@ -8,12 +8,19 @@ import { http2WireFixture } from '../fixtures/http2-wire.mjs';
 import { runProfileClient } from '../fixtures/profile-client.mjs';
 import { parseProfile } from '../packages/omreq/dist/index.mjs';
 import { currentTarget } from './native-target.mjs';
+import { selectedProfile } from './profile-catalog.mjs';
 
-const profile = parseProfile(await readFile('profiles/chrome-157-macos.json', 'utf8'));
-const out = 'artifacts/qualification/chrome157-resumption';
+const entry = selectedProfile();
+const profile = parseProfile(await readFile(entry.path, 'utf8'));
+const out = `${entry.qualification}-resumption`;
 const writeReference = process.argv.includes('--write-reference');
 assert(
-  process.argv.slice(2).every((arg) => arg === '--write-reference'),
+  process.argv
+    .slice(2)
+    .every(
+      (arg, i, all) =>
+        arg === '--write-reference' || arg === '--profile' || all[i - 1] === '--profile',
+    ),
   'Unknown argument',
 );
 await mkdir(out, { recursive: true });
@@ -149,6 +156,7 @@ for (const scenario of report.scenarios)
 report.status = 'matched-in-scoped-TLS12-and-TLS13-resumption-tests';
 await writeFile(`${out}/report.json`, `${JSON.stringify(report, null, 2)}\n`);
 if (writeReference) {
+  await mkdir(entry.references, { recursive: true });
   const reference = {
     recordedAt: report.recordedAt,
     profileId: report.profileId,
@@ -174,7 +182,7 @@ if (writeReference) {
     })),
   };
   await writeFile(
-    'fixtures/references/chrome157/resumption-capture.json',
+    `${entry.references}/resumption-capture.json`,
     `${JSON.stringify(reference, null, 2)}\n`,
   );
 }

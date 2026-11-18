@@ -13,7 +13,7 @@ Rust + BoringSSL in-process: up to **43% faster than wreq-js** and **up to 3× f
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![tls](https://img.shields.io/badge/TLS-JA3%20%7C%20JA4-8A2BE2)
 ![http2](https://img.shields.io/badge/HTTP%2F2-Akamai%20fingerprint-8A2BE2)
-![chrome](https://img.shields.io/badge/Chrome-157-4285F4?logo=googlechrome&logoColor=white)
+![chrome](https://img.shields.io/badge/Chrome-158-4285F4?logo=googlechrome&logoColor=white)
 ![rust](https://img.shields.io/badge/core-Rust%20%2B%20BoringSSL-B7410E?logo=rust)
 
 </div>
@@ -23,7 +23,7 @@ Rust + BoringSSL in-process: up to **43% faster than wreq-js** and **up to 3× f
 ```ts
 import { createClient } from 'omreq';
 
-await using client = createClient(); // 🟢 Chrome 157 by default
+await using client = createClient(); // 🟢 Chrome 158 by default
 
 const res = await client.get('https://example.com/api/items');
 console.log(res.status, res.httpVersion, await res.json()); // 200 '2' {…}
@@ -32,7 +32,7 @@ console.log(res.status, res.httpVersion, await res.json()); // 200 '2' {…}
 ## ✨ Features
 
 - 🕵️ **Chrome fingerprint out of the box** — TLS, HTTP/2, HTTP/1 and headers, checked against a real Chrome
-- 🎯 **One-word profiles** — `'chrome'`, `'chrome157'` or your own in TS/JSON
+- 🎯 **One-word profiles** — `'chrome'`, `'chrome158'` or your own in TS/JSON
 - 🚀 **Fast** — one native call per request, small bodies arrive with the headers
 - 🌐 **Proxies** — HTTP, HTTPS, SOCKS4/5, auth, `noProxy`, `'env'`
 - 🍪 **Sessions** — connection pool, TLS resumption and cookie jar per client
@@ -76,14 +76,14 @@ Runtimes: Node.js 22+ and Bun.
 
 ```ts
 createClient(); // newest Chrome
-createClient({ profile: 'chrome157' }); // exact version
+createClient({ profile: 'chrome158' }); // exact version
 ```
 
 ### Available profiles
 
 | Browser | Profiles | Platforms |
 | --- | --- | --- |
-| <img src="https://cdn.simpleicons.org/googlechrome" width="14"> **Chrome** | `chrome157` | macOS |
+| <img src="https://cdn.simpleicons.org/googlechrome" width="14"> **Chrome** | `chrome158` `chrome157` | macOS |
 
 `chrome` is an alias for the newest version in the list.
 
@@ -116,8 +116,9 @@ await client.close({ graceful: true });
 ## 🛠️ Development
 
 ```bash
-pnpm check     # lint, types, clippy, Rust + Node + Bun tests
-pnpm evidence  # full qualification, incl. wire comparison with real Chrome
+pnpm check        # lint, types, clippy, Rust + Node + Bun tests
+pnpm profile:new  # new Chrome out? capture it and verify byte for byte
+pnpm evidence     # full qualification, incl. wire comparison with real Chrome
 ```
 
 ## 📄 License

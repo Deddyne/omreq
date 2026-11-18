@@ -16,6 +16,7 @@ import {
   parseProfile,
   serializeProfile,
 } from '../packages/omreq/dist/index.mjs';
+import { chromeProfiles, latestChrome, readProfileText } from '../scripts/profile-catalog.mjs';
 import { nativePackage } from './native-package.mjs';
 
 const profileText = readFileSync(new URL('../profiles/neutral.json', import.meta.url), 'utf8');
@@ -105,7 +106,7 @@ test('T22: parser rejects duplicates, invalid JSON, accessors, cycles, unknown f
   cyclic.transport = cyclic;
   assert.throws(() => defineProfile(cyclic), { code: 'ERR_PROFILE_INVALID' });
   assert.throws(() => getProfile('chrome-999'), { code: 'ERR_PROFILE_UNKNOWN' });
-  assert.equal(getProfile('chrome'), getProfile('chrome157'));
+  assert.equal(getProfile('chrome'), getProfile(latestChrome().name));
   assert.equal(getProfile('neutral'), getProfile('omreq/custom-default'));
 });
 test('T22: unsupported capability is rejected before native request', async () => {
@@ -154,21 +155,27 @@ test('named profiles: chrome is the default, neutral opts out of emulation', asy
   try {
     const sent = async (client) => (await (await client.get(`${s.url}/echo`)).json()).headers;
     const browser = await sent(chrome);
-    assert.match(browser['user-agent'], /Chrome\/157/);
+    const latest = JSON.parse(readProfileText(latestChrome()));
+    assert.match(browser['user-agent'], new RegExp(`Chrome/${latestChrome().major}\\.`));
     assert.equal(browser['sec-ch-ua-platform'], '"macOS"');
     assert.equal(browser['accept-encoding'], 'gzip, deflate, br, zstd');
     assert.match((await sent(neutral))['user-agent'], /^Omreq\//);
-    assert.equal(chrome.getInfo().profileId, 'chrome/157.0.8103.79-macos-arm64');
+    assert.equal(chrome.getInfo().profileId, latest.id);
     assert.equal(chrome.getInfo().verification, 'bundled-verified');
     const listed = listProfiles();
     assert.deepEqual(
       listed.map((p) => [p.name, p.default]),
       [
-        ['chrome157', true],
+        ...chromeProfiles().map((p) => [p.name, p.name === latestChrome().name]),
         ['neutral', false],
       ],
     );
-    assert.deepEqual(listed[0].aliases, ['chrome', 'chrome/157.0.8103.79-macos-arm64']);
+    for (const entry of chromeProfiles()) {
+      const id = JSON.parse(readProfileText(entry)).id;
+      const aliases = listed.find((p) => p.name === entry.name).aliases;
+      assert.deepEqual(aliases, entry.name === latestChrome().name ? ['chrome', id] : [id]);
+      assert.equal(getProfile(id), getProfile(entry.name));
+    }
     assert.throws(() => createClient({ profile: 'firefox' }), { code: 'ERR_PROFILE_UNKNOWN' });
   } finally {
     await chrome.close();

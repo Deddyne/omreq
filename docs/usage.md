@@ -409,8 +409,8 @@ groups and extensions, HTTP/2 settings and pseudo-header order, HTTP/1 header ca
 default headers. Pick a bundled one by name:
 
 ```ts
-createClient(); // 'chrome': the newest bundled Chrome (Chrome 157)
-createClient({ profile: 'chrome157' }); // an exact version
+createClient(); // 'chrome': the newest bundled Chrome (Chrome 158)
+createClient({ profile: 'chrome158' }); // an exact version
 createClient({ profile: 'neutral' }); // no browser emulation
 ```
 

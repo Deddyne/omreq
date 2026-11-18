@@ -1,4 +1,5 @@
 import type { Node as JsonNode, ParseError } from 'jsonc-parser';
+import { BUNDLED_ALIASES, type BundledProfileName } from './bundled-names.js';
 import bundledProfiles from './bundled-profiles.json';
 import { OmreqError } from './errors.js';
 import { MAX_HEADER_BYTES, MAX_HEADER_PAIRS, PROFILE_FORBIDDEN_HEADERS } from './headers.js';
@@ -22,15 +23,9 @@ let jsonc: typeof import('jsonc-parser') | undefined;
  * Bundled profile names. `'chrome'` is the newest bundled Chrome and the
  * default; `'neutral'` is a plain client without browser emulation.
  */
-export type ProfileName = 'chrome' | 'chrome157' | 'neutral';
+export type ProfileName = BundledProfileName;
 type BundledName = keyof typeof bundledProfiles;
-const ALIASES: Readonly<Record<string, BundledName>> = {
-  chrome: 'chrome157',
-  chrome157: 'chrome157',
-  'chrome/157.0.8103.79-macos-arm64': 'chrome157',
-  neutral: 'neutral',
-  'omreq/custom-default': 'neutral',
-};
+const ALIASES: Readonly<Record<string, BundledName>> = BUNDLED_ALIASES;
 export const DEFAULT_PROFILE: ProfileName = 'chrome';
 const builtins = new Map<BundledName, ProfileV1>();
 function bad(path: string, message: string): never {
@@ -181,7 +176,7 @@ export function serializeProfile(profile: ProfileV1): string {
   }
   return text;
 }
-/** A bundled profile by name (`'chrome'`, `'chrome157'`, `'neutral'`) or id. */
+/** A bundled profile by name (`'chrome'`, `'chrome158'`, `'neutral'`, …) or id. */
 export function getProfile(name: ProfileName | (string & {})): ProfileV1 {
   const key = typeof name === 'string' ? ALIASES[name] : undefined;
   if (key === undefined)

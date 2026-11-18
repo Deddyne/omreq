@@ -14,7 +14,7 @@ console.log(res.status, res.httpVersion, await res.json());
 ```
 
 ```ts
-createClient({ profile: 'chrome157' }); // exact version; 'neutral' disables emulation
+createClient({ profile: 'chrome158' }); // exact version; 'neutral' disables emulation
 createClient({ proxy: 'socks5h://127.0.0.1:1080' }); // http, https, socks4/4a/5/5h, 'env'
 createClient({ resolve: { 'api.example.com': '203.0.113.10' } });
 await client.close({ graceful: true, timeoutMs: 10_000 });

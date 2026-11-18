@@ -19,6 +19,8 @@
     "test:transport": "cargo test --manifest-path vendor/http2/Cargo.toml --lib --locked",
     "test:transport:wreq": "node scripts/test-wreq.mjs",
     "test:profile:reference": "node scripts/qualify-profile.mjs",
+    "profile:new": "node scripts/profile-new.mjs",
+    "profile:qualify": "node scripts/qualify-profile.mjs",
     "test:profile:resumption": "node scripts/profile-resumption-reference.mjs"
   },
   "devDependencies": {

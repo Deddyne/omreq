@@ -11,98 +11,102 @@ import {
   defineProfile,
   parseProfile,
 } from '../packages/omreq/dist/index.mjs';
+import {
+  chromeProfiles,
+  hasReferences,
+  latestChrome,
+  readProfileText,
+  referenceUrl,
+} from '../scripts/profile-catalog.mjs';
 import { nativePackage } from './native-package.mjs';
 
-const text = readFileSync(new URL('../profiles/chrome-157-macos.json', import.meta.url), 'utf8');
+const text = readProfileText(latestChrome());
 const profile = parseProfile(text);
-const reference = parseClientHello(
-  readFileSync(new URL('../fixtures/references/chrome157/clienthello.bin', import.meta.url)),
-);
-test('G1: candidate TLS first flight matches independent Chrome structure', async () => {
-  const sockets = new Set();
-  let resolve;
-  const captured = new Promise((r) => (resolve = r));
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on('error', () => {});
-    socket.on('close', () => sockets.delete(socket));
-    let bytes = Buffer.alloc(0);
-    socket.on('data', (chunk) => {
-      bytes = Buffer.concat([bytes, chunk]);
-      if (bytes.length > 65536) {
-        socket.destroy();
-        return;
-      }
-      const hello = parseClientHello(bytes);
-      if (hello) {
-        resolve(hello);
-        socket.destroy();
-      }
+// Every bundled Chrome is checked against its own recorded browser capture.
+for (const entry of chromeProfiles().filter(hasReferences)) {
+  const profile = parseProfile(readProfileText(entry));
+  const reference = parseClientHello(readFileSync(referenceUrl(entry, 'clienthello.bin')));
+  test(`G1 ${entry.name}: candidate TLS first flight matches independent Chrome structure`, async () => {
+    const sockets = new Set();
+    let resolve;
+    const captured = new Promise((r) => (resolve = r));
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on('error', () => {});
+      socket.on('close', () => sockets.delete(socket));
+      let bytes = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        bytes = Buffer.concat([bytes, chunk]);
+        if (bytes.length > 65536) {
+          socket.destroy();
+          return;
+        }
+        const hello = parseClientHello(bytes);
+        if (hello) {
+          resolve(hello);
+          socket.destroy();
+        }
+      });
     });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const c = createClient({ profile, trustStore: 'chromium' });
+    let timer;
+    try {
+      const request = c.get(`https://localhost:${server.address().port}/probe`).catch((e) => e);
+      const actual = await Promise.race([
+        captured,
+        new Promise(
+          (_, reject) => (timer = setTimeout(() => reject(Error('ClientHello deadline')), 5000)),
+        ),
+      ]);
+      assert.deepEqual(normalizedClientHello(actual), normalizedClientHello(reference));
+      await request;
+      const report = await checkProfile(profile);
+      assert.equal(report.compatible, true);
+      assert.equal(report.verification, 'bundled-verified');
+    } finally {
+      clearTimeout(timer);
+      await c.close();
+      for (const socket of sockets) socket.destroy();
+      await new Promise((r) => server.close(r));
+    }
   });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const c = createClient({ profile, trustStore: 'chromium' });
-  let timer;
-  try {
-    const request = c.get(`https://localhost:${server.address().port}/probe`).catch((e) => e);
-    const actual = await Promise.race([
-      captured,
-      new Promise(
-        (_, reject) => (timer = setTimeout(() => reject(Error('ClientHello deadline')), 5000)),
-      ),
-    ]);
-    assert.deepEqual(normalizedClientHello(actual), normalizedClientHello(reference));
-    await request;
-    const report = await checkProfile(profile);
-    assert.equal(report.compatible, true);
-    assert.equal(report.verification, 'bundled-verified');
-  } finally {
-    clearTimeout(timer);
-    await c.close();
-    for (const socket of sockets) socket.destroy();
-    await new Promise((r) => server.close(r));
-  }
-});
-test('G1: HTTP2 settings, pseudo headers and literal headers match Chrome on reuse', async () => {
-  const fixture = await http2WireFixture();
-  const c = createClient({ profile, ca: fixture.ca, trustStore: 'chromium' });
-  try {
-    await (await c.get(`${fixture.url}/probe`)).bytes();
-    await (await c.get(`${fixture.url}/probe?reuse=1`)).bytes();
-    const active = fixture.connections.filter((c) => c.frames.some((f) => f.type === 1));
-    assert.equal(active.length, 1);
-    const capture = JSON.parse(
-      readFileSync(
-        new URL('../fixtures/references/chrome157/http2-capture.json', import.meta.url),
-        'utf8',
-      ),
-    );
-    const chrome = capture.connections.find(
-      (c) => c.label === 'chrome' && c.frames.some((f) => f.type === 1),
-    );
-    const relevant = (frames) =>
-      frames
-        .filter((f) => f.type === 4 || f.type === 8 || f.type === 1)
-        .map((f) => ({ ...f, ...(f.type === 1 ? { length: undefined } : {}) }));
-    assert.deepEqual(relevant(active[0].frames), relevant(chrome.frames));
-    const normalize = (headers) => {
-      const result = [];
-      for (let i = 0; i < headers.length; i += 2)
-        result.push([
-          headers[i],
-          headers[i] === ':authority' ? 'controlled-origin' : headers[i + 1],
-        ]);
-      return result;
-    };
-    const requests = capture.requests.filter((q) => q.connection === chrome.index);
-    for (let i = 0; i < 2; i++)
-      assert.deepEqual(normalize(fixture.requests[i].headers), normalize(requests[i].headers));
-  } finally {
-    await c.close();
-    await fixture.close();
-  }
-});
+  test(`G1 ${entry.name}: HTTP2 settings, pseudo headers and literal headers match Chrome on reuse`, async () => {
+    const fixture = await http2WireFixture();
+    const c = createClient({ profile, ca: fixture.ca, trustStore: 'chromium' });
+    try {
+      await (await c.get(`${fixture.url}/probe`)).bytes();
+      await (await c.get(`${fixture.url}/probe?reuse=1`)).bytes();
+      const active = fixture.connections.filter((c) => c.frames.some((f) => f.type === 1));
+      assert.equal(active.length, 1);
+      const capture = JSON.parse(readFileSync(referenceUrl(entry, 'http2-capture.json'), 'utf8'));
+      const chrome = capture.connections.find(
+        (c) => c.label === 'chrome' && c.frames.some((f) => f.type === 1),
+      );
+      const relevant = (frames) =>
+        frames
+          .filter((f) => f.type === 4 || f.type === 8 || f.type === 1)
+          .map((f) => ({ ...f, ...(f.type === 1 ? { length: undefined } : {}) }));
+      assert.deepEqual(relevant(active[0].frames), relevant(chrome.frames));
+      const normalize = (headers) => {
+        const result = [];
+        for (let i = 0; i < headers.length; i += 2)
+          result.push([
+            headers[i],
+            headers[i] === ':authority' ? 'controlled-origin' : headers[i + 1],
+          ]);
+        return result;
+      };
+      const requests = capture.requests.filter((q) => q.connection === chrome.index);
+      for (let i = 0; i < 2; i++)
+        assert.deepEqual(normalize(fixture.requests[i].headers), normalize(requests[i].headers));
+    } finally {
+      await c.close();
+      await fixture.close();
+    }
+  });
+}
 test('G1: native and JS reject conflicting or duplicate HTTP2 settings before I/O', async () => {
   for (const change of [
     (p) => p.transport.http2.settings.push({ name: 'initialWindowSize', value: 1 }),
