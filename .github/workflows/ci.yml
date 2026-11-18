@@ -3,7 +3,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -40,7 +42,10 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
       - run: npm install --global pnpm@${{ env.PNPM_VERSION }}
       - run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --component rustfmt --component clippy
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restore/save separately so a failed run still keeps the compiled
+      # dependencies (BoringSSL alone takes most of a cold build).
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -50,13 +55,31 @@ jobs:
           key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'vendor/**/Cargo.toml') }}
           restore-keys: cargo-${{ matrix.os }}-
       - run: pnpm install --frozen-lockfile
-      - run: node scripts/verify-cookies.mjs --self-test
-      - run: node scripts/notices.mjs --check
       - run: pnpm build
-      - run: pnpm test:transport
-      - run: pnpm check
+      # Platform-independent checks (lint, types, clippy, Rust tests, notices) run once.
+      - if: runner.os == 'Linux'
+        run: |
+          node scripts/verify-cookies.mjs --self-test
+          node scripts/notices.mjs --check
+          pnpm lint
+          pnpm typecheck
+          cargo fmt --all --check
+          cargo clippy --workspace --locked --all-targets -- -D warnings
+          cargo test --workspace --locked
+          pnpm test:transport
+      - run: pnpm test
+      - run: pnpm test:bun
       - run: pnpm pack:check
       - run: node scripts/smoke.mjs
+      - if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}

@@ -307,10 +307,12 @@ test("proxy: 'env' reads HTTP_PROXY/HTTPS_PROXY/NO_PROXY once; omitted ignores t
   const proxy = await httpProxy();
   const saved = { ...process.env };
   try {
-    process.env.HTTP_PROXY = new URL(proxy.url).host; // bare host:port
+    // Clear first: on Windows environment names are case-insensitive, so
+    // deleting http_proxy after setting HTTP_PROXY would remove it again.
     delete process.env.http_proxy;
-    delete process.env.NO_PROXY;
     delete process.env.no_proxy;
+    delete process.env.NO_PROXY;
+    process.env.HTTP_PROXY = new URL(proxy.url).host; // bare host:port
     const implicit = createClient();
     const fromEnv = createClient({ proxy: 'env' });
     process.env.NO_PROXY = '*';
