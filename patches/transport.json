@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "base": {
+    "crate": "wreq",
+    "version": "0.16.3",
+    "revision": "6073cf683d0a62c49c6d9ab4dc8a3c4727e953f0",
+    "crateSha256": "d2b11a67378558357ed083260fd0bbced0481e4d32e2fb722be9c52b42ee08d4"
+  },
+  "backports": [
+    {
+      "id": "cancelled-http2-capacity-waiters",
+      "source": "Omreq cancellation/total deadline/FIFO fixtures with exhausted peer MAX_CONCURRENT_STREAMS",
+      "crates": [
+        "wreq-proto 0.2.3"
+      ],
+      "reason": "Observe queued and pending-open request callback cancellation independently of peer stream capacity. Move existing queued messages into a cooperative FIFO and drop cancelled bodies without closing unrelated streams. Combined channel/FIFO ownership remains bounded by Omreq operation admission; no request/body copies or additional tasks are created.",
+      "regressions": [
+        "T08/T09/T17 blocked Blob abort and total deadline",
+        "T08/T09/T16 cancelled tails behind a live FIFO head, surviving FIFO order and neighbour connection reuse"
+      ],
+      "removeWhen": "Qualified upstream releases all cancelled queued and pending-open bodies while peer stream capacity remains exhausted, preserving live neighbours and FIFO order."
+    },
+    {
+      "id": "cancelled-http1-dispatch-abandons-flush",
+      "source": "Omreq ownership regression: paused server during multipart upload and cancelled response receiver",
+      "crates": [
+        "wreq-proto 0.2.3"
+      ],
+      "reason": "Return a cancelled dispatcher error when its response receiver is gone, rather than waiting for shutdown to flush a blocked request body. This drops the owned upload body and physical socket promptly without draining an aborted HTTP1 request.",
+      "regressions": [
+        "T08 active multipart abort/close against a server paused after the first request bytes",
+        "Core upload-body task guard and physical TCP counters at cleanup"
+      ],
+      "removeWhen": "Qualified upstream cancellation drops the dispatcher and blocked raw socket without waiting for peer read progress, with the same cancellation/reuse/wire regressions passing."
+    },
+    {
+      "id": "physical-tcp-lifetime-hooks",
+      "source": "Omreq implementation over the pinned wreq TCP creation and pool-race paths",
+      "crates": [
+        "wreq 0.16.3"
+      ],
+      "reason": "Reserve capacity before every raw TCP socket including Happy Eyeballs attempts, release after raw socket drop and support owner-initiated close. A connect that loses the pool race to an idle connection completes in the background into the pool, marked by socket::is_raced_connect so the owner abandons it while it still waits for capacity instead of leaving an orphaned waiter. Also expose the separate inner reused-connection cancelled-request replay switch so Omreq can disable it alongside the outer retry policy. Upstream defaults remain unchanged without explicit options.",
+      "removeWhen": "Qualified upstream exposes equivalent physical socket lifetime hooks and bounded pool-race cancellation, verified by the same socket/resource and wire tests."
+    },
+    {
+      "id": "tls-trust-anchors-and-signature-grease",
+      "source": "https://github.com/0x676e67/wreq/commit/cd76bcdf1307153de289d34e072528bdf0510a3b",
+      "files": [
+        "src/tls.rs",
+        "src/tls/conn.rs"
+      ],
+      "reason": "Expose the two native options required by the captured Chrome 157 reference without replacing the transport or using wreq-util enums.",
+      "removeWhen": "A qualified published wreq exposes these options with equivalent semantics and passes the same local wire tests."
+    },
+    {
+      "id": "profile-hpack-huffman-policy",
+      "source": "Omreq implementation; RFC 7541 section 5.2 and controlled Chrome 157 fresh/reused wire comparison",
+      "crates": [
+        "http2 0.5.20",
+        "wreq-proto 0.2.3"
+      ],
+      "reason": "Expose a per-connection smaller-only Huffman policy. Preserve upstream always-Huffman behavior by default. Chrome uses plain strings when Huffman does not shrink them.",
+      "regressions": [
+        "http2::hpack::encoder::omreq_huffman_tests",
+        "Live Chrome/Node/Bun exact HTTP2 preface through two HEADERS frames comparison"
+      ],
+      "removeWhen": "Qualified upstream exposes an equivalent per-connection policy and passes the same tests."
+    },
+    {
+      "id": "shared-happy-eyeballs-reservation",
+      "source": "Omreq audit S-01: dual-stack host with a hung IPv6 path under maxConnectionsPerOrigin",
+      "crates": [
+        "wreq 0.16.3"
+      ],
+      "reason": "Reserve socket capacity once per logical connect. Happy Eyeballs candidates of the same connect share the reservation, so a fallback never queues behind its own hung first attempt for the only slot. Overcommit is bounded by the parallel-attempt limit; the winning socket keeps the reservation.",
+      "regressions": [
+        "wreq::socket::tests::candidates_of_one_connect_share_one_reservation",
+        "wreq::conn::net::tcp::tests::fallback_does_not_queue_behind_its_own_hung_first_attempt",
+        "wreq::conn::net::tcp::tests::observer_reserves_once_per_logical_connect_before_socket_creation_and_releases_on_timeout"
+      ],
+      "removeWhen": "Qualified upstream exposes logical-connect capacity hooks that race candidates under one reservation."
+    },
+    {
+      "id": "local-http2-header-list-bound",
+      "source": "Omreq audit S-02: CONTINUATION buffering without an advertised SETTINGS_MAX_HEADER_LIST_SIZE",
+      "crates": [
+        "http2 0.5.20"
+      ],
+      "reason": "Bound the received header block (CONTINUATION buffer and decoded list) to 256 KiB whether or not SETTINGS advertise MAX_HEADER_LIST_SIZE, and cap larger advertised values locally. SETTINGS frames sent are unchanged, so profile fingerprints are preserved.",
+      "regressions": [
+        "http2::codec::framed_read::omreq_header_list_tests"
+      ],
+      "removeWhen": "Qualified upstream exposes a local-only receive header list limit."
+    }
+  ],
+  "tls": {
+    "source": "https://github.com/0x676e67/btls",
+    "revision": "129887582a538b8f4dcf371d15c953335312ca37",
+    "crates": [
+      "btls",
+      "btls-sys"
+    ],
+    "reason": "Pinned upstream implementation of signature-algorithm GREASE, ML-DSA and Trust Anchor IDs, including its pinned BoringSSL source.",
+    "boringSslRevision": "f1f2556a5dfa59e147d9d47279cc3f7f8a18b433"
+  },
+  "license": "Apache-2.0 for wreq/wreq-proto/btls; MIT for http2. Original LICENSE files retained.",
+  "maintenance": "Requalify on every source/feature change; inspect native linkage and both Node/Bun. No floating branch, runtime downloader or automatic fallback."
+}

@@ -1,0 +1,821 @@
+{
+  "capturedAt": "2026-11-15T17:27:29.874Z",
+  "scenario": "First connection to controlled loopback TCP listener; no TLS session, no external origin, no browser certificate bypass",
+  "chromeVersion": "157.0.8103.79",
+  "runtime": {
+    "runtime": "node",
+    "runtimeVersion": "26.12.1",
+    "platform": "darwin",
+    "arch": "arm64",
+    "packageVersion": "0.0.0-internal.1",
+    "nodeApi": "10",
+    "nativeReady": true,
+    "native": {
+      "bridgeAbi": 1,
+      "capabilities": [
+        "headers.v1",
+        "http.version.v1",
+        "tls.versions.v1",
+        "tls.alpn.v1",
+        "http2.options.v1",
+        "tls.algorithms.v1",
+        "tls.extensions.v1",
+        "tls.trust-anchors.v1",
+        "tls.certificate-compression.brotli.v1"
+      ],
+      "engineBuildId": "omreq-engine-sha256:02d6a5b7986f81aa1ed0e5c33df2363c623aa3f040b7584ed743c3e6fdc38a72",
+      "nodeApi": 8,
+      "stage": "internal-prototype",
+      "tls": "btls/0.5.6",
+      "transport": "wreq/0.16.3",
+      "version": "0.0.0-internal.1"
+    }
+  },
+  "reference": {
+    "legacyVersion": 771,
+    "sessionIdLength": 32,
+    "compressionMethods": [
+      0
+    ],
+    "clientHelloBytes": 1976,
+    "cipherSuites": [
+      43690,
+      4865,
+      4866,
+      4867,
+      49195,
+      49199,
+      49196,
+      49200,
+      52393,
+      52392,
+      49171,
+      49172,
+      156,
+      157,
+      47,
+      53
+    ],
+    "extensions": [
+      {
+        "id": 35466,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 51764,
+        "length": 186,
+        "hex": "00b80582df1302010582df1302060582df13020d0582df13020e0582df13020f0582df1302120582df1302130582df13021408839a648c9b2d010708839a648c9b2d010808839a648c9b2d010908839a648c9b2d010a08839a648c9b2d010b08839a648c9b2d010c08839a648c9b2d010d08839a648c9b2d011208839a648c9b2d011304d679090104d679090404d679090504d679090604d679090704d679090804d679090a04d679090b04d679090c04d679090d04d679090f",
+        "ids": [
+          "82df130201",
+          "82df130206",
+          "82df13020d",
+          "82df13020e",
+          "82df13020f",
+          "82df130212",
+          "82df130213",
+          "82df130214",
+          "839a648c9b2d0107",
+          "839a648c9b2d0108",
+          "839a648c9b2d0109",
+          "839a648c9b2d010a",
+          "839a648c9b2d010b",
+          "839a648c9b2d010c",
+          "839a648c9b2d010d",
+          "839a648c9b2d0112",
+          "839a648c9b2d0113",
+          "d6790901",
+          "d6790904",
+          "d6790905",
+          "d6790906",
+          "d6790907",
+          "d6790908",
+          "d679090a",
+          "d679090b",
+          "d679090c",
+          "d679090d",
+          "d679090f"
+        ]
+      },
+      {
+        "id": 35,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 16,
+        "length": 14,
+        "hex": "000c02683208687474702f312e31",
+        "protocols": [
+          "h2",
+          "http/1.1"
+        ]
+      },
+      {
+        "id": 23,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 10,
+        "length": 12,
+        "hex": "000a0a0a11ec001d00170018",
+        "values": [
+          2570,
+          4588,
+          29,
+          23,
+          24
+        ]
+      },
+      {
+        "id": 18,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 45,
+        "length": 2,
+        "hex": "0101"
+      },
+      {
+        "id": 17613,
+        "length": 5,
+        "hex": "0003026832",
+        "protocols": [
+          "h2"
+        ]
+      },
+      {
+        "id": 13,
+        "length": 26,
+        "hex": "00180a0a09040905090604030804040105030805050108060601",
+        "values": [
+          2570,
+          2308,
+          2309,
+          2310,
+          1027,
+          2052,
+          1025,
+          1283,
+          2053,
+          1281,
+          2054,
+          1537
+        ]
+      },
+      {
+        "id": 65281,
+        "length": 1,
+        "hex": "00"
+      },
+      {
+        "id": 51,
+        "length": 1263,
+        "hex": "04ed0a0a00010011ec04c0466b5655aa1ee74950fd8017d646a8d86970d7715c2c26b78719ae6c9a844aa580e4e470aa2a9b70c51ab1587d5b09779123152fc2adda9178291955cdc48178386a2173a786e31224a4c2b428cd64265d4018901f0b25fb15caf2e484119882a1ab2a52e26be527823989b6ea6b3df139b6f12809218182016a8f85d2517a34a167e89796254213611793852d6f6b04650c24ea5c048218a7e2615ec9a5a2704caf31c08063c11fe7758e19a35f460c3739288f8d777c1e711fe585b8f7b472d74ca049b5a6e59783ad9a4c7c8b615aba7360a23b2d1a9e6f718e6836720c8530a5f91413837e34326c5f16c7c17a40d851bba1cb102dbccd0d29a43e1c15d207aca5820069e23240ea7158f34ca8eb631dca2c1b5cccb6094b4ce7a9557519bd648c39004cd1f88ef7078ef88864eccc276c3620d2f5654444557698ae867983d7d00e1ba58b9308084a436367db10fd951e6577ceb3c5bb6b948fb6e19cf778c25a68c1a8c3129b43ceb6852f90d064f16482ac371d8e88903e5a49a0d706b48279b7178e0aecb6c8b09950f7c2dd71277403227031cd8cd723cff941f437c5fd331875674dec343127b338b8166493a9aab1c83fae006cd95c37c630a5066095955c97b55277301c59575b46d20b2aee0a2eed59be4e0a6d01b30bd6d00f57419582758cd492017ea09b62966bf473a39b72a5ae1b452fd411bbe71e9f1498f7387cb3060d085a6fc5732100761479f752667994edbc2f75021e28bc6db0e04f13f824b6a06917c5bdd3e3cac97a0d4d9c05f3eb4f5b4067bad64d11a78059c83243800b5c7aa7f68b23a6ea5a2819800af004db4cab0b8c6368cc0c41fb5054b07500e608207c74c7f388823934c3364c8817703205be0bc2b5569681aef195ccb1a090a3024fa786631aa332c8179b1bcd46039f541aa3a2295d68fb0c4651c03756743e328b30da2761e80aa2e00baa9863e01468d92c6c52576e1eb77f6500755af82557d13bc850576827cb73fb744f183c862286f6538c3780b497c08794f78bd17980a122854fbc089e1928eac6bdc127320cac01bd85b6e043a6d5d021965654bb3c1d07262e8f4a48715b191f933c9d34282f18b1a91c2bd5b38e274322771366e5d9b3e9e05c9852b9363839580755c9f00b748633bc3c2c976a9a8e65a542ac6a47b577ea66889c65a94e788e31e5cefafc7d49f35e4142af8834204f06948828930b37adb4d1721626866f9c278c39a6f23c9c0f455d6f686a971029c967a90f644f6ce493584c01a234954f01af80a75272a81077fcc8e7d0067be2099558280a402d04284dee5294ec8a5d814803bc8b011351a72184a88d5445a6391982512c1fe2b5595b6b55a2978b10cc9e11866dc0b845eb8870989e10726dac06371d116f7f0c9892fa572ceb10629362d6d4a56ff354be7c6d63327ef8eb20e4884663354cdca65c9be378fed79384961db8820239f0be165457a3a80acb283e855b8d28a5c1350aa91c944cf54a6e2412a1e962291bc451cd567338268f929960381686d7fc2c392c7b4f7716983731dd580c1825068b894414db8a3f1b7c8c446f0542cb87e915f9aabf82a98be6e8663d6b9e096785719cbc5be802870636023440c86e173c4bf053b020c68c067ca0147e69b9c8e44d93d3749a38ddc280160eb72998a5ede005c4b60fab4acb287764c7ce5583cbb5c732001d00208e5b154b3bf64930c0bb5df70a75f2812ad7c56cbb0a3f5603cac9d11387eb7d",
+        "shares": [
+          {
+            "group": 2570,
+            "length": 1
+          },
+          {
+            "group": 4588,
+            "length": 1216
+          },
+          {
+            "group": 29,
+            "length": 32
+          }
+        ]
+      },
+      {
+        "id": 0,
+        "length": 14,
+        "hex": "000c0000096c6f63616c686f7374"
+      },
+      {
+        "id": 5,
+        "length": 5,
+        "hex": "0100000000"
+      },
+      {
+        "id": 11,
+        "length": 2,
+        "hex": "0100"
+      },
+      {
+        "id": 43,
+        "length": 7,
+        "hex": "06fafa03040303",
+        "values": [
+          64250,
+          772,
+          771
+        ]
+      },
+      {
+        "id": 65037,
+        "length": 250,
+        "hex": "0000010001db00209bbba08ba178c408b1a349a10fde5d67d18f79f7132f6cc587833fffb25d6b2c00d06ac01cc88f0c699df66834e2241600d2206dcb6040df397369111be5c0c509877d0880de717ac6a82268e0dc348214fada542da8568b94fd25db22bb30d7c94a2811a56e6175400fd09e3432698efbd6f78268d0a00839793440d916e219583b4df03d03e413a77004f824e2e534d4a336b52478f63c1e8f0d8542f7711c68ead84541e71967066b95a23d347ef1cdc7dd01ace193836fa39cdf9f57661c5ca00315be66f6cc5212e438859b76f876893fb67cbad82ddeea1bb296906a1871f71f9b7f592d47bf3c63c74d73838fe052",
+        "ech": {
+          "type": 0,
+          "kdf": 1,
+          "aead": 1,
+          "encLength": 32,
+          "payloadLength": 208
+        }
+      },
+      {
+        "id": 27,
+        "length": 3,
+        "hex": "020002",
+        "values": [
+          2
+        ]
+      },
+      {
+        "id": 56026,
+        "length": 1,
+        "hex": "00"
+      }
+    ]
+  },
+  "candidate": {
+    "legacyVersion": 771,
+    "sessionIdLength": 32,
+    "compressionMethods": [
+      0
+    ],
+    "clientHelloBytes": 2008,
+    "cipherSuites": [
+      60138,
+      4865,
+      4866,
+      4867,
+      49195,
+      49199,
+      49196,
+      49200,
+      52393,
+      52392,
+      49171,
+      49172,
+      156,
+      157,
+      47,
+      53
+    ],
+    "extensions": [
+      {
+        "id": 19018,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 27,
+        "length": 3,
+        "hex": "020002",
+        "values": [
+          2
+        ]
+      },
+      {
+        "id": 65281,
+        "length": 1,
+        "hex": "00"
+      },
+      {
+        "id": 23,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 45,
+        "length": 2,
+        "hex": "0101"
+      },
+      {
+        "id": 65037,
+        "length": 282,
+        "hex": "0000010001e500200f0eba8e72dc10fac80ea5ec7804c53c63aa8241269370f89adc6b8cc1cca65300f0311c5a48d63a66f7b584add54591b97a20a0f857f388d76d81780f90b26a8ee35870a538420c45934ba155e3edfe7610735e7af57bd7ed6b9612932f8bb35dfadb8be600c997b226d31a2e14af525b092f282cc02f80ed35f7c82c7bdfb3acc3f7fabf0f0c1946c574f2b5745a126b7ccb452e2ef0e2a8529a5f0463c1d1e22368d5e76ebb20519a7d52ee4d072abe943e64be3e6ca5367f1e4eb2dac08df515815ec5406452ee967897c6f8227d1feb32236f1f17790752a94223612bd9cee139a853d97860a565bf1edf4653771fd424c7950c4da85afd2f6e190945bf3b9ca45186ddeeb689d458e3d9c07fdaab5d",
+        "ech": {
+          "type": 0,
+          "kdf": 1,
+          "aead": 1,
+          "encLength": 32,
+          "payloadLength": 240
+        }
+      },
+      {
+        "id": 18,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 10,
+        "length": 12,
+        "hex": "000a0a0a11ec001d00170018",
+        "values": [
+          2570,
+          4588,
+          29,
+          23,
+          24
+        ]
+      },
+      {
+        "id": 35,
+        "length": 0,
+        "hex": ""
+      },
+      {
+        "id": 17613,
+        "length": 5,
+        "hex": "0003026832",
+        "protocols": [
+          "h2"
+        ]
+      },
+      {
+        "id": 43,
+        "length": 7,
+        "hex": "069a9a03040303",
+        "values": [
+          39578,
+          772,
+          771
+        ]
+      },
+      {
+        "id": 51,
+        "length": 1263,
+        "hex": "04ed0a0a00010011ec04c0d692188a2085c21c7e105a9f84b13a9164a47301aa1d6270c5aa1cfd900505603488ab5bde5a9b1f92ad385803b0a504c002c287d370cda6537d4b18e3c0b7ab9415429b150273749715a5443031d3095d6c6a896f3a22e552b74a7230b5e998b3332fe135532012581a8c10b3bac331071b916893ff177322b499eb7bc8e9892716ebc47ca39b4ea8bf0af9c41b02a3a7cb63906823acf02474fa9e6f14598ff1b23d555639e21bd5781260f53dd99231bc922881eba49e055298e79c0eec216736b0d3c4ab321a247fb887830c0c1fe21c8544c57022392370bdd73451f6459e30c07b6e8925558bb08d8cb1b7d760a776a5019c1663384c0fa458aa341f369257f4ac9ee65257bbb958aa9b07afb13463a39c8fd86f0045550962b3448a1c8e220ea5a40900723967a30d8f7822dca108cbc6c612fa1a97f67c375263206521ed5122af85237aec3eb650847771941d7cc12ea39d82b556ab9194122167136363072276282952ce639796455e0e0534320a904bf40d6557682212356c4a993a0143b0e79b6eac0586652207f9959b52023d0867b1e8b9ca3340ee940036f74887cb470ff152178309f7084beb3b47e7e53a3d2b76a9e6a3fee24493a7b59e0cc6bf4aae2decb171910cec932bb202c852f86f6d630c6e239cf409650842a66d8a6b4a2a1b60787263a90dc573cfae141fba30649e276f3669567b0a7262203962481333d0b9993985195b3c4c49589eeb4e3d1a4cc17a8f37a8c932376389273ce5880a7da520f2385e4dfb05a7a3cf195b6ea1403baf110bc0a81b117194ee51237d347a15c059b1704bb2e6b94473693276c4b3f10b67a24a3308c8a4e38e0a1a3d73b97e471122342c63cd5961d1babbdcc6a3afda05344b109ea4c4a6542c1b1651941c03fbf12dedb6bd193a3f707606e02a8529c5691756a8d7e4c5fcd6cd6881a974a7cd2218ca7bac0ff65b977ea84320c5a7a60ac50ed77fcf1cc3e492250c137a5dc21833555d3b5bc7e83c76cbf989894a171bacca8b549ed67a1a17008500e5b06818add6d6c3fd9c61f47b7ca21acf38e8000ed1980186221df5868a27642d43b80e876103991fff942d8135a8e12106b9d9ab572a2967ca062ef52f0aa38c06d13b425cb081035acb9442a38131352555835562764746dd2c2544e3612772c8e1b06a3db4cceef1157293bcd605a2c6bb9af759020d5a8dd32c852d28c0372a88dc2c2a6f3cbca543a5a64140d832513d45882b063cf33c408cb960c98764087a0ea66768f68822430a615f71ac2ad7a54547155ec432d2bcb8e50a4b0293b428db96b804b7bdc429b5b3180dd6ad3afcb22901ca559608021821ce2a1195d8b3dd385d3c079004b379d4bc4984dc561b11bf50e09f9a45b9ed5170fb8582bfe38e0cd76a892885d57c647c37a7b4b4b05822727edcb84326567114045e6b1dc83439b4f9b5e8e5c500f3bf1499319f18916c677742bb67a3588590d7bc1637c8701032de837a193a0406c440d166a54db31837fa0657668528a94fe2e6050d11b038f16af32b8a70177b8f8b589c421289d12d8347c742ca606b0382e0e5260f1a287f67c87e3b24dbaba26e033c3dca920a920ecda6a5a7ec933d3382c8ec859b6d3772853d50208bfef6f565739172fbca43d883fa7a274fcb49925e508cd26f5f7107ab8ac7bfba42f0132fb30a07bded55dc496317001d0020f5155ac356e042d9573bebcbb744bc8ba95013b4803f898ca3f7df12b007a94f",
+        "shares": [
+          {
+            "group": 2570,
+            "length": 1
+          },
+          {
+            "group": 4588,
+            "length": 1216
+          },
+          {
+            "group": 29,
+            "length": 32
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "length": 2,
+        "hex": "0100"
+      },
+      {
+        "id": 16,
+        "length": 14,
+        "hex": "000c02683208687474702f312e31",
+        "protocols": [
+          "h2",
+          "http/1.1"
+        ]
+      },
+      {
+        "id": 5,
+        "length": 5,
+        "hex": "0100000000"
+      },
+      {
+        "id": 13,
+        "length": 26,
+        "hex": "0018eaea09040905090604030804040105030805050108060601",
+        "values": [
+          60138,
+          2308,
+          2309,
+          2310,
+          1027,
+          2052,
+          1025,
+          1283,
+          2053,
+          1281,
+          2054,
+          1537
+        ]
+      },
+      {
+        "id": 51764,
+        "length": 186,
+        "hex": "00b80582df1302010582df1302060582df13020d0582df13020e0582df13020f0582df1302120582df1302130582df13021408839a648c9b2d010708839a648c9b2d010808839a648c9b2d010908839a648c9b2d010a08839a648c9b2d010b08839a648c9b2d010c08839a648c9b2d010d08839a648c9b2d011208839a648c9b2d011304d679090104d679090404d679090504d679090604d679090704d679090804d679090a04d679090b04d679090c04d679090d04d679090f",
+        "ids": [
+          "82df130201",
+          "82df130206",
+          "82df13020d",
+          "82df13020e",
+          "82df13020f",
+          "82df130212",
+          "82df130213",
+          "82df130214",
+          "839a648c9b2d0107",
+          "839a648c9b2d0108",
+          "839a648c9b2d0109",
+          "839a648c9b2d010a",
+          "839a648c9b2d010b",
+          "839a648c9b2d010c",
+          "839a648c9b2d010d",
+          "839a648c9b2d0112",
+          "839a648c9b2d0113",
+          "d6790901",
+          "d6790904",
+          "d6790905",
+          "d6790906",
+          "d6790907",
+          "d6790908",
+          "d679090a",
+          "d679090b",
+          "d679090c",
+          "d679090d",
+          "d679090f"
+        ]
+      },
+      {
+        "id": 0,
+        "length": 14,
+        "hex": "000c0000096c6f63616c686f7374"
+      },
+      {
+        "id": 27242,
+        "length": 1,
+        "hex": "00"
+      }
+    ]
+  },
+  "comparison": {
+    "referenceOnlyExtensions": [],
+    "candidateOnlyExtensions": []
+  },
+  "normalizedReference": {
+    "legacyVersion": 771,
+    "sessionIdLength": 32,
+    "compressionMethods": [
+      0
+    ],
+    "cipherSuites": [
+      4865,
+      4866,
+      4867,
+      49195,
+      49199,
+      49196,
+      49200,
+      52393,
+      52392,
+      49171,
+      49172,
+      156,
+      157,
+      47,
+      53
+    ],
+    "extensions": [
+      {
+        "id": 0,
+        "hex": "000c0000096c6f63616c686f7374"
+      },
+      {
+        "id": 5,
+        "hex": "0100000000"
+      },
+      {
+        "id": 10,
+        "values": [
+          4588,
+          29,
+          23,
+          24
+        ]
+      },
+      {
+        "id": 11,
+        "hex": "0100"
+      },
+      {
+        "id": 13,
+        "values": [
+          2308,
+          2309,
+          2310,
+          1027,
+          2052,
+          1025,
+          1283,
+          2053,
+          1281,
+          2054,
+          1537
+        ]
+      },
+      {
+        "id": 16,
+        "protocols": [
+          "h2",
+          "http/1.1"
+        ]
+      },
+      {
+        "id": 18,
+        "hex": ""
+      },
+      {
+        "id": 23,
+        "hex": ""
+      },
+      {
+        "id": 27,
+        "values": [
+          2
+        ]
+      },
+      {
+        "id": 35,
+        "hex": ""
+      },
+      {
+        "id": 43,
+        "values": [
+          772,
+          771
+        ]
+      },
+      {
+        "id": 45,
+        "hex": "0101"
+      },
+      {
+        "id": 51,
+        "shares": [
+          {
+            "group": 4588,
+            "length": 1216
+          },
+          {
+            "group": 29,
+            "length": 32
+          }
+        ]
+      },
+      {
+        "id": 17613,
+        "protocols": [
+          "h2"
+        ]
+      },
+      {
+        "id": 51764,
+        "ids": [
+          "82df130201",
+          "82df130206",
+          "82df13020d",
+          "82df13020e",
+          "82df13020f",
+          "82df130212",
+          "82df130213",
+          "82df130214",
+          "839a648c9b2d0107",
+          "839a648c9b2d0108",
+          "839a648c9b2d0109",
+          "839a648c9b2d010a",
+          "839a648c9b2d010b",
+          "839a648c9b2d010c",
+          "839a648c9b2d010d",
+          "839a648c9b2d0112",
+          "839a648c9b2d0113",
+          "d6790901",
+          "d6790904",
+          "d6790905",
+          "d6790906",
+          "d6790907",
+          "d6790908",
+          "d679090a",
+          "d679090b",
+          "d679090c",
+          "d679090d",
+          "d679090f"
+        ]
+      },
+      {
+        "id": 65037,
+        "ech": {
+          "type": 0,
+          "kdf": 1,
+          "aead": 1,
+          "encLength": 32
+        },
+        "payloadSizeClass": "grease-144..240-step32"
+      },
+      {
+        "id": 65281,
+        "hex": "00"
+      }
+    ],
+    "grease": {
+      "cipher": 1,
+      "extensions": [
+        0,
+        1
+      ],
+      "groups": 1,
+      "signatures": 1,
+      "versions": 1,
+      "keyShares": [
+        1
+      ]
+    }
+  },
+  "normalizedCandidate": {
+    "legacyVersion": 771,
+    "sessionIdLength": 32,
+    "compressionMethods": [
+      0
+    ],
+    "cipherSuites": [
+      4865,
+      4866,
+      4867,
+      49195,
+      49199,
+      49196,
+      49200,
+      52393,
+      52392,
+      49171,
+      49172,
+      156,
+      157,
+      47,
+      53
+    ],
+    "extensions": [
+      {
+        "id": 0,
+        "hex": "000c0000096c6f63616c686f7374"
+      },
+      {
+        "id": 5,
+        "hex": "0100000000"
+      },
+      {
+        "id": 10,
+        "values": [
+          4588,
+          29,
+          23,
+          24
+        ]
+      },
+      {
+        "id": 11,
+        "hex": "0100"
+      },
+      {
+        "id": 13,
+        "values": [
+          2308,
+          2309,
+          2310,
+          1027,
+          2052,
+          1025,
+          1283,
+          2053,
+          1281,
+          2054,
+          1537
+        ]
+      },
+      {
+        "id": 16,
+        "protocols": [
+          "h2",
+          "http/1.1"
+        ]
+      },
+      {
+        "id": 18,
+        "hex": ""
+      },
+      {
+        "id": 23,
+        "hex": ""
+      },
+      {
+        "id": 27,
+        "values": [
+          2
+        ]
+      },
+      {
+        "id": 35,
+        "hex": ""
+      },
+      {
+        "id": 43,
+        "values": [
+          772,
+          771
+        ]
+      },
+      {
+        "id": 45,
+        "hex": "0101"
+      },
+      {
+        "id": 51,
+        "shares": [
+          {
+            "group": 4588,
+            "length": 1216
+          },
+          {
+            "group": 29,
+            "length": 32
+          }
+        ]
+      },
+      {
+        "id": 17613,
+        "protocols": [
+          "h2"
+        ]
+      },
+      {
+        "id": 51764,
+        "ids": [
+          "82df130201",
+          "82df130206",
+          "82df13020d",
+          "82df13020e",
+          "82df13020f",
+          "82df130212",
+          "82df130213",
+          "82df130214",
+          "839a648c9b2d0107",
+          "839a648c9b2d0108",
+          "839a648c9b2d0109",
+          "839a648c9b2d010a",
+          "839a648c9b2d010b",
+          "839a648c9b2d010c",
+          "839a648c9b2d010d",
+          "839a648c9b2d0112",
+          "839a648c9b2d0113",
+          "d6790901",
+          "d6790904",
+          "d6790905",
+          "d6790906",
+          "d6790907",
+          "d6790908",
+          "d679090a",
+          "d679090b",
+          "d679090c",
+          "d679090d",
+          "d679090f"
+        ]
+      },
+      {
+        "id": 65037,
+        "ech": {
+          "type": 0,
+          "kdf": 1,
+          "aead": 1,
+          "encLength": 32
+        },
+        "payloadSizeClass": "grease-144..240-step32"
+      },
+      {
+        "id": 65281,
+        "hex": "00"
+      }
+    ],
+    "grease": {
+      "cipher": 1,
+      "extensions": [
+        0,
+        1
+      ],
+      "groups": 1,
+      "signatures": 1,
+      "versions": 1,
+      "keyShares": [
+        1
+      ]
+    }
+  },
+  "tlsFirstFlightMatch": true,
+  "qualification": "TLS first-flight comparison only; full browser profile qualification requires HTTP/2 and headers",
+  "limitations": [
+    "Only first-flight TLS collected. HTTP/2 and request-header comparison against Chrome remain required.",
+    "Differences identify missing adapter coverage; they do not prove that the underlying engine cannot express it.",
+    "No chrome alias or verified manifest is shipped."
+  ]
+}

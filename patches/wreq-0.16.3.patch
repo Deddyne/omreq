@@ -1,0 +1,871 @@
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -180,6 +180,7 @@
+     accept_encoding: AcceptEncoding,
+     connect_timeout: Option<Duration>,
+     connection_verbose: bool,
++    socket_observer: Option<Arc<dyn crate::socket::SocketObserver>>,
+     pool_idle_timeout: Option<Duration>,
+     pool_max_idle_per_host: usize,
+     pool_max_size: Option<NonZeroUsize>,
+@@ -198,6 +199,7 @@
+     proxies: Vec<ProxyMatcher>,
+     auto_sys_proxy: bool,
+     retry_policy: retry::Policy,
++    retry_canceled_requests: bool,
+     redirect_policy: redirect::Policy,
+     referer: bool,
+     timeout_options: TimeoutOptions,
+@@ -267,6 +269,7 @@
+                 accept_encoding: AcceptEncoding::default(),
+                 connect_timeout: None,
+                 connection_verbose: false,
++                socket_observer: None,
+                 pool_idle_timeout: Some(Duration::from_secs(90)),
+                 pool_max_idle_per_host: usize::MAX,
+                 pool_max_size: None,
+@@ -285,6 +288,7 @@
+                 proxies: Vec::new(),
+                 auto_sys_proxy: true,
+                 retry_policy: retry::Policy::default(),
++                retry_canceled_requests: true,
+                 redirect_policy: redirect::Policy::none(),
+                 referer: true,
+                 timeout_options: TimeoutOptions::default(),
+@@ -528,6 +532,7 @@
+                 })
+                 .with_http(|http| {
+                     http.enforce_http(false);
++                    http.set_socket_observer(config.socket_observer.clone());
+                     http.set_keepalive(config.tcp_keepalive);
+                     http.set_keepalive_interval(config.tcp_keepalive_interval);
+                     http.set_keepalive_retries(config.tcp_keepalive_retries);
+@@ -581,6 +586,8 @@
+                 .pool_timer(config.timer.clone())
+                 .pool_idle_timeout(config.pool_idle_timeout)
+                 .pool_max_idle_per_host(config.pool_max_idle_per_host)
++                .cancel_raced_connects(config.socket_observer.is_some())
++                .retry_canceled_requests(config.retry_canceled_requests)
+                 .pool_max_size(config.pool_max_size)
+                 .build(connector)
+         };
+@@ -961,6 +968,12 @@
+         self.config.retry_policy = policy;
+         self
+     }
++    /// Control the inner connection client's replay after a reused connection
++    /// cancels a request. This is separate from the outer retry policy.
++    pub fn retry_canceled_requests(mut self, enabled: bool) -> ClientBuilder {
++        self.config.retry_canceled_requests = enabled;
++        self
++    }
+ 
+     // Proxy options
+ 
+@@ -1046,6 +1059,12 @@
+         self.config.connection_verbose = verbose;
+         self
+     }
++    /// Install native socket lifetime accounting. Reservations precede socket
++    /// creation; losing pool-race connect futures are cancelled in this mode.
++    pub fn socket_observer(mut self, observer: Arc<dyn crate::socket::SocketObserver>) -> ClientBuilder {
++        self.config.socket_observer = Some(observer);
++        self
++    }
+ 
+     // HTTP options
+ 
+--- a/src/client/layer/client.rs
++++ b/src/client/layer/client.rs
+@@ -69,6 +69,7 @@
+ #[derive(Clone, Copy)]
+ struct Config {
+     retry_canceled_requests: bool,
++    cancel_raced_connects: bool,
+     set_host: bool,
+     ver: Ver,
+ }
+@@ -443,7 +444,14 @@
+                         });
+                     // An execute error here isn't important, we're just trying
+                     // to prevent a waste of a socket...
+-                    self.exec.execute(bg);
++                    if self.config.cancel_raced_connects {
++                        // A socket owner cancels this connect while it still
++                        // waits for capacity, but a socket that already holds
++                        // capacity finishes its handshake into the pool.
++                        self.exec.execute(crate::socket::raced_connect(bg));
++                    } else {
++                        self.exec.execute(bg);
++                    }
+                 }
+                 Ok(checked_out)
+             }
+@@ -819,11 +827,20 @@
+ // ===== impl Builder =====
+ 
+ impl Builder {
++    pub(crate) fn retry_canceled_requests(mut self, enabled: bool) -> Self {
++        self.config.retry_canceled_requests = enabled;
++        self
++    }
++    pub(crate) fn cancel_raced_connects(mut self, enabled: bool) -> Self {
++        self.config.cancel_raced_connects = enabled;
++        self
++    }
+     /// Construct a new Builder.
+     pub fn new(exec: Executor) -> Self {
+         Self {
+             config: Config {
+                 retry_canceled_requests: true,
++                cancel_raced_connects: false,
+                 set_host: true,
+                 ver: Ver::Auto,
+             },
+--- a/src/conn.rs
++++ b/src/conn.rs
+@@ -24,7 +24,7 @@
+ #[cfg(any(feature = "tokio-rt", feature = "compio-rt"))]
+ use net::TcpConnector;
+ use pin_project_lite::pin_project;
+-use tls_info::TlsInfoFactory;
++pub(crate) use tls_info::TlsInfoFactory;
+ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+ use tokio_btls::SslStream;
+ use tower::{
+--- a/src/conn/connector.rs
++++ b/src/conn/connector.rs
+@@ -481,7 +481,8 @@
+         }
+     }
+ 
+-    async fn connect_auto(self, req: ConnectionDescriptor) -> Result<Conn, BoxError> {
++    async fn connect_auto(mut self, req: ConnectionDescriptor) -> Result<Conn, BoxError> {
++        self.http.set_connection_origin(req.uri().clone());
+         debug!("starting new connection: {:?}", req.uri());
+ 
+         // Determine if a proxy should be used for this request.
+--- a/src/conn/http.rs
++++ b/src/conn/http.rs
+@@ -26,7 +26,7 @@
+ static INVALID_MISSING_SCHEME: &str = "invalid URI, scheme is missing";
+ static INVALID_MISSING_HOST: &str = "invalid URI, host is missing";
+ 
+-type ConnectResult<S> = Result<<S as TcpConnector>::Connection, ConnectError>;
++type ConnectResult<S> = Result<crate::socket::Observed<<S as TcpConnector>::Connection>, ConnectError>;
+ type BoxConnecting<S> = Pin<Box<dyn Future<Output = ConnectResult<S>> + Send>>;
+ 
+ /// A trait for configuring HTTP transport options on a [`Service<Uri>`] connector.
+@@ -166,6 +166,8 @@
+                 tcp_user_timeout: None,
+                 tcp_keepalive: TcpKeepaliveOptions::default(),
+                 socket_bind: SocketBindOptions::default(),
++                socket_observer: None,
++                connection_origin: None,
+             }),
+             resolver,
+             connector,
+@@ -178,6 +180,12 @@
+         // clones.
+         Arc::make_mut(&mut self.options)
+     }
++    pub(crate) fn set_socket_observer(&mut self, observer: Option<Arc<dyn crate::socket::SocketObserver>>) {
++        self.config_mut().socket_observer = observer;
++    }
++    pub(crate) fn set_connection_origin(&mut self, origin: Uri) {
++        self.config_mut().connection_origin = Some(origin);
++    }
+ }
+ 
+ impl<R, S> HttpConnect for HttpConnector<R, S>
+@@ -349,7 +357,7 @@
+     S: TcpConnector,
+     S::TcpStream: From<socket2::Socket>,
+ {
+-    type Response = S::Connection;
++    type Response = crate::socket::Observed<S::Connection>;
+     type Error = ConnectError;
+     type Future = HttpConnecting<R, S>;
+ 
+@@ -360,6 +368,9 @@
+ 
+     fn call(&mut self, dst: Uri) -> Self::Future {
+         let mut this = self.clone();
++        if this.options.connection_origin.is_none() {
++            this.set_connection_origin(dst.clone());
++        }
+ 
+         let fut = async move {
+             let options = &this.options;
+--- a/src/conn/net/tcp.rs
++++ b/src/conn/net/tcp.rs
+@@ -31,10 +31,12 @@
+     pin::{Pin, pin},
+     task::{Context, Poll},
+     time::Duration,
++    sync::Arc,
+ };
+ 
+ use futures_util::future::Either;
+ use socket2::TcpKeepalive;
++use crate::socket::{Observed, ReservationGroup, SocketObserver};
+ 
+ use crate::{
+     conn::{Connection, net::SocketBindOptions},
+@@ -89,6 +91,8 @@
+     addrs: dns::SocketAddrs,
+     connect_timeout: Option<Duration>,
+     connector: S,
++    /// Shared by the preferred and fallback remotes of one logical connect.
++    reservation: Arc<ReservationGroup>,
+ }
+ 
+ /// Schedules staggered connection attempts for a resolved address list.
+@@ -110,7 +114,7 @@
+ struct ConnectingTcpAttempt<S: TcpConnector> {
+     addr: SocketAddr,
+     order: usize,
+-    future: S::Future,
++    future: BoxConnecting<Observed<S::Connection>, ConnectError>,
+ }
+ 
+ /// An event that advances the address race.
+@@ -125,6 +129,7 @@
+     S::TcpStream: From<socket2::Socket>,
+ {
+     pub(crate) fn new(remote_addrs: dns::SocketAddrs, config: &TcpOptions, connector: S) -> Self {
++        let reservation = Arc::new(ReservationGroup::default());
+         if let Some(fallback_timeout) = config.happy_eyeballs_timeout {
+             let (preferred_addrs, fallback_addrs) = remote_addrs.split_by_preference(
+                 config.socket_bind.ipv4_address,
+@@ -136,6 +141,7 @@
+                         preferred_addrs,
+                         config.connect_timeout,
+                         connector,
++                        reservation,
+                     ),
+                     fallback: None,
+                 };
+@@ -146,6 +152,7 @@
+                     preferred_addrs,
+                     config.connect_timeout,
+                     connector.clone(),
++                    reservation.clone(),
+                 ),
+                 fallback: Some(ConnectingTcpFallback {
+                     delay: connector.sleep(fallback_timeout),
+@@ -153,6 +160,7 @@
+                         fallback_addrs,
+                         config.connect_timeout,
+                         connector,
++                        reservation,
+                     ),
+                 }),
+             }
+@@ -162,6 +170,7 @@
+                     remote_addrs,
+                     config.connect_timeout,
+                     connector,
++                    reservation,
+                 ),
+                 fallback: None,
+             }
+@@ -169,7 +178,7 @@
+     }
+ 
+     /// Connects through the sequential fast path or the staggered address race.
+-    pub(crate) async fn connect(self, config: &TcpOptions) -> Result<S::Connection, ConnectError> {
++    pub(crate) async fn connect(self, config: &TcpOptions) -> Result<Observed<S::Connection>, ConnectError> {
+         if self.fallback.is_none()
+             && (config.happy_eyeballs_timeout.is_none() || self.preferred.addrs.len() <= 1)
+         {
+@@ -186,11 +195,17 @@
+ where
+     S::TcpStream: From<socket2::Socket>,
+ {
+-    fn new(addrs: dns::SocketAddrs, connect_timeout: Option<Duration>, connector: S) -> Self {
++    fn new(
++        addrs: dns::SocketAddrs,
++        connect_timeout: Option<Duration>,
++        connector: S,
++        reservation: Arc<ReservationGroup>,
++    ) -> Self {
+         Self {
+             addrs,
+             connect_timeout,
+             connector,
++            reservation,
+         }
+     }
+ 
+@@ -198,14 +213,14 @@
+     fn connect_next(
+         &mut self,
+         config: &TcpOptions,
+-    ) -> Option<(SocketAddr, Result<S::Future, ConnectError>)> {
++    ) -> Option<(SocketAddr, Result<BoxConnecting<Observed<S::Connection>, ConnectError>, ConnectError>)> {
+         let addr = self.addrs.next()?;
+         debug!("connecting to {}", addr);
+-        Some((addr, connect(&addr, config, &self.connector)))
++        Some((addr, connect(&addr, config, &self.connector, &self.reservation)))
+     }
+ 
+     /// Tries this address list sequentially under one shared deadline.
+-    async fn connect(mut self, config: &TcpOptions) -> Result<S::Connection, ConnectError> {
++    async fn connect(mut self, config: &TcpOptions) -> Result<Observed<S::Connection>, ConnectError> {
+         let timeout = self
+             .connect_timeout
+             .map(|duration| self.connector.sleep(duration));
+@@ -213,12 +228,12 @@
+     }
+ 
+     /// Tries addresses in resolver order until one connects.
+-    async fn connect_inner(&mut self, config: &TcpOptions) -> Result<S::Connection, ConnectError> {
++    async fn connect_inner(&mut self, config: &TcpOptions) -> Result<Observed<S::Connection>, ConnectError> {
+         let mut first_error = None;
+ 
+         while let Some((addr, result)) = self.connect_next(config) {
+             let result = match result {
+-                Ok(future) => future.await.map_err(ConnectError::tcp),
++                Ok(future) => future.await,
+                 Err(error) => Err(error),
+             };
+ 
+@@ -336,7 +351,7 @@
+     }
+ 
+     /// Polls every active attempt and reports failure only when none remain.
+-    fn poll_attempts(&mut self, cx: &mut Context<'_>) -> Poll<TcpEvent<S::Connection>> {
++    fn poll_attempts(&mut self, cx: &mut Context<'_>) -> Poll<TcpEvent<Observed<S::Connection>>> {
+         let mut index = 0;
+         let mut failed = false;
+         while let Some(attempt) = self.attempts.get_mut(index) {
+@@ -354,7 +369,7 @@
+                             return Poll::Ready(TcpEvent::Connected(connection));
+                         }
+                         Err(error) => {
+-                            let error = ConnectError::tcp(error).with_addr(addr);
++                            let error = error.with_addr(addr);
+                             trace!("connect error for {}: {:?}", addr, error);
+                             self.record_error(order, error);
+                             failed = true;
+@@ -392,7 +407,7 @@
+     }
+ 
+     /// Runs the complete address race under one shared deadline.
+-    async fn connect(mut self, config: &TcpOptions) -> Result<S::Connection, ConnectError> {
++    async fn connect(mut self, config: &TcpOptions) -> Result<Observed<S::Connection>, ConnectError> {
+         // One deadline covers the complete address race. Dividing it by the
+         // number of resolved addresses can make every attempt unusably short.
+         let timeout = self
+@@ -403,7 +418,7 @@
+     }
+ 
+     /// Drives staggered attempts until one connects or all addresses are exhausted.
+-    async fn connect_inner(&mut self, config: &TcpOptions) -> Result<S::Connection, ConnectError> {
++    async fn connect_inner(&mut self, config: &TcpOptions) -> Result<Observed<S::Connection>, ConnectError> {
+         loop {
+             if self.attempts.is_empty() && !self.launch_next(config) {
+                 return Err(self.take_error());
+@@ -492,6 +507,37 @@
+     addr: &SocketAddr,
+     config: &TcpOptions,
+     connector: &S,
++    reservation: &Arc<ReservationGroup>,
++) -> Result<BoxConnecting<Observed<S::Connection>, ConnectError>, ConnectError>
++where S::TcpStream: From<socket2::Socket> {
++    let config = config.clone();
++    let connector = connector.clone();
++    let reservation = reservation.clone();
++    let addr = *addr;
++    Ok(Box::pin(async move {
++        // Every candidate of one logical connect shares one reservation, so a
++        // fallback never queues behind its own hung first attempt.
++        let lease = if let (Some(observer), Some(origin)) = (&config.socket_observer, &config.connection_origin) {
++            Some(reservation.reserve(&**observer, origin, addr).await.map_err(ConnectError::tcp)?)
++        } else { None };
++        // Lease is declared before the socket future, so cancellation drops
++        // its raw socket before returning the reservation.
++        let mut future = connect_socket(&addr, &config, &connector)?;
++        let inner = std::future::poll_fn(|cx| {
++            if lease.as_ref().is_some_and(|l| l.poll_closed(cx, false).is_ready()) {
++                return Poll::Ready(Err(ConnectError::tcp(io::Error::new(io::ErrorKind::Interrupted, "TCP owner closed"))));
++            }
++            Pin::new(&mut future).poll(cx).map_err(ConnectError::tcp)
++        }).await?;
++        if let Some(lease) = &lease { lease.established(); }
++        Ok(Observed { inner, lease })
++    }))
++}
++
++fn connect_socket<S: TcpConnector>(
++    addr: &SocketAddr,
++    config: &TcpOptions,
++    connector: &S,
+ ) -> Result<S::Future, ConnectError>
+ where
+     S::TcpStream: From<socket2::Socket>,
+@@ -699,6 +745,8 @@
+ 
+ #[derive(Clone)]
+ pub(crate) struct TcpOptions {
++    pub socket_observer: Option<Arc<dyn SocketObserver>>,
++    pub connection_origin: Option<http::Uri>,
+     pub enforce_http: bool,
+     pub connect_timeout: Option<Duration>,
+     pub happy_eyeballs_timeout: Option<Duration>,
+@@ -889,6 +937,8 @@
+         connect_timeout: Option<Duration>,
+     ) -> TcpOptions {
+         TcpOptions {
++            socket_observer: None,
++            connection_origin: None,
+             enforce_http: false,
+             connect_timeout,
+             happy_eyeballs_timeout,
+@@ -910,9 +960,85 @@
+ 
+     fn ipv6(last: u16) -> SocketAddr {
+         (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last), 443).into()
++    }
++
++    struct SemaphoreObserver {
++        semaphore: Arc<::tokio::sync::Semaphore>,
++        reservations: Arc<std::sync::atomic::AtomicUsize>,
+     }
++    struct SemaphoreLease(::tokio::sync::OwnedSemaphorePermit);
++    impl crate::socket::SocketLease for SemaphoreLease {
++        fn established(&self) { let _ = &self.0; }
++        fn poll_closed(&self, _: &mut std::task::Context<'_>, _: bool) -> std::task::Poll<()> { std::task::Poll::Pending }
++    }
++    impl crate::socket::SocketObserver for SemaphoreObserver {
++        fn reserve(&self, _: &http::Uri, _: SocketAddr) -> crate::socket::SocketReservation {
++            self.reservations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++            let semaphore = self.semaphore.clone();
++            Box::pin(async move {
++                let permit = semaphore.acquire_owned().await.map_err(io::Error::other)?;
++                Ok(Arc::new(SemaphoreLease(permit)) as Arc<dyn crate::socket::SocketLease>)
++            })
++        }
++    }
++    fn observed(permits: usize, options: &mut TcpOptions) -> (Arc<::tokio::sync::Semaphore>, Arc<std::sync::atomic::AtomicUsize>) {
++        let semaphore = Arc::new(::tokio::sync::Semaphore::new(permits));
++        let reservations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        options.socket_observer = Some(Arc::new(SemaphoreObserver { semaphore: semaphore.clone(), reservations: reservations.clone() }));
++        options.connection_origin = Some("https://controlled.test/".parse().unwrap());
++        (semaphore, reservations)
++    }
+ 
+     #[::tokio::test(start_paused = true)]
++    async fn observer_reserves_once_per_logical_connect_before_socket_creation_and_releases_on_timeout() {
++        let mut options = tcp_options(Some(Duration::from_millis(10)), Some(Duration::from_millis(200)));
++        let (semaphore, reservations) = observed(2, &mut options);
++        let blocker = semaphore.clone().acquire_many_owned(2).await.unwrap();
++        let connector = TestConnector::new(ipv4(255));
++        // Without capacity no socket is created at all.
++        let result = ConnectingTcp::new(dns::SocketAddrs::new((1..=12).map(ipv4).collect()), &options, connector.clone()).connect(&options).await;
++        assert!(result.is_err());
++        let (launched, active, _) = connector.snapshot();
++        assert!(launched.is_empty());
++        assert_eq!(active, 0);
++        drop(blocker);
++        // With capacity, the candidates share one reservation; the race stays
++        // bounded by the parallel-attempt limit and returns it on timeout.
++        let result = ConnectingTcp::new(dns::SocketAddrs::new((1..=12).map(ipv4).collect()), &options, connector.clone()).connect(&options).await;
++        assert!(result.is_err());
++        let (launched, active, maximum) = connector.snapshot();
++        assert!(launched.len() > 1);
++        assert_eq!(active, 0);
++        assert_eq!(maximum, super::MAX_PARALLEL_CONNECT_ATTEMPTS);
++        assert_eq!(reservations.load(std::sync::atomic::Ordering::SeqCst), 2);
++        assert_eq!(semaphore.available_permits(), 2);
++    }
++
++    #[::tokio::test(start_paused = true)]
++    async fn fallback_does_not_queue_behind_its_own_hung_first_attempt() {
++        // One slot: a hung IPv6 attempt holds it, and the IPv4 fallback of the
++        // same connect must still connect long before the connect timeout.
++        let mut options = tcp_options(Some(Duration::from_millis(300)), Some(Duration::from_secs(10)));
++        let (semaphore, reservations) = observed(1, &mut options);
++        let connector = TestConnector::with_outcomes([
++            (ipv6(1), TestOutcome::Pending),
++            (ipv4(1), TestOutcome::SuccessAfter(Duration::from_millis(5))),
++        ]);
++        let started = ::tokio::time::Instant::now();
++        let connection = ConnectingTcp::new(dns::SocketAddrs::new(vec![ipv6(1), ipv4(1)]), &options, connector.clone())
++            .connect(&options)
++            .await
++            .expect("fallback connects");
++        assert!(started.elapsed() < Duration::from_secs(1));
++        assert_eq!(connector.snapshot().0, vec![ipv6(1), ipv4(1)]);
++        assert_eq!(reservations.load(std::sync::atomic::Ordering::SeqCst), 1);
++        // The winning socket keeps the slot until it closes.
++        assert_eq!(semaphore.available_permits(), 0);
++        drop(connection);
++        assert_eq!(semaphore.available_permits(), 1);
++    }
++
++    #[::tokio::test(start_paused = true)]
+     async fn races_resolved_addresses_in_order_with_a_bounded_set() {
+         let result =
+             connect_with_timeout(std::future::ready(Ok(())), Some(std::future::ready(()))).await;
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -319,6 +319,7 @@
+ pub mod header;
+ pub mod redirect;
+ pub mod retry;
++pub mod socket;
+ pub mod tls;
+ 
+ #[cfg(feature = "multipart")]
+--- a/src/socket.rs
++++ b/src/socket.rs
+@@ -0,0 +1,307 @@
++//! Optional native TCP lifetime hooks. No hook is installed by default.
++use crate::conn::{Connected, Connection, TlsInfoFactory};
++use std::{
++    error::Error as StdError,
++    fmt,
++    future::Future,
++    io,
++    net::SocketAddr,
++    ops::Deref,
++    pin::Pin,
++    sync::{Arc, Mutex, PoisonError},
++    task::{Context, Poll},
++};
++use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
++
++/// A reservation acquired before creating the TCP socket of one logical
++/// connect. Happy Eyeballs candidates of that connect share it (see
++/// `ReservationGroup`): `peer` is the first candidate's address. The future
++/// must release any queued reservation when dropped. Logical origin remains
++/// the target even through a proxy.
++pub trait SocketObserver: Send + Sync + 'static {
++    /// Reserve capacity for a physical socket to `peer` on behalf of `origin`.
++    fn reserve(&self, origin: &http::Uri, peer: SocketAddr) -> SocketReservation;
++}
++/// Pending physical socket reservation.
++pub type SocketReservation = Pin<
++    Box<
++        dyn Future<Output = Result<Arc<dyn SocketLease>, Box<dyn std::error::Error + Send + Sync>>>
++            + Send,
++    >,
++>;
++/// Native reservation owned until the socket is dropped. Response extensions
++/// and connection pool metadata never own this reservation.
++pub trait SocketLease: Send + Sync + 'static {
++    /// TCP has connected; TLS negotiation may still be pending.
++    fn established(&self);
++    /// Register the current read/connect or write waker, and return Ready when
++    /// the owner requests socket closure. Implementations must avoid lost wakes.
++    fn poll_closed(&self, cx: &mut Context<'_>, write: bool) -> Poll<()>;
++}
++
++type SharedError = Arc<dyn StdError + Send + Sync>;
++/// One reservation shared by every address candidate of one logical connect.
++///
++/// Happy Eyeballs races several sockets for one connection. Reserving capacity
++/// per candidate lets a hung first candidate hold the only free slot while the
++/// fallback candidate of the same connect queues behind it until the connect
++/// timeout. Instead the first candidate reserves, later candidates (parallel or
++/// sequential) wait for and share that reservation, a bounded overcommit of at
++/// most the parallel-attempt limit, and the winning socket keeps it. Dropping
++/// the group with the connect cancels a pending reservation or releases an
++/// unused one once the losing candidates are gone.
++#[derive(Default)]
++pub(crate) struct ReservationGroup {
++    state: Mutex<GroupState>,
++}
++#[derive(Default)]
++enum GroupState {
++    #[default]
++    Empty,
++    Pending(SocketReservation),
++    Ready(Result<Arc<dyn SocketLease>, SharedError>),
++}
++impl ReservationGroup {
++    /// Reserves for the first caller; later callers share the outcome. All
++    /// candidates of a connect are polled by the same task, so the waker the
++    /// pending reservation keeps always wakes the remaining candidates.
++    pub(crate) async fn reserve(
++        &self,
++        observer: &dyn SocketObserver,
++        origin: &http::Uri,
++        peer: SocketAddr,
++    ) -> Result<Arc<dyn SocketLease>, Box<dyn StdError + Send + Sync>> {
++        std::future::poll_fn(|cx| {
++            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++            if matches!(*state, GroupState::Empty) {
++                *state = GroupState::Pending(observer.reserve(origin, peer));
++            }
++            if let GroupState::Pending(future) = &mut *state {
++                match future.as_mut().poll(cx) {
++                    Poll::Pending => return Poll::Pending,
++                    Poll::Ready(result) => *state = GroupState::Ready(result.map_err(Arc::from)),
++                }
++            }
++            match &*state {
++                GroupState::Ready(Ok(lease)) => Poll::Ready(Ok(lease.clone())),
++                GroupState::Ready(Err(error)) => {
++                    Poll::Ready(Err(Box::new(SharedReservationError(error.clone())) as _))
++                }
++                _ => unreachable!("reservation group polled to completion"),
++            }
++        })
++        .await
++    }
++}
++/// A reservation failure reported to every candidate that shared it.
++#[derive(Debug)]
++struct SharedReservationError(SharedError);
++impl fmt::Display for SharedReservationError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt::Display::fmt(&self.0, f)
++    }
++}
++impl StdError for SharedReservationError {
++    fn source(&self) -> Option<&(dyn StdError + 'static)> {
++        Some(&*self.0)
++    }
++}
++
++std::thread_local! {
++    static RACED_CONNECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++/// Whether the code being polled is a connect that lost the pool race to an
++/// idle connection. Such a connect is completed in the background so its
++/// socket reaches the pool, but a `SocketObserver` should refuse to queue its
++/// reservation: no request is waiting for that socket.
++pub fn is_raced_connect() -> bool {
++    RACED_CONNECT.with(std::cell::Cell::get)
++}
++/// Poll `connect` with [`is_raced_connect`] reporting true.
++pub(crate) fn raced_connect(
++    connect: impl Future<Output = ()> + Send + 'static,
++) -> impl Future<Output = ()> + Send + 'static {
++    struct Raced(Pin<Box<dyn Future<Output = ()> + Send>>);
++    struct Restore(bool);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            RACED_CONNECT.with(|flag| flag.set(self.0));
++        }
++    }
++    impl Future for Raced {
++        type Output = ();
++        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++            let _restore = Restore(RACED_CONNECT.with(|flag| flag.replace(true)));
++            self.0.as_mut().poll(cx)
++        }
++    }
++    Raced(Box::pin(connect))
++}
++
++// Field order is intentional: close the stream/FD before releasing capacity.
++#[doc(hidden)]
++pub struct Observed<T> {
++    pub(crate) inner: T,
++    pub(crate) lease: Option<Arc<dyn SocketLease>>,
++}
++impl<T: fmt::Debug> fmt::Debug for Observed<T> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_tuple("Observed").field(&self.inner).finish()
++    }
++}
++impl<T> Deref for Observed<T> {
++    type Target = T;
++    fn deref(&self) -> &T {
++        &self.inner
++    }
++}
++impl<T: Connection> Connection for Observed<T> {
++    fn connected(&self) -> Connected {
++        self.inner.connected()
++    }
++}
++impl<T: TlsInfoFactory> TlsInfoFactory for Observed<T> {
++    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
++        self.inner.tls_info()
++    }
++}
++impl<T> Observed<T> {
++    fn check(&self, cx: &mut Context<'_>, write: bool) -> io::Result<()> {
++        if self
++            .lease
++            .as_ref()
++            .is_some_and(|l| l.poll_closed(cx, write).is_ready())
++        {
++            Err(io::Error::new(
++                io::ErrorKind::Interrupted,
++                "TCP owner closed",
++            ))
++        } else {
++            Ok(())
++        }
++    }
++}
++impl<T: AsyncRead + Unpin> AsyncRead for Observed<T> {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        self.check(cx, false)?;
++        Pin::new(&mut self.inner).poll_read(cx, buf)
++    }
++}
++impl<T: AsyncWrite + Unpin> AsyncWrite for Observed<T> {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        self.check(cx, true)?;
++        Pin::new(&mut self.inner).poll_write(cx, buf)
++    }
++    fn poll_write_vectored(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        bufs: &[io::IoSlice<'_>],
++    ) -> Poll<io::Result<usize>> {
++        self.check(cx, true)?;
++        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
++    }
++    fn is_write_vectored(&self) -> bool {
++        self.inner.is_write_vectored()
++    }
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        self.check(cx, true)?;
++        Pin::new(&mut self.inner).poll_flush(cx)
++    }
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        self.check(cx, true)?;
++        Pin::new(&mut self.inner).poll_shutdown(cx)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    struct Inner(Arc<AtomicBool>);
++    impl Drop for Inner {
++        fn drop(&mut self) {
++            self.0.store(true, Ordering::SeqCst);
++        }
++    }
++    struct Lease(Arc<AtomicBool>);
++    impl SocketLease for Lease {
++        fn established(&self) {}
++        fn poll_closed(&self, _: &mut Context<'_>, _: bool) -> Poll<()> {
++            Poll::Pending
++        }
++    }
++    impl Drop for Lease {
++        fn drop(&mut self) {
++            assert!(
++                self.0.load(Ordering::SeqCst),
++                "Capacity returned before raw socket drop"
++            );
++        }
++    }
++    struct Counting {
++        reservations: Arc<std::sync::atomic::AtomicUsize>,
++        released: Arc<AtomicBool>,
++    }
++    struct Released(Arc<AtomicBool>);
++    impl SocketLease for Released {
++        fn established(&self) {}
++        fn poll_closed(&self, _: &mut Context<'_>, _: bool) -> Poll<()> {
++            Poll::Pending
++        }
++    }
++    impl Drop for Released {
++        fn drop(&mut self) {
++            self.0.store(true, Ordering::SeqCst);
++        }
++    }
++    impl SocketObserver for Counting {
++        fn reserve(&self, _: &http::Uri, _: SocketAddr) -> SocketReservation {
++            self.reservations.fetch_add(1, Ordering::SeqCst);
++            let lease = Arc::new(Released(self.released.clone())) as Arc<dyn SocketLease>;
++            Box::pin(async move {
++                tokio::task::yield_now().await;
++                Ok(lease)
++            })
++        }
++    }
++    #[tokio::test]
++    async fn candidates_of_one_connect_share_one_reservation() {
++        let observer = Counting {
++            reservations: Default::default(),
++            released: Default::default(),
++        };
++        let origin: http::Uri = "https://example.test/".parse().unwrap();
++        let group = ReservationGroup::default();
++        let first = group.reserve(&observer, &origin, "[::1]:443".parse().unwrap());
++        let second = group.reserve(&observer, &origin, "127.0.0.1:443".parse().unwrap());
++        let (first, second) = tokio::join!(first, second);
++        let (first, second) = (first.unwrap(), second.unwrap());
++        assert!(Arc::ptr_eq(&first, &second));
++        let third = group
++            .reserve(&observer, &origin, "127.0.0.2:443".parse().unwrap())
++            .await
++            .unwrap();
++        assert_eq!(observer.reservations.load(Ordering::SeqCst), 1);
++        drop((first, second, group));
++        assert!(!observer.released.load(Ordering::SeqCst), "the winner keeps it");
++        drop(third);
++        assert!(observer.released.load(Ordering::SeqCst));
++    }
++    #[test]
++    fn stream_is_dropped_before_its_reservation() {
++        let closed = Arc::new(AtomicBool::new(false));
++        drop(Observed {
++            inner: Inner(closed.clone()),
++            lease: Some(Arc::new(Lease(closed.clone()))),
++        });
++        assert!(closed.load(Ordering::SeqCst));
++    }
++}
+--- a/src/tls.rs
++++ b/src/tls.rs
+@@ -205,6 +205,13 @@
+     /// **Default:** `None` (implementation default)
+     pub grease_enabled: Option<bool>,
+ 
++    /// Include a GREASE value in signature_algorithms (upstream cd76bcdf).
++    pub grease_sigalgs_enabled: Option<bool>,
++
++    /// Non-empty one-byte-length-prefixed Trust Anchor IDs, without the outer length.
++    /// This guides certificate selection and never disables certificate verification.
++    pub trust_anchors: Option<Cow<'static, [u8]>>,
++
+     /// Enables OCSP stapling for the connection.
+     ///
+     /// **Default:** `false`
+@@ -558,6 +565,8 @@
+             enable_ech_grease: false,
+             permute_extensions: None,
+             grease_enabled: None,
++            grease_sigalgs_enabled: None,
++            trust_anchors: None,
+             enable_ocsp_stapling: false,
+             enable_signed_cert_timestamps: false,
+             record_size_limit: None,
+--- a/src/tls/conn.rs
++++ b/src/tls/conn.rs
+@@ -337,6 +337,12 @@
+             .set_cert_store(self.cert_store.as_ref())?
+             .set_cert_verification(self.cert_verification)
+             .set_cert_compressors(opts.certificate_compressors.as_deref())?;
++
++        // Backported from wreq cd76bcdf1307153de289d34e072528bdf0510a3b.
++        if let Some(ids) = opts.trust_anchors.as_deref() {
++            connector.set_requested_trust_anchors(ids).map_err(Error::tls)?;
++        }
++        set_option!(opts, grease_sigalgs_enabled, connector, set_grease_sigalgs_enabled);
+ 
+         // Set minimum TLS version
+         set_option_inner_try!(min_tls_version, connector, set_min_proto_version);

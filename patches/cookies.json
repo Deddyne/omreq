@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "scope": "In-tree RFC 6265bis cookie parser (crates/omreq-core/src/cookies.rs) and static Public Suffix List; no independent transport cookie engine.",
+  "packages": [
+    {
+      "name": "psl",
+      "version": "2.1.254",
+      "registrySource": "registry+https://github.com/rust-lang/crates.io-index",
+      "registryChecksum": "cb958e602bc5c9e07a3bdb78ce240402a490cd08f01e51deacfe637ed903d743",
+      "repository": "https://github.com/addr-rs/psl",
+      "revision": "bc1d239c240301da09ebc0af3c243258f2a903ef",
+      "declaredLicense": "MIT/Apache-2.0",
+      "effectiveFiles": {
+        ".cargo_vcs_info.json": "fef16feac6fcb7d09b421cd7bae4f2dc794f5117c7acb154479494c0c84d746b",
+        ".github/workflows/ci.yml": "c3ace52601525b03ce82b56e8c96d3e66c18a3dde55928edc28c9ef0c04c2bf5",
+        ".github/workflows/update.yaml": "ec5171ca22d33a39fecb418a53ad1fb8ab77d38c517ad6c04d3fe99c94f5b75a",
+        ".gitignore": "6eef65a6975a1981ed2fb9e9fd27c5d878cdede94191269b2d6d09b5f49c76cd",
+        "Cargo.lock": "79e587b715a2a4a2b3310d65551c9e5be42ad63a3fe93b627485566b30a971e9",
+        "Cargo.toml": "63a9aa576e0e92d8005c1acb8e446cf41cabd6c29ce5656d9925910367a2df39",
+        "Cargo.toml.orig": "4c9e319215d73b32ecb77975733bc0830009eb577b9b3ec1c4a4c198212211ac",
+        "LICENSE": "f09adf500d35265ee63ef552f8e61487e09ee549da66eaf0ec7924e3ad7cf14b",
+        "Makefile.toml": "20c02a261f36e1c31c5d62a79e288e3dec516fe02bff93513301be7d46ad272d",
+        "README.md": "3d37bb94d19542bdcaebdf5bc03e6666f2cbb0276aa6c700d2a77d3be669379e",
+        "benches/benches.rs": "8f90e56bd9077806ebd406e5071cde9eda99df74f715c01ee07d8f02c8eb8889",
+        "data/rules.txt": "b8d553ad7e7b28c5dfd0f4d3a2b3a5df829186583ea29ee8e2022d91977f1bab",
+        "examples/tldextract.rs": "2f978913bbdbe4d938e4dee01b67b519adefb3cc925c0188d16e5d08c469a1f7",
+        "src/lib.rs": "f9e0380290b60816fe29556e2aba0ca26702b80348da42e4d88519b40c640e3e",
+        "src/list.rs": "6966e9a7096fa209b70bc3c4c36564781cc6daa0fba9f91b1a4d122f838e2ec7"
+      }
+    },
+    {
+      "name": "psl-types",
+      "version": "2.0.11",
+      "registrySource": "registry+https://github.com/rust-lang/crates.io-index",
+      "registryChecksum": "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac",
+      "repository": "https://github.com/addr-rs/psl-types",
+      "revision": "c0b9c35c4cc306c4f8a888814a68e652571e2730",
+      "declaredLicense": "MIT/Apache-2.0",
+      "effectiveFiles": {
+        ".cargo_vcs_info.json": "082bfb4ac2dbaba285b2acdb0cb6bb1eb7570cc77e28047b64dc7818f5f55f25",
+        ".github/workflows/ci.yml": "19fa1fc9f2c8ad137c8cd7e59e84aff2cf19cc06d8f9d501663955443bba9a39",
+        ".gitignore": "6eef65a6975a1981ed2fb9e9fd27c5d878cdede94191269b2d6d09b5f49c76cd",
+        "Cargo.toml": "ecf17792a126db760bcdc0d29b17587b01136251a0065eb10a32d4adb3f4fe2e",
+        "Cargo.toml.orig": "e07dfef370af63fcf62c3d4fd29207c21d399927551768ccc8d830724c45f9f8",
+        "LICENSE": "7b25e06666d3797292dbb4b1c3f5ba509ebe02fce102e1dca7ca81dd3cbfbeb7",
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "README.md": "e86d890e1b13f4fd9e099275129f3b05913c70bb8c8ba56301ef82385ff02363",
+        "src/lib.rs": "53b73a33d873f212ca4e72e07a414d45c3c17eb084912ee61253f684634f3464"
+      }
+    }
+  ],
+  "pslData": {
+    "version": "psl/2.1.254",
+    "upstreamList": "https://publicsuffix.org/list/public_suffix_list.dat",
+    "crateRepository": "https://github.com/addr-rs/psl",
+    "crateRevision": "bc1d239c240301da09ebc0af3c243258f2a903ef",
+    "rulesSource": "https://github.com/addr-rs/psl/blob/bc1d239c240301da09ebc0af3c243258f2a903ef/data/rules.txt",
+    "rulesPath": "data/rules.txt",
+    "rulesSha256": "b8d553ad7e7b28c5dfd0f4d3a2b3a5df829186583ea29ee8e2022d91977f1bab",
+    "generatedSource": "https://github.com/addr-rs/psl/blob/bc1d239c240301da09ebc0af3c243258f2a903ef/src/list.rs",
+    "generatedPath": "src/list.rs",
+    "generatedSha256": "6966e9a7096fa209b70bc3c4c36564781cc6daa0fba9f91b1a4d122f838e2ec7",
+    "license": "MPL-2.0",
+    "licenseUrl": "https://www.mozilla.org/MPL/2.0/",
+    "licenseTextSource": "https://www.mozilla.org/media/MPL/2.0/index.815ca599c9df.txt",
+    "licensePath": "licenses/PSL-MPL-2.0.txt",
+    "licenseSha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
+    "originalPslRevision": null,
+    "freshness": "The pinned crate snapshot is authoritative. Its original PSL commit/date is not independently established; this is not a claim of matching the current public list.",
+    "modifications": "Omreq does not modify these crate or rule/table source files. Full rules source and the MPL-2.0 text are included in generated third-party notices."
+  },
+  "maintenance": "Any version/source change requires deliberate provenance review, changed frozen hashes, matching build metadata and repeated cookie tests. Verification never refreshes this file."
+}

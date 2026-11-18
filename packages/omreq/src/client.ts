@@ -1,0 +1,987 @@
+import { performance } from 'node:perf_hooks';
+import { invalid, keys, nativeError, OmreqError, positive } from './errors.js';
+import {
+  type HeaderInput,
+  headerGroups,
+  headerOverrideNames,
+  mergeOnto,
+  type Pair,
+  snapshotHeaders,
+} from './headers.js';
+import {
+  loadNative,
+  type NativeClient,
+  type NativeOperation,
+  type ProfileCheck,
+} from './native.js';
+import { defineProfile, getProfile, type ProfileV1, serializeProfile } from './profile.js';
+import {
+  type DecodeOptions,
+  OmreqResponse,
+  type RedirectHop,
+  type ResponseMeta,
+} from './response.js';
+import {
+  type BodyInput,
+  type PreparedBody,
+  prepareBody,
+  startUpload,
+  type UploadControl,
+} from './upload.js';
+export interface Timeouts {
+  queueMs?: number;
+  headersMs?: number;
+  uploadIdleMs?: number;
+  bodyIdleMs?: number;
+  consumerIdleMs?: number | null;
+  totalMs?: number | null;
+}
+export interface RedirectOptions {
+  redirect?: 'follow' | 'manual' | 'error';
+  maxRedirects?: number;
+  allowInsecureRedirects?: boolean;
+  sensitiveHeaders?: readonly string[];
+}
+export interface RequestOptions extends RedirectOptions {
+  method?: string;
+  headers?: HeaderInput;
+  body?: BodyInput;
+  json?: unknown;
+  form?: URLSearchParams | readonly (readonly [string, string])[];
+  searchParams?: URLSearchParams | readonly (readonly [string, string])[];
+  signal?: AbortSignal;
+  timeouts?: Timeouts;
+  maxResponseBytes?: number | null;
+  maxBufferedResponseBytes?: number;
+  /**
+   * Transparently decode gzip, deflate, br and (where the runtime supports it)
+   * zstd response bodies. Defaults to the client option, which defaults to
+   * true. Bodies are never decoded when `accept-encoding` is set explicitly in
+   * client or request headers.
+   */
+  decompress?: boolean;
+}
+export interface ClientOptions extends RedirectOptions {
+  cookies?: boolean;
+  profile?: string | ProfileV1;
+  baseUrl?: string | URL;
+  headers?: HeaderInput;
+  ca?: string;
+  trustStore?: 'bundled' | 'chromium';
+  maxActiveOperations?: number;
+  maxActivePerOrigin?: number;
+  maxConnections?: number;
+  maxConnectionsPerOrigin?: number;
+  maxQueuedOperations?: number;
+  maxInputChunkBytes?: number;
+  maxRetainedRequestBodyBytes?: number;
+  maxBufferedResponseBytes?: number;
+  maxAggregateBufferedResponseBytes?: number;
+  connectMs?: number;
+  timeouts?: Timeouts;
+  /** Default for RequestOptions.decompress; true when omitted. */
+  decompress?: boolean;
+}
+export interface OriginAdmissionStats {
+  readonly origin: string;
+  readonly activeOperations: number;
+  readonly waitingOperations: number;
+}
+export interface CookieRecord {
+  readonly name: string;
+  readonly value: string;
+  readonly domain: string;
+  readonly path: string;
+  readonly hostOnly: boolean;
+  readonly secure: boolean;
+  readonly httpOnly: boolean;
+  readonly sameSite: 'Strict' | 'Lax' | 'None' | null;
+  readonly expiresAt: number | null;
+}
+export interface CookieStore {
+  setCookie(value: string, url: string | URL): Promise<void>;
+  getCookies(url: string | URL): Promise<readonly CookieRecord[]>;
+  clear(): Promise<void>;
+}
+export interface ClientStats {
+  readonly cookieCount: number;
+  readonly cookieBytes: number;
+  readonly discardedCookies: number;
+  readonly partitionedCookies: number;
+  readonly evictedCookies: number;
+  readonly activeOperations: number;
+  readonly queuedOperations: number;
+  readonly initializingOperations: number;
+  readonly originWaitOperations: number;
+  readonly origins: readonly OriginAdmissionStats[];
+  readonly admissionLimits: Readonly<{
+    maxActiveOperations: number;
+    maxQueuedOperations: number;
+    maxActivePerOrigin: number;
+  }>;
+  readonly openBodies: number;
+  readonly uploadBridgeBytes: number;
+  readonly downloadBridgeBytes: number;
+  readonly nativeTasks: number;
+  readonly completed: number;
+  readonly aborted: number;
+  readonly timedOut: number;
+  readonly bufferedResponseBytes: number;
+  readonly bufferedResponseLimitBytes: number;
+  readonly retainedRequestBodyBytes: number;
+  readonly connections: number;
+  readonly creatingConnections: number;
+  readonly waitingConnections: number;
+  readonly connectionOrigins: readonly Readonly<{
+    origin: string;
+    connections: number;
+    waitingConnections: number;
+  }>[];
+  readonly connectionLimits: Readonly<{ maxConnections: number; maxConnectionsPerOrigin: number }>;
+  readonly idleConnections: number | null;
+  readonly connectionAccounting: string;
+}
+type NativeStats = Omit<ClientStats, 'initializingOperations' | 'retainedRequestBodyBytes'>;
+const redirectKeys = ['redirect', 'maxRedirects', 'allowInsecureRedirects', 'sensitiveHeaders'];
+const STANDARD_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+const NO_BODY: PreparedBody = Object.freeze({});
+const DECODE_UNLIMITED: DecodeOptions = Object.freeze({ limit: null });
+const requestKeys = [
+  ...redirectKeys,
+  'method',
+  'headers',
+  'body',
+  'json',
+  'form',
+  'searchParams',
+  'signal',
+  'timeouts',
+  'maxResponseBytes',
+  'maxBufferedResponseBytes',
+  'decompress',
+];
+const clientKeys = [
+  'cookies',
+  ...redirectKeys,
+  'profile',
+  'baseUrl',
+  'headers',
+  'ca',
+  'trustStore',
+  'maxActiveOperations',
+  'maxActivePerOrigin',
+  'maxConnections',
+  'maxConnectionsPerOrigin',
+  'maxQueuedOperations',
+  'maxInputChunkBytes',
+  'maxRetainedRequestBodyBytes',
+  'maxBufferedResponseBytes',
+  'maxAggregateBufferedResponseBytes',
+  'connectMs',
+  'timeouts',
+  'decompress',
+];
+/** Trims the cookie WSP (space and HTAB) that Set-Cookie parsing ignores. */
+function trimWsp(value: string): string {
+  return value.replace(/^[ \t]+|[ \t]+$/g, '');
+}
+/**
+ * RFC 6265bis limits: name + value up to 4096 octets (the cookie is rejected),
+ * each attribute value up to 1024 octets (that attribute is ignored natively).
+ * The whole line is bounded like a response header block.
+ */
+function checkSetCookie(value: string): void {
+  if (value.length > 65536 || Buffer.byteLength(value) > 65536)
+    throw new OmreqError('ERR_INVALID_COOKIE', 'configuration', 'Set-Cookie exceeds 64 KiB');
+  const end = value.indexOf(';');
+  const pair = end === -1 ? value : value.slice(0, end);
+  const split = pair.indexOf('=');
+  const name = split === -1 ? '' : trimWsp(pair.slice(0, split));
+  const cookieValue = trimWsp(split === -1 ? pair : pair.slice(split + 1));
+  if (Buffer.byteLength(name) + Buffer.byteLength(cookieValue) > 4096)
+    throw new OmreqError(
+      'ERR_INVALID_COOKIE',
+      'configuration',
+      'Cookie name and value exceed 4 KiB',
+    );
+}
+/**
+ * Adds the body's automatic content-type unless client or request headers set
+ * or remove (`null`) it. A FormData body is framed here, so an explicit
+ * multipart content-type gets this operation's boundary.
+ */
+function contentType(headers: Pair[], overrides: readonly string[], prepared: PreparedBody): void {
+  const index = headers.findIndex(([n]) => n === 'content-type');
+  if (index === -1) {
+    if (!overrides.includes('content-type'))
+      headers.push(['content-type', prepared.contentType as string]);
+    return;
+  }
+  if (prepared.boundary === undefined) return;
+  const [type = '', ...params] = (headers[index] as Pair)[1].split(';');
+  if (!/^multipart\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/i.test(type.trim()))
+    invalid('content-type: a FormData body requires a multipart media type');
+  const kept = params.map((p) => p.trim()).filter((p) => p && !/^boundary\s*=/i.test(p));
+  headers[index] = [
+    'content-type',
+    [type.trim(), ...kept, `boundary=${prepared.boundary}`].join('; '),
+  ];
+}
+function redirectPolicy(value: RedirectOptions): RedirectOptions {
+  const { redirect, maxRedirects, allowInsecureRedirects, sensitiveHeaders } = value;
+  if (redirect !== undefined && !['follow', 'manual', 'error'].includes(redirect))
+    invalid('redirect: expected follow, manual or error');
+  if (
+    maxRedirects !== undefined &&
+    (!Number.isSafeInteger(maxRedirects) || maxRedirects < 0 || maxRedirects > 10)
+  )
+    invalid('maxRedirects: expected an integer from 0 to 10');
+  if (allowInsecureRedirects !== undefined && typeof allowInsecureRedirects !== 'boolean')
+    invalid('allowInsecureRedirects: expected a boolean');
+  if (
+    sensitiveHeaders !== undefined &&
+    (!Array.isArray(sensitiveHeaders) ||
+      sensitiveHeaders.length > 200 ||
+      sensitiveHeaders.some(
+        (name) =>
+          typeof name !== 'string' ||
+          name.length > 256 ||
+          !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name),
+      ))
+  )
+    invalid('sensitiveHeaders: expected at most 200 valid header names');
+  return {
+    ...(redirect !== undefined ? { redirect } : {}),
+    ...(maxRedirects !== undefined ? { maxRedirects } : {}),
+    ...(allowInsecureRedirects !== undefined ? { allowInsecureRedirects } : {}),
+    ...(sensitiveHeaders !== undefined
+      ? { sensitiveHeaders: Object.freeze(sensitiveHeaders.map((name) => name.toLowerCase())) }
+      : {}),
+  };
+}
+function timeouts(value: Timeouts = {}): Timeouts {
+  if (!value || typeof value !== 'object') invalid('timeouts: expected an object');
+  keys(
+    value,
+    ['queueMs', 'headersMs', 'uploadIdleMs', 'bodyIdleMs', 'consumerIdleMs', 'totalMs'],
+    'timeouts',
+  );
+  for (const [key, v] of Object.entries(value))
+    positive(v, `timeouts.${key}`, ['consumerIdleMs', 'totalMs'].includes(key));
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined));
+}
+function normalizedUrl(
+  input: string | URL,
+  base?: string,
+  params?: RequestOptions['searchParams'],
+): string {
+  let url: URL;
+  try {
+    url = new URL(String(input), base);
+  } catch {
+    invalid('Expected an absolute HTTP(S) URL or a relative URL with baseUrl');
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password)
+    invalid('Only HTTP(S) URLs without credentials are allowed');
+  url.hash = '';
+  if (params !== undefined) {
+    if (!(params instanceof URLSearchParams) && !Array.isArray(params))
+      invalid('searchParams: expected URLSearchParams or string pairs');
+    const pairs = [...params];
+    for (const pair of pairs)
+      if (!Array.isArray(pair) || pair.length !== 2 || pair.some((v) => typeof v !== 'string'))
+        invalid('searchParams: expected string pairs');
+    if (pairs.length) {
+      // Edit the raw query instead of url.searchParams: any searchParams
+      // mutation re-serializes every existing pair as form data, which changes
+      // signed URLs (%20 -> +, ',' -> %2C, '~' -> %7E). Only segments whose
+      // decoded key is replaced are removed; the rest keep their exact bytes.
+      const replaced = new Set(pairs.map(([key]) => key));
+      const raw = url.search.slice(1);
+      const kept = (raw ? raw.split('&') : []).filter((segment) => {
+        const [first] = new URLSearchParams(segment);
+        return !first || !replaced.has(first[0]);
+      });
+      kept.push(new URLSearchParams(pairs as [string, string][]).toString());
+      url.search = kept.join('&');
+    }
+  }
+  return url.href;
+}
+export class OmreqClient {
+  readonly #profile: ProfileV1;
+  readonly #options: ClientOptions;
+  readonly #headers: HeaderInput;
+  readonly #base: string | undefined;
+  #native: NativeClient | undefined;
+  #init: Promise<NativeClient> | undefined;
+  #failure: unknown;
+  #state: 'created' | 'initializing' | 'ready' | 'closing' | 'closed' | 'failed' = 'created';
+  #close: Promise<void> | undefined;
+  #profileCheck: ProfileCheck | undefined;
+  #retained = 0;
+  #admitted = 0;
+  #initializingRequests = 0;
+  readonly #uploads = new Set<UploadControl>();
+  // Native operations opened and not yet released in JavaScript; close()
+  // resolves only after every one of them has settled.
+  #live = 0;
+  #nextId = 0;
+  #drained: (() => void) | undefined;
+  // Request-independent layers, validated once.
+  readonly #baseHeaders: ReadonlyMap<string, readonly Pair[]>;
+  readonly #baseOverrides: readonly string[];
+  readonly #baseTimers: Required<Timeouts>;
+  readonly #baseRedirect: Required<Omit<RedirectOptions, 'sensitiveHeaders'>> & {
+    sensitiveHeaders: string[];
+  };
+  readonly cookies: CookieStore = Object.freeze({
+    setCookie: async (value: string, url: string | URL): Promise<void> => {
+      if (typeof value !== 'string') invalid('Cookie value must be a string');
+      checkSetCookie(value);
+      const target = normalizedUrl(url);
+      try {
+        (await this.#cookieClient()).setCookie(value, target);
+      } catch (error) {
+        throw nativeError(error);
+      }
+    },
+    getCookies: async (url: string | URL): Promise<readonly CookieRecord[]> => {
+      const target = normalizedUrl(url);
+      try {
+        const values = JSON.parse(
+          (await this.#cookieClient()).getCookies(target),
+        ) as CookieRecord[];
+        return Object.freeze(values.map((value) => Object.freeze(value)));
+      } catch (error) {
+        throw nativeError(error);
+      }
+    },
+    clear: async (): Promise<void> => {
+      try {
+        (await this.#cookieClient()).clearCookies();
+      } catch (error) {
+        throw nativeError(error);
+      }
+    },
+  });
+  async #cookieClient(): Promise<NativeClient> {
+    this.#assertOpen();
+    if (this.#options.cookies === false) invalid('Cookies are disabled for this client');
+    const native = await this.#initialize();
+    this.#assertOpen();
+    return native;
+  }
+  constructor(options: ClientOptions = {}) {
+    if (!options || typeof options !== 'object') invalid('options: expected an object');
+    keys(options, clientKeys, 'options');
+    if (options.cookies !== undefined && typeof options.cookies !== 'boolean')
+      invalid('cookies: expected a boolean');
+    if (options.decompress !== undefined && typeof options.decompress !== 'boolean')
+      invalid('decompress: expected a boolean');
+    this.#profile =
+      typeof options.profile === 'string'
+        ? getProfile(options.profile)
+        : options.profile === undefined
+          ? getProfile('omreq/custom-default')
+          : defineProfile(options.profile);
+    this.#headers = snapshotHeaders(options.headers);
+    this.#base = options.baseUrl === undefined ? undefined : normalizedUrl(options.baseUrl);
+    for (const [key, v] of Object.entries(options))
+      if (
+        [
+          'maxActiveOperations',
+          'maxActivePerOrigin',
+          'maxConnections',
+          'maxConnectionsPerOrigin',
+          'maxInputChunkBytes',
+          'maxRetainedRequestBodyBytes',
+          'maxBufferedResponseBytes',
+          'maxAggregateBufferedResponseBytes',
+          'connectMs',
+        ].includes(key)
+      )
+        positive(v, key);
+    if (
+      options.maxQueuedOperations !== undefined &&
+      (!Number.isSafeInteger(options.maxQueuedOperations) ||
+        options.maxQueuedOperations < 0 ||
+        options.maxQueuedOperations > 4096)
+    )
+      invalid('maxQueuedOperations: expected an integer from 0 to 4096');
+    if ((options.maxActiveOperations ?? 64) > 1024) invalid('maxActiveOperations: maximum is 1024');
+    if ((options.maxActivePerOrigin ?? 32) > 1024) invalid('maxActivePerOrigin: maximum is 1024');
+    if ((options.maxConnections ?? 256) > 4096) invalid('maxConnections: maximum is 4096');
+    if ((options.maxConnectionsPerOrigin ?? 32) > 1024)
+      invalid('maxConnectionsPerOrigin: maximum is 1024');
+    if ((options.maxInputChunkBytes ?? 1048576) > 1048576)
+      invalid('maxInputChunkBytes: prototype maximum is 1 MiB');
+    if (
+      options.ca !== undefined &&
+      (typeof options.ca !== 'string' || !options.ca.includes('-----BEGIN CERTIFICATE-----'))
+    )
+      invalid('ca: expected PEM certificates');
+    if (options.trustStore !== undefined && !['bundled', 'chromium'].includes(options.trustStore))
+      invalid('trustStore: expected bundled or chromium');
+    this.#options = {
+      ...options,
+      ...redirectPolicy(options),
+      timeouts: timeouts(options.timeouts),
+    };
+    this.#baseHeaders = headerGroups(
+      this.#profile.headers as readonly (readonly [string, string])[],
+      this.#headers,
+    );
+    this.#baseOverrides = headerOverrideNames(this.#headers);
+    this.#baseTimers = {
+      queueMs: 10000,
+      headersMs: 30000,
+      uploadIdleMs: 30000,
+      bodyIdleMs: 30000,
+      consumerIdleMs: 60000,
+      totalMs: null,
+      ...this.#options.timeouts,
+    };
+    this.#baseRedirect = {
+      redirect: this.#options.redirect ?? 'follow',
+      maxRedirects: this.#options.maxRedirects ?? 10,
+      allowInsecureRedirects: this.#options.allowInsecureRedirects ?? false,
+      sensitiveHeaders: [...new Set(this.#options.sensitiveHeaders ?? [])],
+    };
+  }
+  #initialize(): Promise<NativeClient> {
+    if (this.#state === 'failed') return Promise.reject(this.#failure);
+    if (this.#state === 'closing' || this.#state === 'closed')
+      return Promise.reject(new OmreqError('ERR_CLIENT_CLOSED', 'queue', 'Client is closed'));
+    if (this.#init) return this.#init;
+    this.#state = 'initializing';
+    this.#init = Promise.resolve()
+      .then(async () => {
+        const addon = loadNative();
+        const profile = serializeProfile(this.#profile);
+        // The cheap report covers capabilities; constructing the client below
+        // reports a TLS backend rejection without building a transport twice.
+        const check = JSON.parse(addon.profileReport(profile)) as ProfileCheck;
+        if (!check.compatible)
+          throw new OmreqError(
+            'ERR_PROFILE_UNSUPPORTED',
+            'initialization',
+            check.issues.map((i) => i.message).join('; '),
+          );
+        if (this.#state === 'closing' || this.#state === 'closed')
+          throw new OmreqError(
+            'ERR_CLIENT_CLOSED',
+            'initialization',
+            'Client closed during initialization',
+          );
+        const native = new addon.NativeClient(
+          profile,
+          JSON.stringify({
+            maxActiveOperations: this.#options.maxActiveOperations ?? 64,
+            maxQueuedOperations: this.#options.maxQueuedOperations ?? 256,
+            maxActivePerOrigin: this.#options.maxActivePerOrigin ?? 32,
+            maxConnections: this.#options.maxConnections ?? 256,
+            maxConnectionsPerOrigin: this.#options.maxConnectionsPerOrigin ?? 32,
+            maxAggregateBufferedResponseBytes:
+              this.#options.maxAggregateBufferedResponseBytes ?? 134217728,
+            connectMs: this.#options.connectMs ?? 10000,
+            ca: this.#options.ca ?? null,
+            trustStore: this.#options.trustStore ?? 'bundled',
+            cookies: this.#options.cookies ?? true,
+          }),
+        );
+        this.#native = native;
+        this.#profileCheck = check;
+        this.#state = 'ready';
+        return native;
+      })
+      .catch((error: unknown) => {
+        const converted = nativeError(error);
+        this.#failure = converted;
+        if (this.#state !== 'closing' && this.#state !== 'closed') this.#state = 'failed';
+        throw converted;
+      });
+    return this.#init;
+  }
+  async request(input: string | URL, options: RequestOptions = {}): Promise<OmreqResponse> {
+    const invokedAt = performance.now();
+    this.#assertOpen();
+    if (!options || typeof options !== 'object') invalid('request options: expected an object');
+    keys(options, requestKeys, 'request');
+    const signal = options.signal;
+    if (
+      signal &&
+      (typeof signal.addEventListener !== 'function' || typeof signal.aborted !== 'boolean')
+    )
+      invalid('signal: expected an AbortSignal');
+    if (signal?.aborted)
+      throw new OmreqError('ERR_ABORTED', 'queue', 'Request was aborted', { cause: signal.reason });
+    let op: NativeOperation | undefined;
+    let native: NativeClient | undefined;
+    let id = 0;
+    let cleanup: Promise<void> | undefined;
+    let upload: UploadControl | undefined;
+    let abortReason: unknown;
+    let uploadFailure: unknown;
+    // Without a signal nothing can abort the request from JavaScript, so the
+    // abort promise and its race are only built when a signal is passed.
+    let aborted: Promise<never> | undefined;
+    let onAbort: (() => void) | undefined;
+    if (signal) {
+      let rejectAbort!: (error: unknown) => void;
+      aborted = new Promise<never>((_, reject) => {
+        rejectAbort = reject;
+      });
+      // Always attach a rejection handler, including after headers when a signal aborts body reads.
+      void aborted.catch(() => {});
+      onAbort = () => {
+        abortReason = signal.reason;
+        if (id) native?.cancel(id, 'ERR_ABORTED');
+        upload?.stop();
+        rejectAbort(
+          new OmreqError('ERR_ABORTED', 'queue', 'Request was aborted', { cause: abortReason }),
+        );
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }
+    let released = false;
+    let admitted = false;
+    let opened = false;
+    let retained = 0;
+    const finish = () => {
+      if (released) return;
+      released = true;
+      if (admitted) this.#admitted--;
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
+      this.#retained -= retained;
+      retained = 0;
+      if (upload) {
+        this.#uploads.delete(upload);
+        void upload.cleanup();
+      }
+      if (opened && --this.#live === 0) {
+        const drained = this.#drained;
+        this.#drained = undefined;
+        drained?.();
+      }
+    };
+    try {
+      if (
+        this.#admitted >=
+        (this.#options.maxActiveOperations ?? 64) + (this.#options.maxQueuedOperations ?? 256)
+      )
+        throw new OmreqError('ERR_QUEUE_FULL', 'queue', 'Operation queue is full');
+      this.#admitted++;
+      admitted = true;
+      const url = normalizedUrl(input, this.#base, options.searchParams);
+      let method = options.method ?? 'GET';
+      if (!STANDARD_METHODS.has(method)) {
+        if (
+          typeof method !== 'string' ||
+          !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method) ||
+          method.toUpperCase() === 'CONNECT'
+        )
+          invalid('Unsupported or invalid method');
+        if (STANDARD_METHODS.has(method.toUpperCase())) method = method.toUpperCase();
+      }
+      // `body: undefined` and `form: undefined` mean no body; `json: undefined`
+      // is rejected below because JSON has no representation for it.
+      const hasJson = Object.hasOwn(options, 'json');
+      const source =
+        options.body !== undefined
+          ? 'body'
+          : hasJson
+            ? 'json'
+            : options.form !== undefined
+              ? 'form'
+              : undefined;
+      if (
+        (options.body !== undefined ? 1 : 0) +
+          (hasJson ? 1 : 0) +
+          (options.form !== undefined ? 1 : 0) >
+        1
+      )
+        invalid('body, json and form are mutually exclusive');
+      let prepared: PreparedBody;
+      if (source === undefined) prepared = NO_BODY;
+      else if (source === 'json') {
+        let json: string | undefined;
+        try {
+          json = JSON.stringify(options.json);
+        } catch (cause) {
+          throw new OmreqError(
+            'ERR_INVALID_ARGUMENT',
+            'configuration',
+            'JSON serialization failed',
+            { cause },
+          );
+        }
+        if (json === undefined) invalid('json: undefined is not a JSON body');
+        prepared = { bytes: Buffer.from(json), contentType: 'application/json' };
+      } else if (source === 'form') {
+        const form = options.form;
+        if (!(form instanceof URLSearchParams) && !Array.isArray(form))
+          invalid('form: expected URLSearchParams or string pairs');
+        const pairs = [...form];
+        for (const p of pairs)
+          if (!Array.isArray(p) || p.length !== 2 || p.some((v) => typeof v !== 'string'))
+            invalid('form: expected string pairs');
+        prepared = {
+          bytes: Buffer.from(new URLSearchParams(pairs.map(([k, v]) => [k, v])).toString()),
+          contentType: 'application/x-www-form-urlencoded',
+        };
+      } else {
+        // Reserve materialized input capacity before making the owned byte snapshot.
+        const body = options.body;
+        const size =
+          typeof body === 'string'
+            ? Buffer.byteLength(body)
+            : body instanceof ArrayBuffer
+              ? body.byteLength
+              : ArrayBuffer.isView(body)
+                ? body.byteLength
+                : 0;
+        if (size + this.#retained > (this.#options.maxRetainedRequestBodyBytes ?? 67108864))
+          throw new OmreqError(
+            'ERR_RESOURCE_LIMIT',
+            'queue',
+            'Retained request byte budget exceeded; use a stream',
+          );
+        prepared = prepareBody(
+          body,
+          (this.#options.maxRetainedRequestBodyBytes ?? 67108864) - this.#retained,
+          Math.min(this.#options.maxInputChunkBytes ?? 1048576, 65536),
+        );
+      }
+      if ((method === 'GET' || method === 'HEAD') && source !== undefined)
+        invalid(`${method} cannot have a body`);
+      retained = prepared.retainedBytes ?? prepared.bytes?.length ?? 0;
+      if (retained + this.#retained > (this.#options.maxRetainedRequestBodyBytes ?? 67108864)) {
+        retained = 0;
+        throw new OmreqError(
+          'ERR_RESOURCE_LIMIT',
+          'queue',
+          'Retained request byte budget exceeded',
+        );
+      }
+      this.#retained += retained;
+      const { headers, overrides: headerOverrides } = mergeOnto(
+        this.#baseHeaders,
+        options.headers,
+        this.#baseOverrides,
+      );
+      if (prepared.contentType) contentType(headers, headerOverrides, prepared);
+      if (options.decompress !== undefined && typeof options.decompress !== 'boolean')
+        invalid('decompress: expected a boolean');
+      // An explicit accept-encoding means the caller handles content codings.
+      const decompress =
+        (options.decompress ?? this.#options.decompress ?? true) &&
+        !headerOverrides.includes('accept-encoding');
+      const timers =
+        options.timeouts === undefined
+          ? this.#baseTimers
+          : { ...this.#baseTimers, ...timeouts(options.timeouts) };
+      positive(options.maxResponseBytes, 'maxResponseBytes', true, Number.MAX_SAFE_INTEGER);
+      positive(options.maxBufferedResponseBytes, 'maxBufferedResponseBytes');
+      const maxResponseBytes = options.maxResponseBytes ?? null;
+      const maxBufferedResponseBytes =
+        options.maxBufferedResponseBytes ?? this.#options.maxBufferedResponseBytes ?? 67108864;
+      let redirect = this.#baseRedirect;
+      if (
+        options.redirect !== undefined ||
+        options.maxRedirects !== undefined ||
+        options.allowInsecureRedirects !== undefined ||
+        options.sensitiveHeaders !== undefined
+      ) {
+        redirect = {
+          ...redirect,
+          ...redirectPolicy(options),
+          sensitiveHeaders: [
+            ...new Set([
+              ...redirect.sensitiveHeaders,
+              ...(options.sensitiveHeaders ?? []).map((name) => name.toLowerCase()),
+            ]),
+          ],
+        };
+        if (redirect.sensitiveHeaders.length > 200)
+          invalid('sensitiveHeaders: combined maximum is 200');
+      }
+      if (this.#profile.transport.httpVersion === '2' && !url.startsWith('https:'))
+        invalid('Strict HTTP/2 requires HTTPS; h2c is unsupported');
+      const queueDeadline = invokedAt + timers.queueMs;
+      const totalDeadline = timers.totalMs === null ? null : invokedAt + timers.totalMs;
+      const initDeadline = Math.min(queueDeadline, totalDeadline ?? Infinity);
+      const expired = () =>
+        new OmreqError('ERR_TIMEOUT', 'queue', 'Request deadline expired before admission');
+      if (performance.now() >= initDeadline) throw expired();
+      native = this.#native;
+      if (native === undefined) {
+        let initTimer: ReturnType<typeof setTimeout> | undefined;
+        const initTimeout = new Promise<never>((_, reject) => {
+          initTimer = setTimeout(
+            () => reject(expired()),
+            Math.max(1, initDeadline - performance.now()),
+          );
+        });
+        this.#initializingRequests++;
+        try {
+          native = await Promise.race(
+            aborted
+              ? [this.#initialize(), aborted, initTimeout]
+              : [this.#initialize(), initTimeout],
+          );
+        } finally {
+          this.#initializingRequests--;
+          clearTimeout(initTimer);
+        }
+        this.#assertOpen();
+      }
+      const admittedAt = performance.now();
+      // A blocked JS thread can delay the timer callback. Check monotonic time
+      // before native work even if initialization won that Promise race.
+      if (admittedAt >= initDeadline) throw expired();
+      if (signal?.aborted) onAbort?.();
+      const streaming = !!(prepared.source || prepared.replay);
+      id = ++this.#nextId;
+      // Opening registers admission synchronously, in invocation order; the
+      // rest of the operation runs natively until the response is available.
+      const executing = native.request(
+        id,
+        url,
+        JSON.stringify({
+          url,
+          method,
+          headers,
+          headerOverrides,
+          streaming,
+          replayable: !!prepared.replay,
+          bodyLength: prepared.contentLength,
+          queueMs: Math.ceil(queueDeadline - admittedAt),
+          hopQueueMs: timers.queueMs,
+          headersMs: timers.headersMs,
+          uploadIdleMs: timers.uploadIdleMs,
+          bodyIdleMs: timers.bodyIdleMs,
+          consumerIdleMs: timers.consumerIdleMs,
+          totalMs: totalDeadline === null ? null : Math.ceil(totalDeadline - admittedAt),
+          redirect: redirect.redirect,
+          maxRedirects: redirect.maxRedirects,
+          allowInsecureRedirects: redirect.allowInsecureRedirects,
+          sensitiveHeaders: redirect.sensitiveHeaders,
+          maxResponseBytes,
+        }),
+        prepared.bytes,
+      );
+      opened = true;
+      this.#live++;
+      if (signal?.aborted) {
+        native.cancel(id, 'ERR_ABORTED');
+        throw new OmreqError('ERR_ABORTED', 'queue', 'Request was aborted', {
+          cause: signal.reason,
+        });
+      }
+      if (streaming) {
+        // Missing only when the operation already failed; `executing` rejects.
+        op = native.operation(id) ?? undefined;
+        if (op) {
+          upload = startUpload(
+            op,
+            prepared,
+            this.#options.maxInputChunkBytes ?? 1048576,
+            (error) => {
+              uploadFailure = error;
+            },
+          );
+          this.#uploads.add(upload);
+        }
+      }
+      const [status, httpVersion, finalUrl, rawHeaders, history, inline, cleaned, streamed] =
+        aborted ? await Promise.race([executing, aborted]) : await executing;
+      const meta: ResponseMeta = {
+        status,
+        url: finalUrl ?? url,
+        httpVersion,
+        headers: rawHeaders,
+        redirects: history === undefined ? [] : (JSON.parse(history) as RedirectHop[]),
+      };
+      upload?.stop();
+      if (upload) void upload.cleanup();
+      // Final headers end the request side: redirects can no longer replay
+      // the body and native code has dropped its copy, so the retained
+      // request budget is released now rather than when the response body
+      // is finished.
+      this.#retained -= retained;
+      retained = 0;
+      if (inline !== undefined && cleaned) {
+        // The whole body arrived with the headers and the native operation has
+        // already released its slot and connection.
+        cleanup = undefined;
+        finish();
+      } else {
+        cleanup = streamed ? streamed.waitCleanup() : native.waitCleanup(id);
+        void cleanup.then(finish, finish);
+      }
+      return new OmreqResponse(
+        meta,
+        streamed,
+        maxBufferedResponseBytes,
+        finish,
+        () => abortReason,
+        cleanup,
+        inline,
+        // HEAD, 204 and 304 have no body, so no decoding is claimed for them.
+        decompress && method !== 'HEAD' && status !== 204 && status !== 304
+          ? maxResponseBytes === null
+            ? DECODE_UNLIMITED
+            : { limit: maxResponseBytes }
+          : undefined,
+      );
+    } catch (error) {
+      if (opened && native) {
+        native.cancel(id, 'ERR_BODY_DISPOSED');
+        await native.waitCleanup(id).catch(() => {});
+      }
+      finish();
+      const converted = nativeError(error);
+      if (
+        uploadFailure !== undefined &&
+        ['ERR_UPLOAD_SOURCE', 'ERR_RESOURCE_LIMIT'].includes(converted.code)
+      )
+        throw new OmreqError(converted.code, converted.phase, converted.message, {
+          cause: uploadFailure,
+        });
+      throw converted;
+    }
+  }
+  #assertOpen(): void {
+    if (this.#state === 'closing' || this.#state === 'closed')
+      throw new OmreqError('ERR_CLIENT_CLOSED', 'queue', 'Client is closed');
+  }
+  #verb(
+    method: string,
+    url: string | URL,
+    options: Omit<RequestOptions, 'method'> = {},
+  ): Promise<OmreqResponse> {
+    if ('method' in options)
+      return Promise.reject(
+        new OmreqError(
+          'ERR_INVALID_ARGUMENT',
+          'configuration',
+          'Convenience methods do not accept method',
+        ),
+      );
+    return this.request(url, { ...options, method });
+  }
+  get(url: string | URL, options?: Omit<RequestOptions, 'method'>) {
+    return this.#verb('GET', url, options);
+  }
+  post(url: string | URL, options?: Omit<RequestOptions, 'method'>) {
+    return this.#verb('POST', url, options);
+  }
+  put(url: string | URL, options?: Omit<RequestOptions, 'method'>) {
+    return this.#verb('PUT', url, options);
+  }
+  patch(url: string | URL, options?: Omit<RequestOptions, 'method'>) {
+    return this.#verb('PATCH', url, options);
+  }
+  delete(url: string | URL, options?: Omit<RequestOptions, 'method'>) {
+    return this.#verb('DELETE', url, options);
+  }
+  head(url: string | URL, options?: Omit<RequestOptions, 'method'>) {
+    return this.#verb('HEAD', url, options);
+  }
+  options(url: string | URL, options?: Omit<RequestOptions, 'method'>) {
+    return this.#verb('OPTIONS', url, options);
+  }
+  /** `await using client = createClient()` closes the client at scope exit. */
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.close();
+  }
+  close(): Promise<void> {
+    if (this.#close) return this.#close;
+    this.#state = 'closing';
+    this.#close = (async () => {
+      try {
+        if (this.#init) await this.#init.catch(() => {});
+        for (const upload of this.#uploads) upload.stop();
+        await Promise.all([this.#native?.close(), ...[...this.#uploads].map((u) => u.cleanup())]);
+        while (this.#live > 0)
+          await new Promise<void>((resolve) => {
+            this.#drained = resolve;
+          });
+      } catch (error) {
+        throw nativeError(error);
+      } finally {
+        this.#uploads.clear();
+        this.#state = 'closed';
+      }
+    })();
+    return this.#close;
+  }
+  getInfo() {
+    return Object.freeze({
+      state: this.#state,
+      nativeReady: !!this.#native,
+      profileId: this.#profile.id,
+      profileDigest: this.#profileCheck?.profileDigest ?? null,
+      engineBuildId: this.#profileCheck?.engineBuildId ?? null,
+      verification: 'custom-unverified',
+      trustStore: this.#options.trustStore ?? 'bundled',
+      stage: 'internal-prototype',
+    });
+  }
+  getStats(): ClientStats {
+    const stats: NativeStats = this.#native
+      ? (JSON.parse(this.#native.stats()) as NativeStats)
+      : {
+          activeOperations: 0,
+          queuedOperations: 0,
+          openBodies: 0,
+          uploadBridgeBytes: 0,
+          downloadBridgeBytes: 0,
+          nativeTasks: 0,
+          completed: 0,
+          aborted: 0,
+          timedOut: 0,
+          cookieCount: 0,
+          cookieBytes: 0,
+          discardedCookies: 0,
+          partitionedCookies: 0,
+          evictedCookies: 0,
+          connections: 0,
+          creatingConnections: 0,
+          waitingConnections: 0,
+          connectionOrigins: [],
+          connectionLimits: {
+            maxConnections: this.#options.maxConnections ?? 256,
+            maxConnectionsPerOrigin: this.#options.maxConnectionsPerOrigin ?? 32,
+          },
+          idleConnections: 0,
+          connectionAccounting: 'physical TCP sockets/attempts bounded; idle lifecycle unavailable',
+          bufferedResponseBytes: 0,
+          bufferedResponseLimitBytes: this.#options.maxAggregateBufferedResponseBytes ?? 134217728,
+          originWaitOperations: 0,
+          origins: [],
+          admissionLimits: {
+            maxActiveOperations: this.#options.maxActiveOperations ?? 64,
+            maxQueuedOperations: this.#options.maxQueuedOperations ?? 256,
+            maxActivePerOrigin: this.#options.maxActivePerOrigin ?? 32,
+          },
+        };
+    return Object.freeze({
+      ...stats,
+      origins: Object.freeze(stats.origins.map((origin) => Object.freeze({ ...origin }))),
+      admissionLimits: Object.freeze({ ...stats.admissionLimits }),
+      connectionLimits: Object.freeze({ ...stats.connectionLimits }),
+      connectionOrigins: Object.freeze(
+        stats.connectionOrigins.map((origin) => Object.freeze({ ...origin })),
+      ),
+      queuedOperations: stats.queuedOperations + this.#initializingRequests,
+      initializingOperations: this.#initializingRequests,
+      retainedRequestBodyBytes: this.#retained,
+    });
+  }
+}
+export function createClient(options?: ClientOptions): OmreqClient {
+  return new OmreqClient(options);
+}

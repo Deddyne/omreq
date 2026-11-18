@@ -1,0 +1,283 @@
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -313,6 +313,7 @@
+ /// ```
+ #[derive(Clone, Debug)]
+ pub struct Builder {
++    hpack_prefer_smaller_huffman: bool,
+     /// Time to keep locally reset streams around before reaping.
+     reset_stream_duration: Duration,
+ 
+@@ -669,6 +670,7 @@
+     /// ```
+     pub fn new() -> Builder {
+         Builder {
++            hpack_prefer_smaller_huffman: false,
+             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
+             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
+             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
+@@ -1209,6 +1211,13 @@
+     ///
+     /// This determines the order in which settings are sent during the HTTP/2 handshake.
+     /// Customizing the order may be useful for testing or protocol compliance.
++    /// Prefer literal strings when Huffman would not make them smaller.
++    pub fn hpack_prefer_smaller_huffman(&mut self, enabled: bool) -> &mut Self {
++        self.hpack_prefer_smaller_huffman = enabled;
++        self
++    }
++
++    /// Sets the order of parameters in the initial SETTINGS frame.
+     pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
+         self.settings.set_settings_order(order);
+         self
+@@ -1407,6 +1416,7 @@
+ 
+         // Create the codec
+         let mut codec = Codec::new(io);
++        codec.set_send_prefer_smaller_huffman(builder.hpack_prefer_smaller_huffman);
+ 
+         if let Some(max) = builder.settings.max_frame_size() {
+             codec.set_max_recv_frame_size(max as usize);
+--- a/src/codec/framed_read.rs
++++ b/src/codec/framed_read.rs
+@@ -19,8 +19,13 @@
+ use tokio_util::codec::FramedRead as InnerFramedRead;
+ use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
+ 
+-// 16 MB "sane default" taken from golang http2
+-const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
++// omreq: local receive bound for one header block (encoded CONTINUATION
++// buffer and decoded list). It applies whether or not SETTINGS advertise
++// MAX_HEADER_LIST_SIZE, and caps a larger advertised value, so the frames
++// sent (a fingerprint) are unchanged while a peer cannot make the client
++// buffer up to 16 MiB per stream. Upstream defaults to 16 MiB (from golang).
++const LOCAL_MAX_HEADER_LIST_SIZE: usize = 256 << 10;
++const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = LOCAL_MAX_HEADER_LIST_SIZE;
+ 
+ #[derive(Debug)]
+ pub struct FramedRead<T> {
+@@ -96,6 +101,7 @@
+     /// Update the max header list size setting.
+     #[inline]
+     pub fn set_max_header_list_size(&mut self, val: usize) {
++        let val = val.min(LOCAL_MAX_HEADER_LIST_SIZE);
+         self.max_header_list_size = val;
+         // Update max CONTINUATION frames too, since its based on this
+         self.max_continuation_frames = calc_max_continuation_frames(val, self.max_frame_size());
+@@ -474,5 +480,37 @@
+                 push.into()
+             }
+         }
++    }
++}
++
++#[cfg(test)]
++mod omreq_header_list_tests {
++    use super::*;
++    use tokio_util::codec::length_delimited;
++
++    fn read() -> FramedRead<&'static [u8]> {
++        FramedRead::new(
++            length_delimited::Builder::new()
++                .big_endian()
++                .length_field_length(3)
++                .length_adjustment(9)
++                .num_skip(0)
++                .new_read(&[][..]),
++        )
+     }
++
++    #[test]
++    fn header_list_bound_applies_without_and_caps_advertised_settings() {
++        let mut framed = read();
++        framed.set_max_frame_size(frame::DEFAULT_MAX_FRAME_SIZE as usize);
++        assert_eq!(framed.max_header_list_size, LOCAL_MAX_HEADER_LIST_SIZE);
++        framed.set_max_header_list_size(16 << 20);
++        assert_eq!(framed.max_header_list_size, LOCAL_MAX_HEADER_LIST_SIZE);
++        framed.set_max_header_list_size(16 << 10);
++        assert_eq!(framed.max_header_list_size, 16 << 10);
++        // At the default 16 KiB frame size, CONTINUATION buffering stays near
++        // the bound instead of 1280 frames (20 MiB).
++        framed.set_max_header_list_size(usize::MAX);
++        assert_eq!(framed.max_continuation_frames, 20);
++    }
+ }
+--- a/src/codec/framed_write.rs
++++ b/src/codec/framed_write.rs
+@@ -325,6 +325,10 @@
+     pub fn set_max_frame_size(&mut self, val: usize) {
+         assert!(val <= frame::MAX_MAX_FRAME_SIZE as usize);
+         self.encoder.max_frame_size = val as FrameSize;
++    }
++
++    pub fn set_prefer_smaller_huffman(&mut self, enabled: bool) {
++        self.encoder.hpack.set_prefer_smaller_huffman(enabled);
+     }
+ 
+     /// Set the peer's header table size.
+--- a/src/codec/mod.rs
++++ b/src/codec/mod.rs
+@@ -90,6 +90,10 @@
+         self.framed_write().set_max_frame_size(val)
+     }
+ 
++    pub fn set_send_prefer_smaller_huffman(&mut self, enabled: bool) {
++        self.framed_write().set_prefer_smaller_huffman(enabled);
++    }
++
+     /// Set the peer's header table size size.
+     pub fn set_send_header_table_size(&mut self, val: usize) {
+         self.framed_write().set_header_table_size(val)
+--- a/src/hpack/encoder.rs
++++ b/src/hpack/encoder.rs
+@@ -9,6 +9,7 @@
+ pub struct Encoder {
+     table: Table,
+     size_update: Option<SizeUpdate>,
++    prefer_smaller_huffman: bool,
+ }
+ 
+ #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+@@ -22,9 +23,14 @@
+         Encoder {
+             table: Table::new(max_size, capacity),
+             size_update: None,
++            prefer_smaller_huffman: false,
+         }
+     }
+ 
++    pub(crate) fn set_prefer_smaller_huffman(&mut self, enabled: bool) {
++        self.prefer_smaller_huffman = enabled;
++    }
++
+     /// Queues a max size update.
+     ///
+     /// The next call to `encode` will include a dynamic size update frame.
+@@ -120,7 +126,7 @@
+             Index::Name(idx, _) => {
+                 let header = self.table.resolve(index);
+ 
+-                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst);
++                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst, self.prefer_smaller_huffman);
+             }
+             Index::Inserted(_) => {
+                 let header = self.table.resolve(index);
+@@ -129,8 +135,8 @@
+ 
+                 dst.put_u8(0b0100_0000);
+ 
+-                encode_str(header.name().as_slice(), dst);
+-                encode_str(header.value_slice(), dst);
++                encode_str(header.name().as_slice(), dst, self.prefer_smaller_huffman);
++                encode_str(header.value_slice(), dst, self.prefer_smaller_huffman);
+             }
+             Index::InsertedValue(idx, _) => {
+                 let header = self.table.resolve(index);
+@@ -138,7 +144,7 @@
+                 assert!(!header.is_sensitive());
+ 
+                 encode_int(idx, 6, 0b0100_0000, dst);
+-                encode_str(header.value_slice(), dst);
++                encode_str(header.value_slice(), dst, self.prefer_smaller_huffman);
+             }
+             Index::NotIndexed(_) => {
+                 let header = self.table.resolve(index);
+@@ -148,6 +154,7 @@
+                     header.value_slice(),
+                     header.is_sensitive(),
+                     dst,
++                    self.prefer_smaller_huffman,
+                 );
+             }
+         }
+@@ -166,7 +173,7 @@
+             | Index::InsertedValue(..) => {
+                 let idx = self.table.resolve_idx(last);
+ 
+-                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst);
++                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst, self.prefer_smaller_huffman);
+             }
+             Index::NotIndexed(_) => {
+                 let last = self.table.resolve(last);
+@@ -176,6 +183,7 @@
+                     value.as_ref(),
+                     value.is_sensitive(),
+                     dst,
++                    self.prefer_smaller_huffman,
+                 );
+             }
+         }
+@@ -192,28 +200,33 @@
+     encode_int(val, 5, 0b0010_0000, dst)
+ }
+ 
+-fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
++fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut, prefer_smaller: bool) {
+     if sensitive {
+         encode_int(name, 4, 0b10000, dst);
+     } else {
+         encode_int(name, 4, 0, dst);
+     }
+ 
+-    encode_str(value, dst);
++    encode_str(value, dst, prefer_smaller);
+ }
+ 
+-fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut) {
++fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut, prefer_smaller: bool) {
+     if sensitive {
+         dst.put_u8(0b10000);
+     } else {
+         dst.put_u8(0);
+     }
+ 
+-    encode_str(name, dst);
+-    encode_str(value, dst);
++    encode_str(name, dst, prefer_smaller);
++    encode_str(value, dst, prefer_smaller);
+ }
+ 
+-fn encode_str(val: &[u8], dst: &mut BytesMut) {
++fn encode_str(val: &[u8], dst: &mut BytesMut, prefer_smaller: bool) {
++    if prefer_smaller && huffman::encoded_len(val) >= val.len() {
++        encode_int(val.len(), 7, 0, dst);
++        dst.put_slice(val);
++        return;
++    }
+     if !val.is_empty() {
+         let idx = position(dst);
+ 
+@@ -718,3 +731,20 @@
+         huffman::decode(src, &mut buf).unwrap()
+     }
+ }
++
++#[cfg(test)]
++mod omreq_huffman_tests {
++    use super::*;
++    #[test]
++    fn smaller_policy_uses_plain_bytes_on_ties_and_expansion() {
++        for input in [b"?0".as_slice(), b"\"macOS\"", b"\xff"] {
++            let mut bytes=BytesMut::new();encode_str(input,&mut bytes,true);
++            assert_eq!(bytes[0]&0x80,0);assert_eq!(&bytes[1..],input);
++        }
++    }
++    #[test]
++    fn smaller_policy_still_compresses_when_shorter_and_preserves_legacy_default() {
++        let mut bytes=BytesMut::new();encode_str(b"www.example.com",&mut bytes,true);assert_eq!(bytes[0]&0x80,0x80);
++        let mut legacy=BytesMut::new();encode_str(b"?0",&mut legacy,false);assert_eq!(legacy[0]&0x80,0x80);
++    }
++}
+--- a/src/hpack/huffman/mod.rs
++++ b/src/hpack/huffman/mod.rs
+@@ -40,6 +40,10 @@
+     Ok(buf.split())
+ }
+ 
++pub(crate) fn encoded_len(src: &[u8]) -> usize {
++    src.iter().map(|&byte| ENCODE_TABLE[usize::from(byte)].0 as usize).sum::<usize>().div_ceil(8)
++}
++
+ pub fn encode(src: &[u8], dst: &mut BytesMut) {
+     let mut bits: u64 = 0;
+     let mut bits_left = 40;

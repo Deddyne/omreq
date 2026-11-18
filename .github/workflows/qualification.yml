@@ -1,0 +1,49 @@
+name: Native qualification
+on:
+  # Pull requests run once; pushes only for the default branch, so a PR branch
+  # push does not trigger a second identical run.
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: qualification-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  macos-arm64:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['26.13.1']
+        os: ['macos-15', 'macos-26']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.4'
+      - run: test "$(uname -m)" = arm64
+      - run: npm install --global pnpm@11.22.0
+      - run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'vendor/**/Cargo.toml') }}
+          restore-keys: cargo-${{ matrix.os }}-
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/verify-cookies.mjs --self-test
+      - run: node scripts/notices.mjs --check
+      - run: pnpm build
+      - run: pnpm test:transport
+      - run: pnpm test:transport:wreq
+      - run: pnpm check
+      - run: pnpm pack:check

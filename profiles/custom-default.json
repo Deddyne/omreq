@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "omreq/custom-default",
+  "revision": 1,
+  "target": { "family": "custom", "platform": "generic" },
+  "defaults": "omreq-transport-v1",
+  "requires": [],
+  "transport": {},
+  "headers": [["user-agent", "Omreq/0.0.0-internal.1"], ["accept", "*/*"]]
+}

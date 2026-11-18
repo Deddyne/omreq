@@ -1,0 +1,40 @@
+[workspace]
+members = ["crates/omreq-core", "crates/omreq-napi"]
+resolver = "3"
+exclude = ["vendor/wreq", "vendor/http2", "vendor/wreq-proto"]
+
+[workspace.package]
+version = "0.0.0-internal.1"
+edition = "2024"
+license = "MIT"
+rust-version = "1.100"
+
+[workspace.dependencies]
+wreq = { version = "=0.16.3", default-features = false, features = ["tokio-rt", "webpki-roots", "stream"] }
+napi = { version = "=3.16.2", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = "=3.7.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tokio = { version = "=1.53.3", features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio-util = { version = "=0.7.19", features = ["rt"] }
+bytes = "=1.12.1"
+http = "=1.5.0"
+http-body = "=1.1.0"
+url = "=2.5.8"
+futures-util = "=0.3.34"
+sha2 = "=0.10.9"
+jsonschema = { version = "=0.61.2", default-features = false }
+psl = "=2.1.254"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Transport qualification: stable wreq with a minimal upstream TLS DTO backport.
+[patch.crates-io]
+http2 = { path = "vendor/http2" }
+wreq-proto = { path = "vendor/wreq-proto" }
+wreq = { path = "vendor/wreq" }
+btls = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }

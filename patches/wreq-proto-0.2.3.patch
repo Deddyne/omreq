@@ -1,0 +1,193 @@
+--- a/src/conn/http2.rs
++++ b/src/conn/http2.rs
+@@ -217,6 +217,7 @@
+ 
+         // Crate the HTTP/2 client with the provided options.
+         let mut builder = http2::client::Builder::default();
++        builder.hpack_prefer_smaller_huffman(self.opts.hpack_prefer_smaller_huffman);
+         builder
+             .initial_max_send_streams(self.opts.initial_max_send_streams)
+             .initial_window_size(self.opts.initial_window_size)
+--- a/src/proto/http1/dispatch.rs
++++ b/src/proto/http1/dispatch.rs
+@@ -286,8 +286,11 @@
+             Ok(()) => (),
+             Err(()) => {
+                 trace!("dispatch no longer receiving messages");
++                // The response receiver is gone. Do not flush a potentially
++                // blocked request body before dropping the dispatcher/socket.
++                // No caller remains to observe a response or reuse this stream.
+                 self.close();
+-                return Poll::Ready(Ok(()));
++                return Poll::Ready(Err(Error::new_canceled()));
+             }
+         }
+ 
+--- a/src/proto/http2.rs
++++ b/src/proto/http2.rs
+@@ -474,6 +474,8 @@
+ #[non_exhaustive]
+ #[derive(Debug, Clone)]
+ pub struct Http2Options {
++    /// Prefer plain HPACK strings unless Huffman is strictly smaller.
++    pub hpack_prefer_smaller_huffman: bool,
+     /// Whether to use adaptive flow control.
+     pub adaptive_window: bool,
+ 
+@@ -895,6 +897,7 @@
+             enable_connect_protocol: None,
+             no_rfc7540_priorities: None,
+             settings_order: None,
++            hpack_prefer_smaller_huffman: false,
+             headers_pseudo_order: None,
+             headers_stream_dependency: None,
+             priorities: None,
+--- a/src/proto/http2/client.rs
++++ b/src/proto/http2/client.rs
+@@ -1,4 +1,5 @@
+ use std::{
++    collections::VecDeque,
+     convert::Infallible,
+     future::Future,
+     marker::PhantomData,
+@@ -43,6 +44,7 @@
+ 
+ /// Receiver for HTTP/2 client requests
+ type ClientRx<B> = dispatch::Receiver<Request<B>, Response<Incoming>>;
++type QueuedRequest<B> = (Request<B>, Callback<Request<B>, Response<Incoming>>);
+ 
+ ///// An mpsc channel is used to help notify the `Connection` task when *all*
+ ///// other handles to it have been dropped, so that it can shutdown.
+@@ -104,6 +106,8 @@
+         executor: exec,
+         h2_tx,
+         req_rx,
++        req_rx_closed: false,
++        pending_requests: VecDeque::new(),
+         fut_ctx: None,
+         marker: PhantomData,
+     })
+@@ -329,6 +333,12 @@
+     executor: E,
+     h2_tx: SendRequest<SendBuf<B::Data>>,
+     req_rx: ClientRx<B>,
++    req_rx_closed: bool,
++    // These requests have moved out of the existing dispatch channel, not
++    // duplicated it. The caller's operation admission bounds their number.
++    // Keep FIFO while watching every callback, including those behind a live
++    // head, so exhausted stream capacity cannot retain cancelled request bodies.
++    pending_requests: VecDeque<QueuedRequest<B>>,
+     fut_ctx: Option<FutCtx<B>>,
+     marker: PhantomData<T>,
+ }
+@@ -557,18 +567,66 @@
+     type Output = Result<Dispatched>;
+ 
+     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-        loop {
+-            match ready!(self.h2_tx.poll_ready(cx)) {
+-                Ok(()) => (),
+-                Err(err) => {
+-                    self.ping.ensure_not_timed_out()?;
+-                    return if err.reason() == Some(::http2::Reason::NO_ERROR) {
+-                        trace!("connection gracefully shutdown");
+-                        Poll::Ready(Ok(Dispatched::Shutdown))
+-                    } else {
+-                        Poll::Ready(Err(Error::new_h2(err)))
++        // Drain only a cooperative batch per poll. Cancellation must be
++        // observed independently of h2 readiness: MAX_CONCURRENT_STREAMS can
++        // remain exhausted for the entire lifetime of an unrelated response.
++        let mut received = 0;
++        if !self.req_rx_closed {
++            for _ in 0..16 {
++                match self.req_rx.poll_recv(cx) {
++                    Poll::Ready(Some((req, mut cb))) => {
++                        received += 1;
++                        if cb.poll_canceled(cx).is_pending() {
++                            self.pending_requests.push_back((req, cb));
++                        }
++                    }
++                    Poll::Ready(None) => {
++                        self.req_rx_closed = true;
++                        break;
++                    }
++                    Poll::Pending => break,
++                }
++            }
++        }
++        if received == 16 {
++            // There may be more messages, and the ready receives above did
++            // not register a receiver waker for the next batch.
++            cx.waker().wake_by_ref();
++        }
++        self.pending_requests
++            .retain_mut(|(_, cb)| cb.poll_canceled(cx).is_pending());
++        if self
++            .fut_ctx
++            .as_mut()
++            .is_some_and(|f| f.cb.poll_canceled(cx).is_ready())
++        {
++            let mut f = self.fut_ctx.take().expect("checked pending context");
++            f.body_tx.send_reset(http2::Reason::CANCEL);
++            // Dropping f releases its request body now, rather than waiting
++            // for another stream to finish and make h2_tx ready again.
++        }
++
++        for _ in 0..16 {
++            match self.h2_tx.poll_ready(cx) {
++                Poll::Pending => {
++                    return match Pin::new(&mut self.conn_eof).poll(cx) {
++                        Poll::Ready(Ok(never)) => match never {},
++                        Poll::Ready(Err(_)) => Poll::Ready(Ok(Dispatched::Shutdown)),
++                        Poll::Pending => Poll::Pending,
+                     };
+                 }
++                Poll::Ready(result) => match result {
++                    Ok(()) => (),
++                    Err(err) => {
++                        self.ping.ensure_not_timed_out()?;
++                        return if err.reason() == Some(::http2::Reason::NO_ERROR) {
++                            trace!("connection gracefully shutdown");
++                            Poll::Ready(Ok(Dispatched::Shutdown))
++                        } else {
++                            Poll::Ready(Err(Error::new_h2(err)))
++                        };
++                    }
++                },
+             };
+ 
+             // If we were waiting on pending open
+@@ -578,8 +636,8 @@
+                 continue;
+             }
+ 
+-            match self.req_rx.poll_recv(cx) {
+-                Poll::Ready(Some((req, cb))) => {
++            match self.pending_requests.pop_front() {
++                Some((req, cb)) => {
+                     // Check that future hasn't been canceled already
+                     if cb.is_canceled() {
+                         trace!("request callback is canceled");
+@@ -657,12 +715,12 @@
+                     continue;
+                 }
+ 
+-                Poll::Ready(None) => {
++                None if self.req_rx_closed => {
+                     trace!("client::dispatch::Sender dropped");
+                     return Poll::Ready(Ok(Dispatched::Shutdown));
+                 }
+ 
+-                Poll::Pending => match ready!(Pin::new(&mut self.conn_eof).poll(cx)) {
++                None => match ready!(Pin::new(&mut self.conn_eof).poll(cx)) {
+                     // As of Rust 1.82, this pattern is no longer needed, and emits a warning.
+                     // But we cannot remove it as long as MSRV is less than that.
+                     Ok(never) => match never {},
+@@ -673,5 +731,7 @@
+                 },
+             }
+         }
++        cx.waker().wake_by_ref();
++        Poll::Pending
+     }
+ }
