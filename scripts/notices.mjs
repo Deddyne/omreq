@@ -16,15 +16,17 @@ const metadata = JSON.parse(
     maxBuffer: 20 * 1024 * 1024,
   }),
 );
+// Same output on every OS: Windows checkouts may carry CRLF line endings.
+const read = (path) => readFileSync(path, 'utf8').replaceAll('\r\n', '\n');
 const items = [];
 for (const p of metadata.packages
-  .filter((p) => p.source || p.manifest_path.includes('/vendor/'))
+  .filter((p) => p.source || p.manifest_path.replaceAll('\\', '/').includes('/vendor/'))
   .sort((a, b) => a.name.localeCompare(b.name))) {
   const dir = dirname(p.manifest_path);
   let text = `## ${p.name} ${p.version}\n\nDeclared license: ${p.license ?? 'see license file'}\nSource: ${p.repository ?? p.source}\n`;
-  const files = readdirSync(dir).filter((f) =>
-    /^(LICENSE|LICENCE|COPYING|NOTICE|COPYRIGHT)(\.|-|$)/i.test(f),
-  );
+  const files = readdirSync(dir)
+    .filter((f) => /^(LICENSE|LICENCE|COPYING|NOTICE|COPYRIGHT)(\.|-|$)/i.test(f))
+    .sort();
   if (p.license_file && !files.includes(p.license_file)) files.push(p.license_file);
   if (p.name === 'btls-sys')
     for (const f of [
@@ -36,7 +38,7 @@ for (const p of metadata.packages
       if (existsSync(join(dir, f))) files.push(f);
   for (const file of files) {
     try {
-      const value = readFileSync(join(dir, file), 'utf8');
+      const value = read(join(dir, file));
       text += `\n### ${file}\n\n\`\`\`text\n${value}\n\`\`\`\n`;
     } catch {}
   }
@@ -47,8 +49,8 @@ for (const p of metadata.packages
 // notices file, so recipients need no runtime downloader or current-list URL.
 const { provenance, packages } = verifyCookies(metadata);
 const data = provenance.pslData;
-const rules = readFileSync(join(packages.get('psl').dir, data.rulesPath), 'utf8');
-const dataLicense = readFileSync(data.licensePath, 'utf8');
+const rules = read(join(packages.get('psl').dir, data.rulesPath));
+const dataLicense = read(data.licensePath);
 items.push(
   `## Mozilla Public Suffix List data (${data.version})\n\n` +
     `Data license: ${data.license}\n` +
@@ -80,10 +82,10 @@ for (const name of ['ajv', 'jsonc-parser', 'fast-deep-equal']) {
   const dir = dirname(path),
     p = JSON.parse(readFileSync(path));
   let text = `## npm: ${p.name} ${p.version}\n\nDeclared license: ${p.license}\n`;
-  for (const file of readdirSync(dir).filter((f) =>
-    /^(LICENSE|LICENCE|COPYING|NOTICE)(\.|-|$)/i.test(f),
-  ))
-    text += `\n\`\`\`text\n${readFileSync(join(dir, file), 'utf8')}\n\`\`\`\n`;
+  for (const file of readdirSync(dir)
+    .filter((f) => /^(LICENSE|LICENCE|COPYING|NOTICE)(\.|-|$)/i.test(f))
+    .sort())
+    text += `\n\`\`\`text\n${read(join(dir, file))}\n\`\`\`\n`;
   items.push(text);
 }
 const notices =
@@ -91,8 +93,15 @@ const notices =
   items.join('\n');
 // Package copies (packages/omreq, native/*) are produced by `pnpm generate`.
 if (flags.has('--check')) {
-  if (readFileSync('THIRD_PARTY_NOTICES.md', 'utf8') !== notices)
-    throw Error('Stale generated notices: THIRD_PARTY_NOTICES.md');
+  const current = readFileSync('THIRD_PARTY_NOTICES.md', 'utf8');
+  if (current !== notices) {
+    const [a, b] = [current.split('\n'), notices.split('\n')];
+    const line = a.findIndex((l, i) => l !== b[i]);
+    throw Error(
+      `Stale generated notices: THIRD_PARTY_NOTICES.md line ${line + 1}\n` +
+        `  committed: ${JSON.stringify(a[line])}\n  generated: ${JSON.stringify(b[line])}`,
+    );
+  }
 } else if (!flags.has('--dry-run')) writeFileSync('THIRD_PARTY_NOTICES.md', notices);
 console.log(
   `${flags.has('--dry-run') ? 'Prepared' : flags.has('--check') ? 'Verified' : 'Generated'} notices for ${items.length} dependency entries, including exact pinned PSL source and MPL-2.0 text`,

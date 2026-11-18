@@ -8,8 +8,8 @@ TLS (JA3/JA4), HTTP/2 (Akamai) and header order identical to Chrome, byte for by
 Rust + BoringSSL in-process: up to **43% faster than wreq-js** and **up to 3× faster than `fetch`**.
 
 ![status](https://img.shields.io/badge/status-pre--release-orange)
-![platform](https://img.shields.io/badge/platform-macOS%20arm64-lightgrey)
-![runtimes](https://img.shields.io/badge/runtimes-Node%2026%20%7C%20Bun%201.4-blue)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
+![runtimes](https://img.shields.io/badge/runtimes-Node%2022%2B%20%7C%20Bun-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![tls](https://img.shields.io/badge/TLS-JA3%20%7C%20JA4-8A2BE2)
 ![http2](https://img.shields.io/badge/HTTP%2F2-Akamai%20fingerprint-8A2BE2)
@@ -58,11 +58,19 @@ Harness: [`scripts/compare`](scripts/compare).
 
 ## 📦 Install
 
-Not on npm yet — build from source (macOS arm64, Rust 1.100, Node 26, pnpm 11):
-
 ```bash
-pnpm install --frozen-lockfile && pnpm build
+npm install omreq
 ```
+
+Prebuilt binaries, nothing to compile:
+
+| OS | Arch | Package |
+| --- | --- | --- |
+| macOS 15+ | arm64 | `omreq-darwin-arm64` |
+| Linux (glibc 2.35+) | x64 | `omreq-linux-x64-gnu` |
+| Windows 10 / 11 | x64 | `omreq-win32-x64-msvc` |
+
+Runtimes: Node.js 22+ and Bun.
 
 ## 🎭 Profiles
 

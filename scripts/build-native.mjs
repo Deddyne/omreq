@@ -24,13 +24,16 @@ const rustflags = prefixes.map(([from, to]) => `--remap-path-prefix=${from}=${to
 const cflags = windows
   ? ''
   : prefixes.map(([from, to]) => `-ffile-prefix-map=${from}=${to}`).join(' ');
-// Linux: link the C++ runtime statically so the binary only needs glibc.
-if (process.platform === 'linux') rustflags.push('-Clink-arg=-static-libstdc++');
+// Linux: link BoringSSL's C++ runtime statically so the binary only needs glibc.
+// btls-sys emits a dynamic -lstdc++ unless told otherwise; -bundle defers the
+// lookup to the final link, where gcc finds its own libstdc++.a.
+const linux = process.platform === 'linux';
 execFileSync('cargo', ['build', '--release', '--locked', '-p', 'omreq-napi'], {
   stdio: 'inherit',
   env: {
     ...process.env,
     CARGO_ENCODED_RUSTFLAGS: rustflags.join('\x1f'),
+    ...(linux ? { BORING_BSSL_RUST_CPPLIB: 'static:-bundle=stdc++' } : {}),
     ...(cflags
       ? {
           CFLAGS: `${process.env.CFLAGS ?? ''} ${cflags}`.trim(),
