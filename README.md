@@ -18,11 +18,7 @@ Rust + BoringSSL in-process: up to **43% faster than wreq-js** and **up to 3× f
 
 </div>
 
-## 🤔 Why
-
-Anti-bot systems don't trust `User-Agent`. They fingerprint the TLS handshake and HTTP/2
-frames, and Node's `fetch` gives itself away on both. omreq runs the transport in Rust on
-BoringSSL — the TLS library Chrome uses — so every request looks like Chrome on the wire.
+## 🚀 Quick start
 
 ```ts
 import { createClient } from 'omreq';
