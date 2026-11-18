@@ -66,9 +66,9 @@ Prebuilt binaries, nothing to compile:
 
 | OS | Arch | Package |
 | --- | --- | --- |
-| macOS 26+ | arm64 | `omreq-darwin-arm64` |
-| Linux (glibc 2.35+) | x64 | `omreq-linux-x64-gnu` |
-| Windows 10 / 11 | x64 | `omreq-win32-x64-msvc` |
+| macOS 26+ | arm64 | `@omreq/darwin-arm64` |
+| Linux (glibc 2.35+) | x64 | `@omreq/linux-x64-gnu` |
+| Windows 10 / 11 | x64 | `@omreq/win32-x64-msvc` |
 
 Runtimes: Node.js 22+ and Bun.
 

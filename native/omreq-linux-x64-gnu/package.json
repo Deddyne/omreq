@@ -1,5 +1,5 @@
 {
-  "name": "omreq-linux-x64-gnu",
+  "name": "@omreq/linux-x64-gnu",
   "version": "0.1.0",
   "description": "Linux x64 (glibc) native module for omreq",
   "main": "omreq.node",

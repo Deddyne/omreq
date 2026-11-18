@@ -1,5 +1,5 @@
 {
-  "name": "omreq-darwin-arm64",
+  "name": "@omreq/darwin-arm64",
   "version": "0.1.0",
   "description": "macOS arm64 native module for omreq",
   "main": "omreq.node",

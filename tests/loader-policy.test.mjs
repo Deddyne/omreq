@@ -26,7 +26,7 @@ function isolated(stub) {
     );
   if (stub !== undefined) {
     const native = join(dir, 'node_modules', nativePackage);
-    mkdirSync(native);
+    mkdirSync(native, { recursive: true });
     writeFileSync(
       join(native, 'package.json'),
       JSON.stringify({ name: nativePackage, main: 'index.cjs' }),

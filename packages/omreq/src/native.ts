@@ -82,9 +82,9 @@ interface NativeModule {
 }
 /** Native package per `${platform}-${arch}`; see scripts/native-target.mjs. */
 export const NATIVE_PACKAGES: Readonly<Record<string, string>> = Object.freeze({
-  'darwin-arm64': 'omreq-darwin-arm64',
-  'linux-x64': 'omreq-linux-x64-gnu',
-  'win32-x64': 'omreq-win32-x64-msvc',
+  'darwin-arm64': '@omreq/darwin-arm64',
+  'linux-x64': '@omreq/linux-x64-gnu',
+  'win32-x64': '@omreq/win32-x64-msvc',
 });
 const MIN_NODE_MAJOR = 22;
 function isMusl(): boolean {

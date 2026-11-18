@@ -28,7 +28,7 @@ await client.close({ graceful: true, timeoutMs: 10_000 });
 - `json(schema)` validates with any Standard Schema v1 library.
 
 Supported: macOS arm64, Node 26, Bun 1.4. The native module ships as the optional
-`omreq-darwin-arm64` package; installing runs no compiler and downloads nothing.
+`@omreq/darwin-arm64` package; installing runs no compiler and downloads nothing.
 
 Documentation: [usage guide](https://github.com/Deddyne/omreq/blob/main/docs/usage.md),
 [profiles](https://github.com/Deddyne/omreq/blob/main/docs/profiles.md).

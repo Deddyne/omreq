@@ -39,13 +39,13 @@ importers:
         specifier: 3.3.1
         version: 3.3.1
     optionalDependencies:
-      omreq-darwin-arm64:
+      '@omreq/darwin-arm64':
         specifier: workspace:0.1.0
         version: link:../../native/omreq-darwin-arm64
-      omreq-linux-x64-gnu:
+      '@omreq/linux-x64-gnu':
         specifier: workspace:0.1.0
         version: link:../../native/omreq-linux-x64-gnu
-      omreq-win32-x64-msvc:
+      '@omreq/win32-x64-msvc':
         specifier: workspace:0.1.0
         version: link:../../native/omreq-win32-x64-msvc
 

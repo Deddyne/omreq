@@ -81,7 +81,7 @@ test('T21: lazy missing/mismatched native errors in isolated packages', async ()
         );
       if (kind !== 'missing') {
         const native = join(dir, 'node_modules', nativePackage);
-        mkdirSync(native);
+        mkdirSync(native, { recursive: true });
         writeFileSync(
           join(native, 'package.json'),
           JSON.stringify({ name: nativePackage, main: 'index.cjs' }),

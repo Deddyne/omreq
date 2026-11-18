@@ -14,7 +14,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fixture } from '../fixtures/server.mjs';
-import { nativeDirs } from './native-target.mjs';
+import { nativeDirs, TARGETS } from './native-target.mjs';
 
 const windows = process.platform === 'win32';
 
@@ -33,7 +33,9 @@ for (const dir of [...nativeDirs, 'packages/omreq']) {
     shell: windows,
   });
   const original = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
-  const file = join(packagesDir, `${original.name}-${original.version}.tgz`);
+  // pnpm names a scoped tarball without '@' and with '-' for '/'.
+  const tarball = original.name.replace(/^@/, '').replace('/', '-');
+  const file = join(packagesDir, `${tarball}-${original.version}.tgz`);
   const data = readFileSync(file),
     manifest = JSON.parse(
       execFileSync('tar', ['-xOf', file, 'package/package.json'], { encoding: 'utf8' }),
@@ -45,8 +47,8 @@ for (const dir of [...nativeDirs, 'packages/omreq']) {
     throw Error('Install-time scripts are prohibited');
   if (
     manifest.name === 'omreq' &&
-    nativeDirs.some(
-      (d) => manifest.optionalDependencies[d.slice('native/'.length)] !== manifest.version,
+    Object.values(TARGETS).some(
+      (t) => manifest.optionalDependencies[t.package] !== manifest.version,
     )
   )
     throw Error('Root/native dependencies must be exact');

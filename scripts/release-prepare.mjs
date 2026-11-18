@@ -13,7 +13,7 @@ const main = JSON.parse(readFileSync('packages/omreq/package.json', 'utf8'));
 assert.equal(main.version, version, `Tag ${tag} does not match packages/omreq ${main.version}`);
 assert(!main.private, 'packages/omreq is private');
 for (const [key, target] of Object.entries(TARGETS)) {
-  const dir = `native/${target.package}`;
+  const dir = `native/${target.folder}`;
   const manifest = JSON.parse(readFileSync(`${dir}/package.json`, 'utf8'));
   assert.equal(manifest.version, version, `${target.package} version`);
   assert(!manifest.private, `${target.package} is private`);
