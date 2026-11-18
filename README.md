@@ -75,7 +75,7 @@ createClient({ profile: 'chrome157' }); // exact version
 
 | Browser | Profiles | Platforms |
 | --- | --- | --- |
-| <img src="https://cdn.simpleicons.org/googlechrome" width="14"> **Chrome** | `chrome157` | 🍎 macOS |
+| <img src="https://cdn.simpleicons.org/googlechrome" width="14"> **Chrome** | `chrome157` | macOS |
 
 `chrome` is an alias for the newest version in the list.
 
