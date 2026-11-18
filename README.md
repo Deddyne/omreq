@@ -72,6 +72,15 @@ createClient({ profile: 'chrome157' }); // exact version
 createClient({ profile: 'neutral' }); // no emulation
 ```
 
+### Available profiles
+
+| Browser | Profile | Version | Platform |
+| --- | --- | --- | --- |
+| 🟢 Chrome | `chrome157` (alias `chrome`) | 157.0.8103.79 | macOS |
+| ⚪ None | `neutral` | — | any |
+
+`chrome` always points to the newest Chrome in this list; new versions are added here.
+
 HTTP version is negotiated like in a browser: ALPN offers `h2` and `http/1.1`, the server
 picks. Custom profiles → [docs/profiles.md](docs/profiles.md).
 
