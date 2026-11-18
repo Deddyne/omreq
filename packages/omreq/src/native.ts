@@ -80,6 +80,24 @@ interface NativeModule {
   profileReport(profile: string): string;
   NativeClient: new (profile: string, config: string) => NativeClient;
 }
+/** Native package per `${platform}-${arch}`; see scripts/native-target.mjs. */
+export const NATIVE_PACKAGES: Readonly<Record<string, string>> = Object.freeze({
+  'darwin-arm64': 'omreq-darwin-arm64',
+  'linux-x64': 'omreq-linux-x64-gnu',
+  'win32-x64': 'omreq-win32-x64-msvc',
+});
+const MIN_NODE_MAJOR = 22;
+function isMusl(): boolean {
+  try {
+    const report = process.report?.getReport() as
+      | { header?: { glibcVersionRuntime?: string } }
+      | undefined;
+    // Runtimes without a diagnostic report (Bun) are assumed to be glibc.
+    return report?.header !== undefined && !report.header.glibcVersionRuntime;
+  } catch {
+    return false;
+  }
+}
 let loaded: NativeModule | undefined;
 let build: NativeBuild | undefined;
 const localRequire = createRequire(__filename);
@@ -91,24 +109,36 @@ export function loadNative(): NativeModule {
       'native-load',
       'Workers are outside the qualified runtime scope',
     );
-  if (process.platform !== 'darwin' || process.arch !== 'arm64')
+  const target = `${process.platform}-${process.arch}`;
+  const nativePackage = NATIVE_PACKAGES[target];
+  if (nativePackage === undefined)
     throw new OmreqError(
       'ERR_UNSUPPORTED_PLATFORM',
       'native-load',
-      `Native prototype requires darwin/arm64; process is ${process.platform}/${process.arch}`,
+      `No native build for ${target}; supported: ${Object.keys(NATIVE_PACKAGES).join(', ')}`,
     );
-  if (!process.versions.bun && process.versions.node.split('.')[0] !== '26')
-    throw new OmreqError('ERR_UNSUPPORTED_RUNTIME', 'native-load', 'Use Node 26 LTS or Bun');
+  if (process.platform === 'linux' && isMusl())
+    throw new OmreqError(
+      'ERR_UNSUPPORTED_PLATFORM',
+      'native-load',
+      'Linux builds require glibc; musl (Alpine) is not supported yet',
+    );
+  if (!process.versions.bun && Number(process.versions.node.split('.')[0]) < MIN_NODE_MAJOR)
+    throw new OmreqError(
+      'ERR_UNSUPPORTED_RUNTIME',
+      'native-load',
+      `Use Node ${MIN_NODE_MAJOR} or newer, or Bun`,
+    );
   if (Number(process.versions.napi) < 8)
     throw new OmreqError('ERR_UNSUPPORTED_RUNTIME', 'native-load', 'Node-API 8 is required');
   let entry: string;
   try {
-    entry = localRequire.resolve('omreq-darwin-arm64');
+    entry = localRequire.resolve(nativePackage);
   } catch (cause) {
     throw new OmreqError(
       'ERR_NATIVE_NOT_FOUND',
       'native-load',
-      `Install the matching optional package omreq-darwin-arm64@${VERSION}`,
+      `Install the matching optional package ${nativePackage}@${VERSION}`,
       { cause },
     );
   }

@@ -14,6 +14,9 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fixture } from '../fixtures/server.mjs';
+import { nativeDirs } from './native-target.mjs';
+
+const windows = process.platform === 'win32';
 
 const packagesDir = resolve('artifacts/packages');
 mkdirSync(packagesDir, { recursive: true });
@@ -22,9 +25,12 @@ mkdirSync(packagesDir, { recursive: true });
 mkdirSync('artifacts/qualification', { recursive: true });
 const report = [];
 const packages = [];
-for (const dir of ['native/omreq-darwin-arm64', 'packages/omreq']) {
+// Every platform package is served so package managers can resolve (and skip)
+// the optional dependencies of other platforms; only this platform's has a binary.
+for (const dir of [...nativeDirs, 'packages/omreq']) {
   execFileSync('pnpm', ['--dir', dir, 'pack', '--pack-destination', packagesDir], {
     stdio: 'pipe',
+    shell: windows,
   });
   const original = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
   const file = join(packagesDir, `${original.name}-${original.version}.tgz`);
@@ -39,9 +45,11 @@ for (const dir of ['native/omreq-darwin-arm64', 'packages/omreq']) {
     throw Error('Install-time scripts are prohibited');
   if (
     manifest.name === 'omreq' &&
-    manifest.optionalDependencies['omreq-darwin-arm64'] !== manifest.version
+    nativeDirs.some(
+      (d) => manifest.optionalDependencies[d.slice('native/'.length)] !== manifest.version,
+    )
   )
-    throw Error('Root/native dependency must be exact');
+    throw Error('Root/native dependencies must be exact');
   packages.push({
     manifest,
     data,
@@ -93,7 +101,11 @@ await once(registry, 'listening');
 const registryUrl = `http://127.0.0.1:${registry.address().port}`;
 async function command(binary, args, options = {}) {
   return await new Promise((resolve, reject) => {
-    const p = spawn(binary, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    const p = spawn(binary, args, {
+      ...options,
+      shell: windows,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let log = '';
     p.stdout.on('data', (b) => (log += b));
     p.stderr.on('data', (b) => (log += b));
@@ -118,22 +130,27 @@ try {
         join(dir, 'package.json'),
         JSON.stringify({ name: 'omreq-clean-consumer', version: '1.0.0', private: true }),
       );
+      // Unix: a PATH that only offers the runtimes and failing compiler stubs
+      // proves installation never compiles. Windows keeps its PATH.
       const guard = join(dir, 'bin');
-      mkdirSync(guard);
       const marker = join(dir, 'compiler-used');
-      for (const name of ['rustc', 'cargo', 'cmake', 'clang', 'cc', 'c++'])
-        writeFileSync(
-          join(guard, name),
-          '#!/bin/sh\necho forbidden > "$OMREQ_FORBIDDEN_TOOL_MARKER"\nexit 97\n',
-          { mode: 0o755 },
-        );
-      for (const name of ['node', 'npm', 'pnpm', 'bun']) {
-        const path = execFileSync('which', [name], { encoding: 'utf8' }).trim();
-        symlinkSync(path, join(guard, name));
+      if (!windows) {
+        mkdirSync(guard);
+        for (const name of ['rustc', 'cargo', 'cmake', 'clang', 'cc', 'c++'])
+          writeFileSync(
+            join(guard, name),
+            '#!/bin/sh\necho forbidden > "$OMREQ_FORBIDDEN_TOOL_MARKER"\nexit 97\n',
+            { mode: 0o755 },
+          );
+        for (const name of ['node', 'npm', 'pnpm', 'bun']) {
+          const path = execFileSync('which', [name], { encoding: 'utf8' }).trim();
+          symlinkSync(path, join(guard, name));
+        }
       }
+      const tool = (name) => (windows ? name : join(guard, name));
       const env = {
         ...process.env,
-        PATH: `${guard}:/usr/bin:/bin`,
+        ...(windows ? {} : { PATH: `${guard}:/usr/bin:/bin` }),
         OMREQ_FORBIDDEN_TOOL_MARKER: marker,
         npm_config_cache: join(dir, 'npm-cache'),
         BUN_INSTALL_CACHE_DIR: join(dir, 'bun-cache'),
@@ -142,21 +159,29 @@ try {
         npm_config_update_notifier: 'false',
       };
       const opts = { cwd: dir, env };
-      const version = await command(join(guard, manager), ['--version'], opts);
+      const version = await command(tool(manager), ['--version'], opts);
       const install = manager === 'npm' ? ['install'] : manager === 'pnpm' ? ['add'] : ['add'];
       const flags = manager === 'pnpm' ? ['--store-dir', join(dir, 'pnpm-store')] : [];
       let log = await command(
-        join(guard, manager),
-        [...install, 'omreq@0.0.0-internal.1', '--registry', registryUrl, ...flags],
+        tool(manager),
+        [
+          ...install,
+          `omreq@${lookup.get('omreq').manifest.version}`,
+          '--registry',
+          registryUrl,
+          ...flags,
+        ],
         opts,
       );
       const smoke = `const a=require('omreq');(async()=>{const b=await import('omreq');if(a.createClient!==b.createClient)throw Error('different loaders');const c=a.createClient();const r=await c.get(${JSON.stringify(`${fixtureServer.url}/echo`)});const v=await r.json();if(v.method!=='GET')throw Error('request failed');await c.close();console.log(JSON.stringify(a.getRuntimeInfo()));})().catch(e=>{console.error(e);process.exitCode=1;});`;
-      log += await command(join(guard, 'node'), ['-e', smoke], opts);
-      log += await command(join(guard, 'bun'), ['-e', smoke], opts);
+      // A file, not -e: Windows runs package managers through cmd, which mangles quotes.
+      writeFileSync(join(dir, 'smoke.cjs'), smoke);
+      log += await command(tool('node'), ['smoke.cjs'], opts);
+      log += await command(tool('bun'), ['smoke.cjs'], opts);
       rmSync(join(dir, 'node_modules'), { recursive: true, force: true });
       const before = registryRequests;
       log += await command(
-        join(guard, manager),
+        tool(manager),
         [
           'install',
           '--offline',
@@ -168,7 +193,7 @@ try {
         opts,
       );
       if (registryRequests !== before) throw Error('Offline install contacted the registry');
-      log += await command(join(guard, 'node'), ['-e', smoke], opts);
+      log += await command(tool('node'), ['smoke.cjs'], opts);
       if (existsSync(marker)) throw Error('Consumer installation invoked a compiler');
       writeFileSync(`artifacts/qualification/install-${manager}.log`, log);
       report.push({

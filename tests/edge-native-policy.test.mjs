@@ -2,11 +2,13 @@
 // request-body headers on dropped bodies (L-02), profile validation of HTTP/2
 // windows (L-15/P-03), TLS cipher/version consistency (L-17) and the shared
 // transport-managed header rules (B-14).
+
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { fixture } from '../fixtures/server.mjs';
 import { checkProfile, createClient } from '../packages/omreq/dist/index.mjs';
+import { nativePackage } from './native-package.mjs';
 
 const profileText = readFileSync(new URL('../profiles/neutral.json', import.meta.url), 'utf8');
 const custom = (mutate) => {
@@ -169,7 +171,7 @@ test('L-17: cipher suites must be negotiable within the TLS version range', asyn
 test('B-14: native profile and request header rules match the TypeScript layer', async () => {
   const { createRequire } = await import('node:module');
   const require = createRequire(new URL('../packages/omreq/package.json', import.meta.url));
-  const addon = require('omreq-darwin-arm64');
+  const addon = require(nativePackage);
   const native = (mutate) => () => addon.checkProfile(JSON.stringify(custom(mutate)));
   for (const [name, value] of [
     ['keep-alive', 'timeout=5'],

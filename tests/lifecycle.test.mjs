@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { fixture } from '../fixtures/server.mjs';
+import { nativePackage } from './native-package.mjs';
 
 const entry = new URL('../packages/omreq/dist/index.mjs', import.meta.url).href;
 async function child(code, timeout = 4000, entryUrl = entry) {
@@ -78,20 +79,20 @@ test('T21: lazy missing/mismatched native errors in isolated packages', async ()
           join(dir, 'node_modules', dep),
         );
       if (kind !== 'missing') {
-        const native = join(dir, 'node_modules', 'omreq-darwin-arm64');
+        const native = join(dir, 'node_modules', nativePackage);
         mkdirSync(native);
         writeFileSync(
           join(native, 'package.json'),
-          JSON.stringify({ name: 'omreq-darwin-arm64', main: 'index.cjs' }),
+          JSON.stringify({ name: nativePackage, main: 'index.cjs' }),
         );
         writeFileSync(
           join(native, 'index.cjs'),
           kind === 'mismatch'
             ? 'exports.buildInfo=()=>JSON.stringify({version:"wrong",bridgeAbi:99,nodeApi:8});'
             : kind === 'old-bridge'
-              ? 'exports.buildInfo=()=>JSON.stringify({version:"0.0.0-internal.1",bridgeAbi:1,nodeApi:8,capabilities:[],bundledTrustStores:[]});'
+              ? 'exports.buildInfo=()=>JSON.stringify({version:"0.1.0",bridgeAbi:1,nodeApi:8,capabilities:[],bundledTrustStores:[]});'
               : kind === 'previous-bridge'
-                ? 'exports.buildInfo=()=>JSON.stringify({version:"0.0.0-internal.1",bridgeAbi:6,nodeApi:8,capabilities:[],bundledTrustStores:[]});'
+                ? 'exports.buildInfo=()=>JSON.stringify({version:"0.1.0",bridgeAbi:6,nodeApi:8,capabilities:[],bundledTrustStores:[]});'
                 : 'throw new Error("dlopen failure");',
         );
       }

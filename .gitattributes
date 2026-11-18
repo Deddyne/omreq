@@ -1,0 +1,3 @@
+# Keep bytes identical on every OS: vendored sources, fixtures and patches are
+# verified by hash, and Windows checkouts must not convert line endings.
+* -text

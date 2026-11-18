@@ -4,6 +4,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fixture } from '../fixtures/server.mjs';
 import { createClient, getProfile, serializeProfile } from '../packages/omreq/dist/index.mjs';
+import { nativePackage } from './native-package.mjs';
 
 async function until(check) {
   for (let i = 0; i < 300; i++) {
@@ -323,7 +324,7 @@ test('T16: invalid limits and native origin substitution fail before transport w
       code: 'ERR_INVALID_ARGUMENT',
     });
   const require = createRequire(new URL('../packages/omreq/dist/index.js', import.meta.url));
-  const { NativeClient } = require('omreq-darwin-arm64');
+  const { NativeClient } = require(nativePackage);
   const profile = serializeProfile(getProfile('omreq/custom-default'));
   const config = {
     maxActiveOperations: 1,

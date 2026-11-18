@@ -7,6 +7,7 @@ import { normalizedClientHello } from '../fixtures/clienthello.mjs';
 import { http2WireFixture } from '../fixtures/http2-wire.mjs';
 import { runProfileClient } from '../fixtures/profile-client.mjs';
 import { parseProfile } from '../packages/omreq/dist/index.mjs';
+import { currentTarget } from './native-target.mjs';
 
 const profile = parseProfile(await readFile('profiles/chrome-157-macos.json', 'utf8'));
 const out = 'artifacts/qualification/chrome157-resumption';
@@ -18,7 +19,7 @@ assert(
 await mkdir(out, { recursive: true });
 const nativeSha = async () =>
   createHash('sha256')
-    .update(await readFile('native/omreq-darwin-arm64/omreq.node'))
+    .update(await readFile(`${currentTarget().dir}/omreq.node`))
     .digest('hex');
 const nativeSha256 = await nativeSha();
 const report = {

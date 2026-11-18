@@ -67,7 +67,11 @@ export function verifyCookies(metadata = readMetadata(), provenance = cookieProv
       `Unreviewed ${pin.name} published file set`,
     );
     for (const [path, digest] of Object.entries(pin.effectiveFiles)) {
-      assert.equal(relative(dir, resolve(dir, path)), path, 'Unsafe provenance source path');
+      assert.equal(
+        relative(dir, resolve(dir, path)).replaceAll('\\', '/'),
+        path,
+        'Unsafe provenance source path',
+      );
       assert.equal(
         sha(readFileSync(join(dir, path))),
         digest,
@@ -94,7 +98,10 @@ export function verifyCookies(metadata = readMetadata(), provenance = cookieProv
   assert.equal(data.rulesSha256, psl.effectiveFiles[data.rulesPath]);
   assert.equal(data.generatedSha256, psl.effectiveFiles[data.generatedPath]);
   assert.equal(data.license, 'MPL-2.0');
-  assert.equal(relative(root, resolve(root, data.licensePath)), data.licensePath);
+  assert.equal(
+    relative(root, resolve(root, data.licensePath)).replaceAll('\\', '/'),
+    data.licensePath,
+  );
   assert.equal(
     sha(readFileSync(join(root, data.licensePath))),
     data.licenseSha256,

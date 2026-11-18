@@ -4,7 +4,7 @@ resolver = "3"
 exclude = ["vendor/wreq", "vendor/http2", "vendor/wreq-proto"]
 
 [workspace.package]
-version = "0.0.0-internal.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.100"

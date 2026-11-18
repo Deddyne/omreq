@@ -11,6 +11,7 @@ import {
   defineProfile,
   parseProfile,
 } from '../packages/omreq/dist/index.mjs';
+import { nativePackage } from './native-package.mjs';
 
 const text = readFileSync(new URL('../profiles/chrome-157-macos.json', import.meta.url), 'utf8');
 const profile = parseProfile(text);
@@ -116,7 +117,7 @@ test('G1: native and JS reject conflicting or duplicate HTTP2 settings before I/
     assert.throws(() => defineProfile(p), { code: 'ERR_PROFILE_INVALID' });
     const { createRequire } = await import('node:module');
     const require = createRequire(new URL('../packages/omreq/package.json', import.meta.url));
-    assert.throws(() => require('omreq-darwin-arm64').checkProfile(JSON.stringify(p)));
+    assert.throws(() => require(nativePackage).checkProfile(JSON.stringify(p)));
   }
 });
 test('G1: HTTP1 casing/order/reuse matches Chrome and explicit overrides survive', async () => {

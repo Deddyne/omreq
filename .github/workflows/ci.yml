@@ -1,0 +1,134 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+env:
+  NODE_VERSION: '26.13.1'
+  BUN_VERSION: '1.4.4'
+  PNPM_VERSION: '11.22.0'
+  RUST_TOOLCHAIN: '1.100.0'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    name: build (${{ matrix.target }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The macOS binary is built on 15 (deployment target 15.0) and also
+          # tested on 26. Linux builds on the oldest supported glibc runner.
+          - { os: macos-15, target: darwin-arm64, package: omreq-darwin-arm64, publish: true }
+          - { os: macos-26, target: darwin-arm64, package: omreq-darwin-arm64, publish: false }
+          - { os: ubuntu-22.04, target: linux-x64, package: omreq-linux-x64-gnu, publish: true }
+          - { os: windows-2025, target: win32-x64, package: omreq-win32-x64-msvc, publish: true }
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: npm install --global pnpm@${{ env.PNPM_VERSION }}
+      - run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --component rustfmt --component clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'vendor/**/Cargo.toml') }}
+          restore-keys: cargo-${{ matrix.os }}-
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/verify-cookies.mjs --self-test
+      - run: node scripts/notices.mjs --check
+      - run: pnpm build
+      - run: pnpm test:transport
+      - run: pnpm check
+      - run: pnpm pack:check
+      - run: node scripts/smoke.mjs
+      - if: matrix.publish
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-${{ matrix.target }}
+          path: |
+            native/${{ matrix.package }}/omreq.node
+            native/${{ matrix.package }}/build-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # Older Node releases: load the prebuilt binary and make a real request.
+  compat:
+    name: compat (Node ${{ matrix.node }}, ${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-22.04, windows-2025]
+        node: ['22', '24']
+        include:
+          - { os: macos-26, target: darwin-arm64, package: omreq-darwin-arm64 }
+          - { os: ubuntu-22.04, target: linux-x64, package: omreq-linux-x64-gnu }
+          - { os: windows-2025, target: win32-x64, package: omreq-win32-x64-msvc }
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --global pnpm@${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm generate
+      - run: pnpm build:js
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-${{ matrix.target }}
+          path: native/${{ matrix.package }}
+      - run: node scripts/smoke.mjs
+
+  publish:
+    name: publish to npm
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, compat]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global pnpm@${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm generate
+      - run: pnpm build:js
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: native-*
+          path: artifacts/native
+      - name: Place binaries and check versions
+        run: node scripts/release-prepare.mjs "$GITHUB_REF_NAME" artifacts/native
+      - name: Publish platform packages, then the main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in native/omreq-darwin-arm64 native/omreq-linux-x64-gnu native/omreq-win32-x64-msvc; do
+            (cd "$dir" && npm publish --access public --provenance)
+          done
+          pnpm --dir packages/omreq publish --access public --provenance --no-git-checks

@@ -13,7 +13,7 @@ for (const p of manifest.packages) {
     if (sha(readFileSync(`vendor/${p.name}/${path}`)) !== expected)
       throw Error(`Unreviewed native source change: ${p.name}/${path}`);
   for (const path of allFiles(`vendor/${p.name}/src`)) {
-    const relative = path.slice(`vendor/${p.name}/`.length);
+    const relative = path.replaceAll('\\', '/').slice(`vendor/${p.name}/`.length);
     if (!p.effectiveFiles[relative]) throw Error(`Unreviewed native source file: ${path}`);
   }
 }

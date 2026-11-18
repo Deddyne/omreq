@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import Ajv from 'ajv';
 import standaloneCode from 'ajv/dist/standalone/index.js';
 import { compileFromFile } from 'json-schema-to-typescript';
+import { nativeDirs } from './native-target.mjs';
 
 const source = 'profiles/profile-v1.schema.json';
 const generated = await compileFromFile(source, {
@@ -72,5 +73,5 @@ export const validateProfile: ProfileValidator = validate10;
 );
 
 // Every published package carries the workspace license and notices.
-for (const dir of ['packages/omreq', 'native/omreq-darwin-arm64'])
+for (const dir of ['packages/omreq', ...nativeDirs])
   for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) await copyFile(file, `${dir}/${file}`);

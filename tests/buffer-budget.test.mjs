@@ -4,6 +4,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fixture } from '../fixtures/server.mjs';
 import { createClient, getProfile, serializeProfile } from '../packages/omreq/dist/index.mjs';
+import { nativePackage } from './native-package.mjs';
 
 const chunkBytes = 65536;
 async function until(check) {
@@ -171,7 +172,7 @@ test('T06/T21: native reservations validate inputs, fail without mutation and re
       code: 'ERR_INVALID_ARGUMENT',
     });
   const require = createRequire(new URL('../packages/omreq/dist/index.js', import.meta.url));
-  const { NativeClient } = require('omreq-darwin-arm64');
+  const { NativeClient } = require(nativePackage);
   const c = new NativeClient(
     serializeProfile(getProfile('omreq/custom-default')),
     JSON.stringify({

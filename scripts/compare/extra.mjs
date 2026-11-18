@@ -1,12 +1,14 @@
 // Supplemental audit benchmarks: cold-start breakdown, fetch(undici) comparison, per-client cost.
+
 import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { performance } from 'node:perf_hooks';
+import { currentTarget } from '../native-target.mjs';
 
 const ROOT = new URL('../..', import.meta.url).pathname.replace(/\/$/, '');
 const ENTRY = `${ROOT}/packages/omreq/dist/index.mjs`;
-const NATIVE = `${ROOT}/native/omreq-darwin-arm64/omreq.node`;
+const NATIVE = `${ROOT}/${currentTarget().dir}/omreq.node`;
 const runtime = process.versions.bun ? 'bun' : 'node';
 const N = Number(process.env.COLD_N ?? 30);
 

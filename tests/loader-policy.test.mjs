@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { nativePackage } from './native-package.mjs';
 
 const bridge = JSON.parse(await readFile(new URL('../bridge.json', import.meta.url), 'utf8'));
 const require = createRequire(new URL('../packages/omreq/dist/index.js', import.meta.url));
@@ -23,11 +24,11 @@ function isolated(stub) {
       join(dir, 'node_modules', dependency),
     );
   if (stub !== undefined) {
-    const native = join(dir, 'node_modules', 'omreq-darwin-arm64');
+    const native = join(dir, 'node_modules', nativePackage);
     mkdirSync(native);
     writeFileSync(
       join(native, 'package.json'),
-      JSON.stringify({ name: 'omreq-darwin-arm64', main: 'index.cjs' }),
+      JSON.stringify({ name: nativePackage, main: 'index.cjs' }),
     );
     writeFileSync(join(native, 'index.cjs'), stub);
   }
@@ -68,7 +69,7 @@ function requestCode(dir, mode, patch = '') {
       const require = originalCreateRequire(...args);
       const resolve = require.resolve;
       require.resolve = (...values) => {
-        if (values[0] === 'omreq-darwin-arm64') resolutions++;
+        if (values[0] === ${JSON.stringify(nativePackage)}) resolutions++;
         return resolve(...values);
       };
       return require;
@@ -104,15 +105,15 @@ test('T21/T24: platform, architecture, Node branch and N-API guards precede nati
       for (const [name, patch, code] of [
         [
           'platform',
-          `Object.defineProperty(process,'platform',{value:'linux'});`,
+          `Object.defineProperty(process,'platform',{value:'freebsd'});`,
           'ERR_UNSUPPORTED_PLATFORM',
         ],
         [
           'architecture',
-          `Object.defineProperty(process,'arch',{value:'x64'});`,
+          `Object.defineProperty(process,'arch',{value:'ia32'});`,
           'ERR_UNSUPPORTED_PLATFORM',
         ],
-        ...['22.21.0', '24.12.0', '27.0.0'].map((version) => [
+        ...['18.20.4', '20.19.0', '21.7.3'].map((version) => [
           `Node ${version}`,
           `Object.defineProperty(process.versions,'bun',{value:undefined,configurable:true});Object.defineProperty(process.versions,'node',{value:${JSON.stringify(version)}});`,
           'ERR_UNSUPPORTED_RUNTIME',
@@ -175,7 +176,7 @@ test('T19/T21: real Node workers reject native loading and exit without active t
 
 test('T21/T24: malformed native manifests produce structured mismatch errors in ESM/CJS', async () => {
   const base = {
-    version: '0.0.0-internal.1',
+    version: '0.1.0',
     bridgeAbi: bridge.abi,
     nodeApi: 8,
     engineBuildId: `omreq-engine-sha256:${'0'.repeat(64)}`,

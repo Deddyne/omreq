@@ -16,6 +16,7 @@ import {
   parseProfile,
   serializeProfile,
 } from '../packages/omreq/dist/index.mjs';
+import { nativePackage } from './native-package.mjs';
 
 const profileText = readFileSync(new URL('../profiles/neutral.json', import.meta.url), 'utf8');
 const canonical = (v) =>
@@ -32,7 +33,7 @@ test('T22: TS/JSON, canonical effective digest and immutable snapshots', async (
   const object = defineProfile(input);
   const json = parseProfile(profileText);
   input.headers[0][1] = 'mutated';
-  assert.equal(object.headers[0][1], 'Omreq/0.0.0-internal.1');
+  assert.equal(object.headers[0][1], 'Omreq/0.1.0');
   assert(Object.isFrozen(object.headers[0]));
   const a = await checkProfile(object);
   const b = await checkProfile(json);
@@ -130,7 +131,7 @@ test('T24: CJS/ESM share classes and error brand', () => {
 });
 test('T22: native boundary validates schema, duplicate keys and integral decimal numbers', async () => {
   const require = createRequire(new URL('../packages/omreq/package.json', import.meta.url));
-  const addon = require('omreq-darwin-arm64');
+  const addon = require(nativePackage);
   assert.throws(() =>
     addon.checkProfile(
       profileText.replace('"schemaVersion": 1', '"schemaVersion": 1,"schemaVersion": 1'),
