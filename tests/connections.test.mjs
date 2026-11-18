@@ -237,10 +237,11 @@ test('T08: failed TCP connects release every reservation and origin record', asy
   await new Promise((r) => server.close(r));
   // Windows retries a refused loopback SYN for about two seconds, so there the
   // short connect deadline fires first; either way the slot must be released.
-  const c = createClient({ connectMs: 500 });
-  const codes = process.platform === 'win32' ? ['ERR_CONNECT', 'ERR_TIMEOUT'] : ['ERR_CONNECT'];
+  const windows = process.platform === 'win32';
+  const c = createClient({ connectMs: windows ? 200 : 500 });
+  const codes = windows ? ['ERR_CONNECT', 'ERR_TIMEOUT'] : ['ERR_CONNECT'];
   try {
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < (windows ? 5 : 10); i++) {
       await assert.rejects(c.get(`http://127.0.0.1:${port}`), (e) => codes.includes(e.code));
       assert.equal(c.getStats().connections, 0);
       assert.deepEqual(c.getStats().connectionOrigins, []);

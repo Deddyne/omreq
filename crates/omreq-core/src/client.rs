@@ -1645,6 +1645,16 @@ impl Operation {
                         return Ok(());
                     }
                 }
+                Ok(None) => {
+                    // The pool takes an HTTP/1 connection back from a separate
+                    // task once its dispatcher is idle. Let that run before the
+                    // next hop checks the pool, so the hop reuses the connection.
+                    drop(stream);
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    return Ok(());
+                }
                 _ => return Ok(()),
             }
         }

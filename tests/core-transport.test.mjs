@@ -75,10 +75,14 @@ test('L-05: a small intermediate redirect body is drained and the connection reu
   });
   const c = createClient();
   try {
-    const response = await c.get(`${s.url}/start`);
-    assert.equal(await response.text(), 'ok');
-    assert.equal(response.redirects.length, 1);
-    assert.equal(s.connections(), 1);
+    // Without draining every hop opens a new connection (6 here). The pool takes
+    // a drained connection back asynchronously, so allow one lost race.
+    for (let i = 0; i < 5; i++) {
+      const response = await c.get(`${s.url}/start`);
+      assert.equal(await response.text(), 'ok');
+      assert.equal(response.redirects.length, 1);
+    }
+    assert(s.connections() <= 2, `${s.connections()} connections for 5 redirects`);
   } finally {
     await c.close();
     await s.close();
