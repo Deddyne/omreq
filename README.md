@@ -32,7 +32,7 @@ console.log(res.status, res.httpVersion, await res.json()); // 200 '2' {…}
 ## ✨ Features
 
 - 🕵️ **Chrome fingerprint out of the box** — TLS, HTTP/2, HTTP/1 and headers, checked against a real Chrome
-- 🎯 **One-word profiles** — `'chrome'`, `'chrome157'`, `'neutral'` or your own in TS/JSON
+- 🎯 **One-word profiles** — `'chrome'`, `'chrome157'` or your own in TS/JSON
 - 🚀 **Fast** — one native call per request, small bodies arrive with the headers
 - 🌐 **Proxies** — HTTP, HTTPS, SOCKS4/5, auth, `noProxy`, `'env'`
 - 🍪 **Sessions** — connection pool, TLS resumption and cookie jar per client
@@ -69,17 +69,15 @@ pnpm install --frozen-lockfile && pnpm build
 ```ts
 createClient(); // newest Chrome
 createClient({ profile: 'chrome157' }); // exact version
-createClient({ profile: 'neutral' }); // no emulation
 ```
 
 ### Available profiles
 
-| Browser | Profile | Version | Platform |
-| --- | --- | --- | --- |
-| 🟢 Chrome | `chrome157` (alias `chrome`) | 157.0.8103.79 | macOS |
-| ⚪ None | `neutral` | — | any |
+| Browser | Profiles | Platforms |
+| --- | --- | --- |
+| <img src="https://cdn.simpleicons.org/googlechrome" width="14"> **Chrome** | `chrome157` | 🍎 macOS |
 
-`chrome` always points to the newest Chrome in this list; new versions are added here.
+`chrome` is an alias for the newest version in the list.
 
 HTTP version is negotiated like in a browser: ALPN offers `h2` and `http/1.1`, the server
 picks. Custom profiles → [docs/profiles.md](docs/profiles.md).
