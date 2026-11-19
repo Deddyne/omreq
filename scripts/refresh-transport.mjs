@@ -25,7 +25,12 @@ function files(path, prefix = '') {
   );
 }
 const root = `vendor/${name}`;
-const paths = ['Cargo.toml', 'LICENSE', ...files(`${root}/src`, 'src/')].sort();
+const paths = [
+  'Cargo.toml',
+  'LICENSE',
+  ...(existsSync(`${root}/build.rs`) ? ['build.rs'] : []),
+  ...files(`${root}/src`, 'src/'),
+].sort();
 entry.effectiveFiles = Object.fromEntries(
   paths.map((file) => [file, sha(readFileSync(`${root}/${file}`))]),
 );

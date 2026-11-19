@@ -16,7 +16,7 @@ export interface StandardSchemaV1<Input = unknown, Output = Input> {
   };
 }
 /** Protocol of the final response. HTTP/1.0 is accepted from legacy servers. */
-export type HttpVersion = '1.0' | '1.1' | '2';
+export type HttpVersion = '1.0' | '1.1' | '2' | '3';
 export interface ResponseMeta {
   status: number;
   url: string;

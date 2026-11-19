@@ -1,0 +1,529 @@
+{
+  "initial": {
+    "datagrams": 2,
+    "datagramSizes": [
+      1250
+    ],
+    "dcidLength": 8,
+    "scidLength": 0,
+    "tokenLength": 0,
+    "chaos": {
+      "firstPacketHasHeadAndTail": true,
+      "pings": true,
+      "splitCrypto": true
+    },
+    "clientHello": {
+      "legacyVersion": 771,
+      "sessionIdLength": 0,
+      "compressionMethods": [
+        0
+      ],
+      "cipherSuites": [
+        4865,
+        4866,
+        4867
+      ],
+      "extensions": [
+        {
+          "id": 0,
+          "hex": "000c0000096c6f63616c686f7374"
+        },
+        {
+          "id": 10,
+          "values": [
+            4588,
+            29,
+            23,
+            24
+          ]
+        },
+        {
+          "id": 13,
+          "values": [
+            1027,
+            2052,
+            1025,
+            1283,
+            2053,
+            1281,
+            2054,
+            1537,
+            513
+          ]
+        },
+        {
+          "id": 16,
+          "protocols": [
+            "h3"
+          ]
+        },
+        {
+          "id": 27,
+          "values": [
+            2
+          ]
+        },
+        {
+          "id": 43,
+          "values": [
+            772
+          ]
+        },
+        {
+          "id": 45,
+          "hex": "0101"
+        },
+        {
+          "id": 51,
+          "shares": [
+            {
+              "group": 4588,
+              "length": 1216
+            },
+            {
+              "group": 29,
+              "length": 32
+            }
+          ]
+        },
+        {
+          "id": 57,
+          "parameters": [
+            {
+              "name": "google_connection_options",
+              "hex": "4f524947"
+            },
+            {
+              "name": "grease",
+              "lengthBelow16": true
+            },
+            {
+              "name": "initial_max_data",
+              "value": "15728640"
+            },
+            {
+              "name": "initial_max_stream_data_bidi_local",
+              "value": "6291456"
+            },
+            {
+              "name": "initial_max_stream_data_bidi_remote",
+              "value": "6291456"
+            },
+            {
+              "name": "initial_max_stream_data_uni",
+              "value": "6291456"
+            },
+            {
+              "name": "initial_max_streams_bidi",
+              "value": "100"
+            },
+            {
+              "name": "initial_max_streams_uni",
+              "value": "103"
+            },
+            {
+              "name": "initial_source_connection_id",
+              "length": 0
+            },
+            {
+              "name": "max_datagram_frame_size",
+              "value": "65536"
+            },
+            {
+              "name": "max_idle_timeout",
+              "value": "30000"
+            },
+            {
+              "name": "max_udp_payload_size",
+              "value": "1472"
+            },
+            {
+              "name": "version_information",
+              "chosen": 1,
+              "available": [
+                1
+              ],
+              "greaseVersions": 1
+            }
+          ]
+        },
+        {
+          "id": 17613,
+          "protocols": [
+            "h3"
+          ]
+        },
+        {
+          "id": 51764,
+          "ids": [
+            "82df130201",
+            "82df130206",
+            "82df13020d",
+            "82df13020e",
+            "82df13020f",
+            "82df130212",
+            "82df130213",
+            "82df130214",
+            "839a648c9b2d0107",
+            "839a648c9b2d0108",
+            "839a648c9b2d0109",
+            "839a648c9b2d010a",
+            "839a648c9b2d010b",
+            "839a648c9b2d010c",
+            "839a648c9b2d010d",
+            "839a648c9b2d0112",
+            "839a648c9b2d0113",
+            "d6790901",
+            "d6790904",
+            "d6790905",
+            "d6790906",
+            "d6790907",
+            "d6790908",
+            "d679090a",
+            "d679090b",
+            "d679090c",
+            "d679090d",
+            "d679090f"
+          ]
+        },
+        {
+          "id": 65037,
+          "ech": {
+            "type": 0,
+            "kdf": 1,
+            "aead": 1,
+            "encLength": 32
+          },
+          "payloadSizeClass": "grease-144..240-step32"
+        }
+      ],
+      "grease": {
+        "cipher": 0,
+        "extensions": [],
+        "groups": 0,
+        "signatures": 0,
+        "versions": 0,
+        "keyShares": []
+      }
+    }
+  },
+  "uniStreams": [
+    "control"
+  ],
+  "control": [
+    {
+      "type": "settings",
+      "settings": [
+        [
+          1,
+          65536
+        ],
+        [
+          6,
+          262144
+        ],
+        [
+          7,
+          100
+        ],
+        [
+          51,
+          1
+        ],
+        "grease"
+      ]
+    },
+    {
+      "type": "grease",
+      "payloadBelow4": true
+    },
+    {
+      "type": "priority_update",
+      "request": 0,
+      "value": "u=0, i"
+    },
+    {
+      "type": "priority_update",
+      "request": 1,
+      "value": "u=0, i"
+    }
+  ],
+  "requests": [
+    {
+      "path": "/probe",
+      "before": [],
+      "headersHex": "0000d1508ba0e41d139d09b8e32d005fd7518562bb0f197f2f004148b1275ad1ffb8fe6f4f61e935b4ff3f7de0fe42dbdfcfd29fce93a57858bb60ea93f9fbef07f226bf9fa53f9c473cd4154bd3d87a4bfcfdf783f90b6f7f3f2f044148b1275ad1ad49e33505023f302f064148b1275ad1ad5d034ca7b29f07226d61634f5322ff1f5f50d9d07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e28104416e277fb521aeba0bc8b1e632586d975765c53facd8f7e8cff4a506ea5531149d4ffda97a7b0f49580b6f2e05c0b814dc394761986d975765cf5f0eec497ca589d34d1f43aeba0c41a4c7a98f33a69a3fdf9a68fa1d75d0620d263d4c79a68fbed00177fe8d48e62b1d3cd1f46a4731581f734bf46a473158f058ebfa352398ac0ebaa6faf963e7efb4005defa1d75d0620d263d4c20d35459162f924e3aa62fdf782367efb4005dd2f034148b4a549275906497f83a8f5172f034148b4a549275a93c85f86a87dcd30d25f2f034148b4a549275ad416cf023f312f034148b4a549275a42a13f8690e4b692d49f5f10929bd9abfa5242cb40d25fa523b3e94f684c9f5f398b2d4b70ddf45abefb4005df2eaec31ec327d785b6007d286f",
+      "fields": [
+        {
+          "name": ":method",
+          "value": "GET",
+          "kind": "indexed",
+          "index": 17
+        },
+        {
+          "name": ":authority",
+          "value": "localhost:PORT",
+          "kind": "name-ref",
+          "index": 0,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": ":scheme",
+          "value": "https",
+          "kind": "indexed",
+          "index": 23
+        },
+        {
+          "name": ":path",
+          "value": "/probe",
+          "kind": "name-ref",
+          "index": 1,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-ch-ua",
+          "value": "\"Chromium\";v=\"158\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"158\"",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-ch-ua-mobile",
+          "value": "?0",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": false,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-ch-ua-platform",
+          "value": "\"macOS\"",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": false,
+          "neverIndexed": false
+        },
+        {
+          "name": "upgrade-insecure-requests",
+          "value": "1",
+          "kind": "indexed",
+          "index": 94
+        },
+        {
+          "name": "user-agent",
+          "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36",
+          "kind": "name-ref",
+          "index": 95,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "accept",
+          "value": "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "kind": "name-ref",
+          "index": 29,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-site",
+          "value": "none",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-mode",
+          "value": "navigate",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-user",
+          "value": "?1",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": false,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-dest",
+          "value": "document",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "accept-encoding",
+          "value": "gzip, deflate, br, zstd",
+          "kind": "name-ref",
+          "index": 31,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "accept-language",
+          "value": "en-US,en;q=0.9",
+          "kind": "name-ref",
+          "index": 72,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "priority",
+          "value": "u=0, i",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        }
+      ],
+      "body": 0
+    },
+    {
+      "path": "/probe?reuse=1",
+      "before": [],
+      "headersHex": "0000d1508ba0e41d139d09b8e32d005fd7518b62bb0f197fcb0b6a0b007f2f004148b1275ad1ffb8fe6f4f61e935b4ff3f7de0fe42dbdfcfd29fce93a57858bb60ea93f9fbef07f226bf9fa53f9c473cd4154bd3d87a4bfcfdf783f90b6f7f3f2f044148b1275ad1ad49e33505023f302f064148b1275ad1ad5d034ca7b29f07226d61634f5322ff1f5f50d9d07f66a281b0dae053fad0321aa49d13fda992a49685340c8a6adca7e28104416e277fb521aeba0bc8b1e632586d975765c53facd8f7e8cff4a506ea5531149d4ffda97a7b0f49580b6f2e05c0b814dc394761986d975765cf5f0eec497ca589d34d1f43aeba0c41a4c7a98f33a69a3fdf9a68fa1d75d0620d263d4c79a68fbed00177fe8d48e62b1d3cd1f46a4731581f734bf46a473158f058ebfa352398ac0ebaa6faf963e7efb4005defa1d75d0620d263d4c20d35459162f924e3aa62fdf782367efb4005dd2f034148b4a549275906497f83a8f5172f034148b4a549275a93c85f86a87dcd30d25f2f034148b4a549275ad416cf023f312f034148b4a549275a42a13f8690e4b692d49f5f10929bd9abfa5242cb40d25fa523b3e94f684c9f5f398b2d4b70ddf45abefb4005df2eaec31ec327d785b6007d286f",
+      "fields": [
+        {
+          "name": ":method",
+          "value": "GET",
+          "kind": "indexed",
+          "index": 17
+        },
+        {
+          "name": ":authority",
+          "value": "localhost:PORT",
+          "kind": "name-ref",
+          "index": 0,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": ":scheme",
+          "value": "https",
+          "kind": "indexed",
+          "index": 23
+        },
+        {
+          "name": ":path",
+          "value": "/probe?reuse=1",
+          "kind": "name-ref",
+          "index": 1,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-ch-ua",
+          "value": "\"Chromium\";v=\"158\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"158\"",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-ch-ua-mobile",
+          "value": "?0",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": false,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-ch-ua-platform",
+          "value": "\"macOS\"",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": false,
+          "neverIndexed": false
+        },
+        {
+          "name": "upgrade-insecure-requests",
+          "value": "1",
+          "kind": "indexed",
+          "index": 94
+        },
+        {
+          "name": "user-agent",
+          "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36",
+          "kind": "name-ref",
+          "index": 95,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "accept",
+          "value": "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "kind": "name-ref",
+          "index": 29,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-site",
+          "value": "none",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-mode",
+          "value": "navigate",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-user",
+          "value": "?1",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": false,
+          "neverIndexed": false
+        },
+        {
+          "name": "sec-fetch-dest",
+          "value": "document",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "accept-encoding",
+          "value": "gzip, deflate, br, zstd",
+          "kind": "name-ref",
+          "index": 31,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "accept-language",
+          "value": "en-US,en;q=0.9",
+          "kind": "name-ref",
+          "index": 72,
+          "huffman": true,
+          "neverIndexed": false
+        },
+        {
+          "name": "priority",
+          "value": "u=0, i",
+          "kind": "literal",
+          "nameHuffman": true,
+          "huffman": true,
+          "neverIndexed": false
+        }
+      ],
+      "body": 0
+    }
+  ]
+}

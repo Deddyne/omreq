@@ -105,6 +105,12 @@ export interface ClientOptions extends RedirectOptions {
   headers?: HeaderInput;
   ca?: string;
   trustStore?: 'bundled' | 'chromium';
+  /**
+   * Use HTTP/3 when the profile describes it (default `true`): origins that advertise h3
+   * through Alt-Svc or a DNS HTTPS record are reached over QUIC, falling back to TCP when
+   * QUIC fails. `false` keeps every request on TCP.
+   */
+  http3?: boolean;
   maxActiveOperations?: number;
   maxActivePerOrigin?: number;
   maxConnections?: number;
@@ -183,6 +189,8 @@ export interface ClientStats {
   readonly connectionLimits: Readonly<{ maxConnections: number; maxConnectionsPerOrigin: number }>;
   readonly idleConnections: number | null;
   readonly connectionAccounting: string;
+  /** Open HTTP/3 (QUIC) connections; they are not counted in `connections`. */
+  readonly http3Connections: number;
 }
 type NativeStats = Omit<ClientStats, 'initializingOperations' | 'retainedRequestBodyBytes'>;
 const redirectKeys = ['redirect', 'maxRedirects', 'allowInsecureRedirects', 'sensitiveHeaders'];
@@ -211,6 +219,7 @@ const clientKeys = [
   'headers',
   'ca',
   'trustStore',
+  'http3',
   'maxActiveOperations',
   'maxActivePerOrigin',
   'maxConnections',
@@ -573,6 +582,8 @@ export class OmreqClient {
       invalid('ca: expected PEM certificates');
     if (options.trustStore !== undefined && !['bundled', 'chromium'].includes(options.trustStore))
       invalid('trustStore: expected bundled or chromium');
+    if (options.http3 !== undefined && typeof options.http3 !== 'boolean')
+      invalid('http3: expected a boolean');
     this.#proxies = proxyRoutes(options.proxy);
     this.#resolve = resolveMap(options.resolve);
     this.#options = {
@@ -639,6 +650,7 @@ export class OmreqClient {
             connectMs: this.#options.connectMs ?? 10000,
             ca: this.#options.ca ?? null,
             trustStore: this.#options.trustStore ?? 'bundled',
+            http3: this.#options.http3 ?? true,
             cookies: this.#options.cookies ?? true,
             proxies: this.#proxies,
             resolve: this.#resolve,
@@ -864,8 +876,9 @@ export class OmreqClient {
         if (redirect.sensitiveHeaders.length > 200)
           invalid('sensitiveHeaders: combined maximum is 200');
       }
-      if (this.#profile.transport.httpVersion === '2' && !url.startsWith('https:'))
-        invalid('Strict HTTP/2 requires HTTPS; h2c is unsupported');
+      const strict = this.#profile.transport.httpVersion;
+      if ((strict === '2' || strict === '3') && !url.startsWith('https:'))
+        invalid(`Strict HTTP/${strict} requires HTTPS; h2c is unsupported`);
       const queueDeadline = invokedAt + timers.queueMs;
       const totalDeadline = timers.totalMs === null ? null : invokedAt + timers.totalMs;
       const initDeadline = Math.min(queueDeadline, totalDeadline ?? Infinity);
@@ -1152,6 +1165,7 @@ export class OmreqClient {
             maxConnectionsPerOrigin: this.#options.maxConnectionsPerOrigin ?? 32,
           },
           idleConnections: 0,
+          http3Connections: 0,
           connectionAccounting: 'physical TCP sockets/attempts bounded; idle lifecycle unavailable',
           bufferedResponseBytes: 0,
           bufferedResponseLimitBytes: this.#options.maxAggregateBufferedResponseBytes ?? 134217728,

@@ -163,6 +163,9 @@ pub struct ClientConfig {
     /// --resolve). The port always comes from the URL.
     #[serde(default)]
     pub resolve: std::collections::BTreeMap<String, Vec<std::net::IpAddr>>,
+    /// Whether a profile with an HTTP/3 block may use it. `false` keeps every request on TCP.
+    #[serde(default = "enabled")]
+    pub http3: bool,
 }
 /// One proxy route. `scope` selects target schemes (`all`, `http`, `https`);
 /// `url` is `http`, `https`, `socks4`, `socks4a`, `socks5` or `socks5h`,
@@ -289,7 +292,9 @@ struct Counters {
 }
 struct ClientInner {
     http1_profile: Arc<crate::profile_headers::Http1Profile>,
+    /// Strict HTTP/2 or HTTP/3: plain HTTP is rejected.
     http2_only: bool,
+    http3: Option<Arc<crate::h3::Http3>>,
     transport: Mutex<Option<Client>>,
     operations: Mutex<HashMap<u64, Arc<Operation>>>,
     scheduler: Arc<Scheduler>,
@@ -659,17 +664,15 @@ impl CoreClient {
         config.validate()?;
         let store = config.trust_store.as_deref().unwrap_or("bundled");
         // Without extra CAs the parsed bundle is shared process-wide (L-10).
-        let roots = match &config.ca {
-            None => crate::profile_tls::bundled_roots(store),
-            Some(ca) => crate::profile_tls::trust_roots(store, ca),
-        }
-        .ok_or_else(|| {
-            Error::new(
-                "ERR_INVALID_ARGUMENT",
-                "configuration",
-                "Unknown trust store",
-            )
-        })??;
+        let anchors = crate::profile_tls::trust_anchor_ids(&profile.effective["transport"]["tls"]);
+        let roots = crate::profile_tls::client_roots(store, config.ca.as_deref(), &anchors)
+            .ok_or_else(|| {
+                Error::new(
+                    "ERR_INVALID_ARGUMENT",
+                    "configuration",
+                    "Unknown trust store",
+                )
+            })??;
         let mut emulation = profile.emulation()?;
         // Header layers are normalized in TypeScript; no transport defaults may restore a removed group.
         emulation.headers.clear();
@@ -726,6 +729,34 @@ impl CoreClient {
                 addrs.iter().map(|ip| std::net::SocketAddr::new(*ip, 0)),
             );
         }
+        let version = profile.effective["transport"]["httpVersion"]
+            .as_str()
+            .unwrap_or("auto");
+        let http3_profile = &profile.effective["transport"]["http3"];
+        let http3 = match version {
+            "3" if !config.proxies.is_empty() => {
+                return Err(Error::new(
+                    "ERR_INVALID_ARGUMENT",
+                    "configuration",
+                    "Strict HTTP/3 cannot be carried by a proxy",
+                ));
+            }
+            "3" if !config.http3 => {
+                return Err(Error::new(
+                    "ERR_INVALID_ARGUMENT",
+                    "configuration",
+                    "The profile requires HTTP/3, which the client disables",
+                ));
+            }
+            "3" => Some(crate::h3::Mode::Only),
+            // HTTP/3 needs UDP; proxied clients stay on TCP.
+            "auto" if !http3_profile.is_null() && config.proxies.is_empty() && config.http3 => {
+                Some(crate::h3::Mode::Auto)
+            }
+            _ => None,
+        }
+        .map(|mode| crate::h3::Http3::new(http3_profile, mode, &config).map(Arc::new))
+        .transpose()?;
         match profile.effective["transport"]["httpVersion"].as_str() {
             Some("1.1") => builder = builder.http1_only(),
             // HTTP/2 prior knowledge is forbidden for plain HTTP; execute checks the URL.
@@ -746,7 +777,8 @@ impl CoreClient {
                 http1_profile: Arc::new(crate::profile_headers::Http1Profile::new(
                     &profile.effective["transport"]["http1"],
                 )),
-                http2_only: profile.effective["transport"]["httpVersion"] == "2",
+                http2_only: matches!(version, "2" | "3"),
+                http3,
                 transport: Mutex::new(Some(transport)),
                 operations: Mutex::new(HashMap::new()),
                 scheduler,
@@ -854,6 +886,7 @@ impl CoreClient {
             "cookieCount":cookies.cookie_count,"cookieBytes":cookies.cookie_bytes,
             "discardedCookies":cookies.discarded_cookies,"partitionedCookies":cookies.partitioned_cookies,
             "evictedCookies":cookies.evicted_cookies,
+            "http3Connections":self.inner.http3.as_ref().map_or(0, |h3| h3.open_connections()),
             "connections":connections["connections"],"creatingConnections":connections["creatingConnections"],
             "waitingConnections":connections["waitingConnections"],"connectionOrigins":connections["connectionOrigins"],
             "connectionLimits":{"maxConnections":self.inner.config.max_connections,"maxConnectionsPerOrigin":self.inner.config.max_connections_per_origin},
@@ -924,6 +957,7 @@ impl CoreClient {
             operations.values().cloned().collect::<Vec<_>>()
         };
         self.inner.scheduler.stop();
+        self.inner.connections.refuse();
         if let Some(jar) = lock(&self.inner.cookies).as_mut() {
             jar.clear();
         }
@@ -931,6 +965,9 @@ impl CoreClient {
             op.cancel("ERR_CLIENT_CLOSED");
         }
         self.inner.connections.close();
+        if let Some(h3) = &self.inner.http3 {
+            h3.close();
+        }
         lock(&self.inner.transport).take();
         // Every counter below signals its own Notify when it drops, so close()
         // completes as soon as the last task, buffer or socket is gone.
@@ -974,6 +1011,7 @@ impl Drop for CoreClient {
         {
             self.inner.closed.store(true, Ordering::SeqCst);
             self.inner.scheduler.stop();
+            self.inner.connections.refuse();
             if let Some(jar) = lock(&self.inner.cookies).as_mut() {
                 jar.clear();
             }
@@ -985,6 +1023,9 @@ impl Drop for CoreClient {
                 op.cancel("ERR_CLIENT_CLOSED");
             }
             self.inner.connections.close();
+            if let Some(h3) = &self.inner.http3 {
+                h3.close();
+            }
         }
     }
 }
@@ -1335,36 +1376,92 @@ impl Operation {
                     "Request headers including automatic cookies exceed the limit",
                 ));
             }
-            let mut request = transport
-                .request(method.clone(), uri)
-                .headers(request_headers);
-            let progress = if streaming {
+            // The request as wreq sends it; a replayable body can be built again for a TCP
+            // retry after HTTP/3 failed.
+            let build = |body: Option<Body>| -> Result<http::Request<Body>> {
+                let mut request = transport
+                    .request(method.clone(), uri.clone())
+                    .headers(request_headers.clone());
+                if let Some(body) = body {
+                    request = request.body(body);
+                }
+                let mut raw: http::Request<Body> = request.build().map_err(Error::from)?.into();
+                wreq_proto::ext::on_preserve_header(&mut raw, SharedHeaderPolicy(policy.clone()));
+                Ok(raw)
+            };
+            let replay = |progress: &Arc<SendProgress>| {
+                replay_body.clone().map(|bytes| {
+                    Body::wrap(ReplayBody {
+                        bytes,
+                        progress: progress.clone(),
+                    })
+                })
+            };
+            let (raw, progress) = if streaming {
                 let (body, hop) =
                     self.start_upload_hop(redirects.len() as u32 + 1, config.body_length)?;
-                request = request.body(body);
-                Some(hop.progress.clone())
-            } else if let Some(bytes) = replay_body.clone() {
+                (build(Some(body))?, Some(hop.progress.clone()))
+            } else if replay_body.is_some() {
                 let progress = SendProgress::new();
-                if bytes.is_empty() {
+                if replay_body.as_ref().is_some_and(Bytes::is_empty) {
                     progress.done.cancel();
                 }
-                request = request.body(Body::wrap(ReplayBody {
-                    bytes,
-                    progress: progress.clone(),
-                }));
-                Some(progress)
+                (build(replay(&progress))?, Some(progress))
             } else {
-                None
+                (build(None)?, None)
             };
-            let mut raw: http::Request<Body> = request.build().map_err(Error::from)?.into();
-            wreq_proto::ext::on_preserve_header(&mut raw, SharedHeaderPolicy(policy.clone()));
-            let request = wreq::Request::from(raw);
-            let deadline = send_deadline(progress, config.headers_ms, config.upload_idle_ms);
+            let deadline =
+                send_deadline(progress.clone(), config.headers_ms, config.upload_idle_ms);
+            let send = async {
+                let mut raw = raw;
+                // HTTP/3 when the origin offers it; the QUIC handshake counts toward the
+                // headers deadline like a TCP connect.
+                if let Some(h3) = &owner.http3 {
+                    for attempt in 1..=2 {
+                        let Some(connection) = h3.connection(&current).await? else {
+                            break;
+                        };
+                        match h3
+                            .send(&connection, raw, |headers| policy.order_h2(headers))
+                            .await
+                        {
+                            Ok(response) => return Ok(response),
+                            // The connection was going away before the request went out: it
+                            // is sent once more on a new connection, then over TCP.
+                            Err(crate::h3::SendError::NotSent(error, request)) => {
+                                if attempt == 2 && !h3.falls_back() {
+                                    return Err(error);
+                                }
+                                raw = *request;
+                            }
+                            // Like Chromium, a request the server did not process goes over
+                            // TCP and HTTP/3 to the origin is marked broken for a while.
+                            Err(crate::h3::SendError::Unprocessed(_))
+                                if h3.falls_back()
+                                    && !streaming
+                                    && !owner.closed.load(Ordering::SeqCst) =>
+                            {
+                                h3.mark_broken(&current);
+                                raw = build(progress.as_ref().and_then(replay))?;
+                                break;
+                            }
+                            Err(failure) => return Err(failure.into_error()),
+                        }
+                    }
+                }
+                transport
+                    .execute(wreq::Request::from(raw))
+                    .await
+                    .map_err(Error::from)
+            };
             let response = tokio::select! { biased;
                 _ = self.token.cancelled() => return Err(self.error()),
                 phase = deadline => return Err(self.timeout(phase)),
-                r = transport.execute(request) => r.map_err(Error::from)?
+                r = send => r?
             };
+            if let Some(h3) = &owner.http3 {
+                h3.observe(&current, response.headers());
+            }
             // An upload hop that did not finish when headers arrived was cut
             // short; its transport frame fails once `abort` is cancelled.
             let hop = self.stop_upload_hop().filter(|hop| !hop.is_complete());
@@ -1424,7 +1521,7 @@ impl Operation {
                 return Err(Error::new(
                     "ERR_REDIRECT_URL",
                     "headers",
-                    "Strict HTTP2 requires HTTPS",
+                    "Strict HTTP/2 and HTTP/3 require HTTPS",
                 ));
             }
             let drop_body = redirect::drops_body(response.status().as_u16(), &method);
@@ -1493,6 +1590,7 @@ impl Operation {
         self.stop_upload();
         self.phase.store(PHASE_BODY, Ordering::SeqCst);
         let version = match response.version() {
+            Version::HTTP_3 => "3",
             Version::HTTP_2 => "2",
             Version::HTTP_11 => "1.1",
             // Still common from embedded devices and simple servers (Python
@@ -1623,7 +1721,7 @@ impl Operation {
     /// HTTP/1 are dropped instead (closing the connection or resetting the
     /// stream); a drain failure never fails the redirect.
     async fn drain_redirect(&self, response: wreq::Response, idle_ms: u64) -> Result<()> {
-        if response.version() == Version::HTTP_2
+        if matches!(response.version(), Version::HTTP_2 | Version::HTTP_3)
             || response
                 .content_length()
                 .is_some_and(|n| n > REDIRECT_DRAIN_BYTES)
@@ -2083,6 +2181,7 @@ mod tests {
                 cookies: true,
                 proxies: Vec::new(),
                 resolve: Default::default(),
+                http3: true,
             },
         )
         .unwrap()

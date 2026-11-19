@@ -1,0 +1,1486 @@
+use std::{
+    convert::TryInto,
+    fmt::{self, Debug},
+};
+
+use bytes::{Buf, BufMut, Bytes, buf::Take};
+use smallvec::SmallVec;
+#[cfg(feature = "tracing")]
+use tracing::trace;
+
+use super::{
+    coding::{Decode, Encode},
+    push::{InvalidPushId, PushId},
+    stream::InvalidStreamId,
+    varint::{BufExt, BufMutExt, UnexpectedEnd, VarInt},
+};
+use crate::webtransport::SessionId;
+
+#[derive(Debug, PartialEq)]
+pub enum FrameError {
+    Malformed,
+    UnsupportedFrame(u64), // Known frames that should generate an error
+    UnknownFrame(u64),     // Unknown frames that should be ignored
+    InvalidFrameValue,
+    ExcessiveLoad { len: u64, limit: usize },
+    Incomplete(usize),
+    Settings(SettingsError),
+    InvalidStreamId(InvalidStreamId),
+    InvalidPushId(InvalidPushId),
+}
+
+impl std::error::Error for FrameError {}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrameError::Malformed => write!(f, "frame is malformed"),
+            FrameError::UnsupportedFrame(c) => {
+                write!(f, "frame 0x{:x} is not allowed in HTTP/3", c)
+            }
+            FrameError::UnknownFrame(c) => write!(f, "frame 0x{:x} ignored", c),
+            FrameError::InvalidFrameValue => write!(f, "frame value is invalid"),
+            FrameError::ExcessiveLoad { len, limit } => {
+                write!(f, "frame payload length {len} exceeds local limit {limit}")
+            }
+            FrameError::Incomplete(x) => write!(f, "internal error: frame incomplete {}", x),
+            FrameError::Settings(x) => write!(f, "invalid settings: {}", x),
+            FrameError::InvalidStreamId(x) => write!(f, "{}", x),
+            FrameError::InvalidPushId(x) => write!(f, "{}", x),
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum Frame<B> {
+    Data(B),
+    Headers(Bytes),
+    CancelPush(PushId),
+    Settings(Settings),
+    PushPromise(PushPromise),
+    Goaway(VarInt),
+    MaxPushId(PushId),
+    /// Describes the header for a webtransport stream.
+    ///
+    /// The payload is sent streaming until the stream is closed
+    ///
+    /// Unwrap the framed streamer and read the inner stream until the end.
+    ///
+    /// Conversely, when sending, send this frame and unwrap the stream
+    WebTransportStream(SessionId),
+    Grease,
+}
+
+/// A frame header read by the stream decoder.
+pub(crate) enum StreamFrame {
+    Known(Frame<PayloadLen>),
+    /// A frame of unknown type, whose `len` payload bytes follow and carry no
+    /// meaning. <https://www.rfc-editor.org/rfc/rfc9114#section-9>
+    Unknown {
+        ty: u64,
+        len: u64,
+    },
+}
+
+/// The stream a frame arrives on, which decides the frame types rejected at
+/// their header.
+#[derive(Clone, Copy)]
+pub(crate) enum StreamKind {
+    /// No stream-specific rules apply.
+    Any,
+    Control,
+    /// A request or push stream.
+    Request,
+}
+
+// Largest CANCEL_PUSH, SETTINGS, GOAWAY or MAX_PUSH_ID payload buffered before
+// decoding. Valid ones are a few bytes, or well under 100 bytes for browser
+// SETTINGS, so a longer declared length is excessive load.
+// https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+const MAX_CONTROL_PAYLOAD: u64 = 64 * 1024;
+
+/// Represents the available data len for a `Data` frame on a RecvStream
+///
+/// Decoding received frames does not handle `Data` frames payload. Instead, receiving it
+/// and passing it to the user is left under the responsibility of `RequestStream`s.
+pub struct PayloadLen(pub usize);
+
+impl From<usize> for PayloadLen {
+    fn from(len: usize) -> Self {
+        PayloadLen(len)
+    }
+}
+
+impl Frame<PayloadLen> {
+    pub const MAX_ENCODED_SIZE: usize = VarInt::MAX_SIZE * 7;
+
+    /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
+    pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
+        let max_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        Self::decode_whole(buf, max_addressable)
+    }
+
+    #[cfg(test)]
+    fn decode_with_max_addressable<T: Buf>(
+        buf: &mut T,
+        max_addressable: u64,
+    ) -> Result<Self, FrameError> {
+        Self::decode_whole(buf, max_addressable)
+    }
+
+    /// Decodes a frame header for a stream decoder, which discards the payload
+    /// of an unknown frame as it arrives instead of buffering it.
+    pub(crate) fn decode_stream<T: Buf>(
+        buf: &mut T,
+        max_field_section_size: usize,
+        kind: StreamKind,
+    ) -> Result<StreamFrame, FrameError> {
+        let max_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+        Self::decode_with_limits(buf, max_addressable, max_field_section_size, kind)
+    }
+
+    /// Decodes a frame and consumes an unknown frame whole once it is buffered.
+    fn decode_whole<T: Buf>(buf: &mut T, max_addressable: u64) -> Result<Self, FrameError> {
+        let remaining = buf.remaining();
+        match Self::decode_with_limits(buf, max_addressable, usize::MAX, StreamKind::Any)? {
+            StreamFrame::Known(frame) => Ok(frame),
+            StreamFrame::Unknown {
+                ty,
+                len: encoded_len,
+            } => {
+                let len = payload_len(encoded_len, max_addressable)?;
+                let prefix_len = remaining
+                    .checked_sub(buf.remaining())
+                    .ok_or(FrameError::Malformed)?;
+                let frame_len = buffered_frame_len(prefix_len, encoded_len, max_addressable)?;
+                if buf.remaining() < len {
+                    return Err(FrameError::Incomplete(frame_len));
+                }
+                buf.advance(len);
+                Err(FrameError::UnknownFrame(ty))
+            }
+        }
+    }
+
+    fn decode_with_limits<T: Buf>(
+        buf: &mut T,
+        max_addressable: u64,
+        max_field_section_size: usize,
+        kind: StreamKind,
+    ) -> Result<StreamFrame, FrameError> {
+        let remaining = buf.remaining();
+        let next_byte = remaining
+            .checked_add(1)
+            .ok_or(FrameError::InvalidFrameValue)?;
+        let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(next_byte))?;
+
+        // Webtransport streams need special handling as they have no length.
+        //
+        // See: https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-4.2
+        if ty == FrameType::WEBTRANSPORT_BI_STREAM {
+            #[cfg(feature = "tracing")]
+            tracing::trace!("webtransport frame");
+
+            return Ok(StreamFrame::Known(Frame::WebTransportStream(
+                SessionId::decode(buf)?,
+            )));
+        }
+
+        let encoded_len = buf
+            .get_var()
+            .map_err(|_| FrameError::Incomplete(next_byte))?;
+
+        // Reject or skip frames at the header, before any payload is buffered.
+        match ty {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+            //# These frame
+            //# types MUST NOT be sent, and their receipt MUST be treated as a
+            //# connection error of type H3_FRAME_UNEXPECTED.
+            FrameType::H2_PRIORITY
+            | FrameType::H2_PING
+            | FrameType::H2_WINDOW_UPDATE
+            | FrameType::H2_CONTINUATION => return Err(FrameError::UnsupportedFrame(ty.0)),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+            //= type=implication
+            //# DATA frames MUST be associated with an HTTP request or response.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+            //# If
+            //# a DATA frame is received on a control stream, the recipient MUST
+            //# respond with a connection error of type H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
+            //# If a HEADERS frame is received on a control stream, the recipient
+            //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+            //# If a PUSH_PROMISE frame is received on the control stream, the client
+            //# MUST respond with a connection error of type H3_FRAME_UNEXPECTED.
+            FrameType::DATA | FrameType::HEADERS | FrameType::PUSH_PROMISE
+                if matches!(kind, StreamKind::Control) =>
+            {
+                return Err(FrameError::UnsupportedFrame(ty.0));
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+            //# Receiving a
+            //# CANCEL_PUSH frame on a stream other than the control stream MUST be
+            //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+            //# If an endpoint receives a SETTINGS frame on a different
+            //# stream, the endpoint MUST respond with a connection error of type
+            //# H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.6
+            //# A client MUST treat a GOAWAY frame on a stream other than
+            //# the control stream as a connection error of type H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+            //# The MAX_PUSH_ID frame is always sent on the control stream.  Receipt
+            //# of a MAX_PUSH_ID frame on any other stream MUST be treated as a
+            //# connection error of type H3_FRAME_UNEXPECTED.
+            FrameType::CANCEL_PUSH
+            | FrameType::SETTINGS
+            | FrameType::GOAWAY
+            | FrameType::MAX_PUSH_ID
+                if matches!(kind, StreamKind::Request) =>
+            {
+                return Err(FrameError::UnsupportedFrame(ty.0));
+            }
+            FrameType::HEADERS | FrameType::PUSH_PROMISE
+                if encoded_len > u64::try_from(max_field_section_size).unwrap_or(u64::MAX) =>
+            {
+                // QPACK field sections are otherwise buffered before decoding. Stop
+                // at the frame header instead of granting credit for an unbounded
+                // payload.
+                // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3
+                // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4
+                return Err(FrameError::ExcessiveLoad {
+                    len: encoded_len,
+                    limit: max_field_section_size,
+                });
+            }
+            FrameType::CANCEL_PUSH
+            | FrameType::SETTINGS
+            | FrameType::GOAWAY
+            | FrameType::MAX_PUSH_ID
+                if encoded_len > MAX_CONTROL_PAYLOAD =>
+            {
+                return Err(FrameError::ExcessiveLoad {
+                    len: encoded_len,
+                    limit: usize::try_from(MAX_CONTROL_PAYLOAD).unwrap_or(usize::MAX),
+                });
+            }
+            FrameType::DATA
+            | FrameType::HEADERS
+            | FrameType::CANCEL_PUSH
+            | FrameType::SETTINGS
+            | FrameType::PUSH_PROMISE
+            | FrameType::GOAWAY
+            | FrameType::MAX_PUSH_ID => {}
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+            //# Endpoints MUST
+            //# NOT consider these frames to have any meaning upon receipt.
+            _ => {
+                return Ok(StreamFrame::Unknown {
+                    ty: ty.0,
+                    len: encoded_len,
+                });
+            }
+        }
+
+        let len = payload_len(encoded_len, max_addressable)?;
+
+        if ty == FrameType::DATA {
+            return Ok(StreamFrame::Known(Frame::Data(len.into())));
+        }
+
+        let prefix_len = remaining
+            .checked_sub(buf.remaining())
+            .ok_or(FrameError::Malformed)?;
+        let frame_len = buffered_frame_len(prefix_len, encoded_len, max_addressable)?;
+        if buf.remaining() < len {
+            return Err(FrameError::Incomplete(frame_len));
+        }
+
+        #[cfg(feature = "tracing")]
+        trace!("frame ty: {:?}", ty);
+
+        let frame = match ty {
+            FrameType::HEADERS => Ok(Frame::Headers(buf.copy_to_bytes(len))),
+            FrameType::SETTINGS => decode_payload(buf, len, |payload| {
+                Settings::decode(payload)
+                    .map(Frame::Settings)
+                    .map_err(|error| match error {
+                        SettingsError::Malformed => FrameError::Malformed,
+                        error => FrameError::Settings(error),
+                    })
+            }),
+            FrameType::CANCEL_PUSH => decode_payload(buf, len, |payload| {
+                Ok(Frame::CancelPush(payload.get_var()?.try_into()?))
+            }),
+            FrameType::PUSH_PROMISE => decode_payload(buf, len, |payload| {
+                Ok(Frame::PushPromise(PushPromise::decode(payload)?))
+            }),
+            FrameType::GOAWAY => decode_payload(buf, len, |payload| {
+                Ok(Frame::Goaway(VarInt::decode(payload)?))
+            }),
+            FrameType::MAX_PUSH_ID => decode_payload(buf, len, |payload| {
+                Ok(Frame::MaxPushId(payload.get_var()?.try_into()?))
+            }),
+            // DATA, WEBTRANSPORT_STREAM and the frames skipped or rejected above.
+            _ => Err(FrameError::Malformed),
+        };
+
+        if let Ok(_frame) = &frame {
+            #[cfg(feature = "tracing")]
+            trace!(
+                "got frame {:?}, len: {}, remaining: {}",
+                _frame,
+                encoded_len,
+                buf.remaining()
+            );
+        }
+        frame.map(StreamFrame::Known)
+    }
+}
+
+/// Decodes the fields of a frame whose `len`-byte payload is fully buffered.
+///
+/// The payload must hold exactly these fields: running out of bytes or leaving
+/// some unread is a connection error of type H3_FRAME_ERROR, never a request
+/// for more stream data.
+/// https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+fn decode_payload<B: Buf, F>(
+    buf: &mut B,
+    len: usize,
+    decode: impl FnOnce(&mut Take<&mut B>) -> Result<F, FrameError>,
+) -> Result<F, FrameError> {
+    let mut payload = buf.take(len);
+    let fields = decode(&mut payload).map_err(|error| match error {
+        FrameError::Incomplete(_) => FrameError::Malformed,
+        error => error,
+    })?;
+    if payload.has_remaining() {
+        return Err(FrameError::Malformed);
+    }
+    Ok(fields)
+}
+
+fn payload_len(encoded_len: u64, max_addressable: u64) -> Result<usize, FrameError> {
+    if encoded_len > max_addressable {
+        return Err(excessive_frame_length(encoded_len, max_addressable));
+    }
+    usize::try_from(encoded_len).map_err(|_| excessive_frame_length(encoded_len, max_addressable))
+}
+
+fn buffered_frame_len(
+    prefix_len: usize,
+    encoded_len: u64,
+    max_addressable: u64,
+) -> Result<usize, FrameError> {
+    let prefix_len = u64::try_from(prefix_len).map_err(|_| FrameError::InvalidFrameValue)?;
+    let frame_len = prefix_len
+        .checked_add(encoded_len)
+        .filter(|frame_len| *frame_len <= max_addressable)
+        .ok_or_else(|| excessive_frame_length(encoded_len, max_addressable))?;
+    usize::try_from(frame_len).map_err(|_| excessive_frame_length(encoded_len, max_addressable))
+}
+
+fn excessive_frame_length(encoded_len: u64, max_addressable: u64) -> FrameError {
+    FrameError::ExcessiveLoad {
+        len: encoded_len,
+        limit: usize::try_from(max_addressable).unwrap_or(usize::MAX),
+    }
+}
+
+impl<B> Encode for Frame<B>
+where
+    B: Buf,
+{
+    fn encode<T: BufMut>(&self, buf: &mut T) {
+        match self {
+            Frame::Data(b) => {
+                FrameType::DATA.encode(buf);
+                buf.write_var(b.remaining() as u64);
+            }
+            Frame::Headers(f) => {
+                FrameType::HEADERS.encode(buf);
+                buf.write_var(f.len() as u64);
+            }
+            Frame::Settings(f) => f.encode(buf),
+            Frame::PushPromise(f) => f.encode(buf),
+            Frame::CancelPush(id) => simple_frame_encode(FrameType::CANCEL_PUSH, (*id).into(), buf),
+            Frame::Goaway(id) => simple_frame_encode(FrameType::GOAWAY, *id, buf),
+            Frame::MaxPushId(id) => simple_frame_encode(FrameType::MAX_PUSH_ID, (*id).into(), buf),
+            Frame::Grease => {
+                FrameType::grease().encode(buf);
+                buf.write_var(6);
+                buf.put_slice(b"grease");
+            }
+            Frame::WebTransportStream(id) => {
+                FrameType::WEBTRANSPORT_BI_STREAM.encode(buf);
+                id.encode(buf);
+                // rest of the data is sent streaming
+            }
+        }
+    }
+}
+
+impl<B> Frame<B>
+where
+    B: Buf,
+{
+    pub fn payload(&self) -> Option<&dyn Buf> {
+        match self {
+            Frame::Data(f) => Some(f),
+            Frame::Headers(f) => Some(f),
+            Frame::PushPromise(f) => Some(&f.encoded),
+            _ => None,
+        }
+    }
+
+    pub fn payload_mut(&mut self) -> Option<&mut dyn Buf> {
+        match self {
+            Frame::Data(f) => Some(f),
+            Frame::Headers(f) => Some(f),
+            Frame::PushPromise(f) => Some(&mut f.encoded),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn encode_with_payload<T: BufMut>(&mut self, buf: &mut T) {
+        self.encode(buf);
+        match self {
+            Frame::Data(b) => {
+                while b.has_remaining() {
+                    let pos = {
+                        let chunk = b.chunk();
+                        buf.put_slice(chunk);
+                        chunk.len()
+                    };
+                    b.advance(pos)
+                }
+            }
+            Frame::Headers(b) => buf.put_slice(b),
+            _ => (),
+        }
+    }
+}
+
+impl fmt::Debug for Frame<PayloadLen> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Frame::Data(len) => write!(f, "Data: {} bytes", len.0),
+            Frame::Headers(frame) => write!(f, "Headers({} entries)", frame.len()),
+            Frame::Settings(_) => write!(f, "Settings"),
+            Frame::CancelPush(id) => write!(f, "CancelPush({})", id),
+            Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
+            Frame::Goaway(id) => write!(f, "GoAway({})", id),
+            Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::Grease => write!(f, "Grease()"),
+            Frame::WebTransportStream(session) => write!(f, "WebTransportStream({:?})", session),
+        }
+    }
+}
+
+impl<B> fmt::Debug for Frame<B>
+where
+    B: Buf,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Frame::Data(data) => write!(f, "Data: {} bytes", data.remaining()),
+            Frame::Headers(frame) => write!(f, "Headers({} entries)", frame.len()),
+            Frame::Settings(_) => write!(f, "Settings"),
+            Frame::CancelPush(id) => write!(f, "CancelPush({})", id),
+            Frame::PushPromise(frame) => write!(f, "PushPromise({})", frame.id),
+            Frame::Goaway(id) => write!(f, "GoAway({})", id),
+            Frame::MaxPushId(id) => write!(f, "MaxPushId({})", id),
+            Frame::Grease => write!(f, "Grease()"),
+            Frame::WebTransportStream(_) => write!(f, "WebTransportStream()"),
+        }
+    }
+}
+
+/// Compare two frames ignoring data
+///
+/// Only useful for `encode() -> Frame<Buf>` then `decode() -> Frame<PayloadLen>` unit tests.
+#[cfg(test)]
+impl<T, U> PartialEq<Frame<T>> for Frame<U> {
+    fn eq(&self, other: &Frame<T>) -> bool {
+        match self {
+            Frame::Data(_) => matches!(other, Frame::Data(_)),
+            Frame::Settings(x) => matches!(other, Frame::Settings(y) if x == y),
+            Frame::Headers(x) => matches!(other, Frame::Headers(y) if x == y),
+            Frame::CancelPush(x) => matches!(other, Frame::CancelPush(y) if x == y),
+            Frame::PushPromise(x) => matches!(other, Frame::PushPromise(y) if x == y),
+            Frame::Goaway(x) => matches!(other, Frame::Goaway(y) if x == y),
+            Frame::MaxPushId(x) => matches!(other, Frame::MaxPushId(y) if x == y),
+            Frame::Grease => matches!(other, Frame::Grease),
+            Frame::WebTransportStream(x) => {
+                matches!(other, Frame::WebTransportStream(y) if x == y)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Frame<Bytes> {
+    pub fn headers<T: Into<Bytes>>(block: T) -> Self {
+        Frame::Headers(block.into())
+    }
+}
+
+macro_rules! frame_types {
+    {$($name:ident = $val:expr,)*} => {
+        impl FrameType {
+            $(pub const $name: FrameType = FrameType($val);)*
+        }
+    }
+}
+
+frame_types! {
+    DATA = 0x0,
+    HEADERS = 0x1,
+    H2_PRIORITY = 0x2,
+    CANCEL_PUSH = 0x3,
+    SETTINGS = 0x4,
+    PUSH_PROMISE = 0x5,
+    H2_PING = 0x6,
+    GOAWAY = 0x7,
+    H2_WINDOW_UPDATE = 0x8,
+    H2_CONTINUATION = 0x9,
+    MAX_PUSH_ID = 0xD,
+    // Reserved frame types
+    WEBTRANSPORT_BI_STREAM = 0x41,
+}
+
+impl FrameType {
+    /// returns a FrameType type with random number of the 0x1f * N + 0x21
+    /// format within the range of the Varint implementation
+    pub fn grease() -> Self {
+        FrameType(fastrand::u64(0..0x210842108421083) * 0x1f + 0x21)
+    }
+}
+
+/// Encodes a reserved frame to follow SETTINGS: one random 32-bit `n` gives
+/// the type `0x1f * n + 0x21` and `n % 4` random payload bytes.
+/// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8>.
+pub(crate) fn encode_grease_frame<B: BufMut>(buf: &mut B) {
+    let n = fastrand::u32(..);
+    FrameType(0x1f * u64::from(n) + 0x21).encode(buf);
+    let len = n % 4;
+    buf.write_var(u64::from(len));
+    for _ in 0..len {
+        buf.put_u8(fastrand::u8(..));
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct FrameType(u64);
+
+impl FrameType {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
+        Ok(FrameType(buf.get_var()?))
+    }
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        buf.write_var(self.0);
+    }
+
+    #[cfg(test)]
+    pub(crate) const RESERVED: FrameType = FrameType(0x1f * 1337 + 0x21);
+}
+
+pub(crate) trait FrameHeader {
+    fn len(&self) -> usize;
+    const TYPE: FrameType;
+    fn encode_header<T: BufMut>(&self, buf: &mut T) {
+        Self::TYPE.encode(buf);
+        buf.write_var(self.len() as u64);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PushPromise {
+    id: u64,
+    encoded: Bytes,
+}
+
+impl FrameHeader for PushPromise {
+    const TYPE: FrameType = FrameType::PUSH_PROMISE;
+
+    fn encode_header<T: BufMut>(&self, buf: &mut T) {
+        Self::TYPE.encode(buf);
+        buf.write_var(self.len() as u64);
+        buf.write_var(self.id);
+    }
+
+    fn len(&self) -> usize {
+        VarInt::from_u64(self.id)
+            .expect("PushPromise id varint overflow")
+            .size()
+            + self.encoded.as_ref().len()
+    }
+}
+
+impl PushPromise {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
+        Ok(PushPromise {
+            id: buf.get_var()?,
+            encoded: buf.copy_to_bytes(buf.remaining()),
+        })
+    }
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        self.encode_header(buf);
+        buf.put(self.encoded.clone());
+    }
+}
+
+fn simple_frame_encode<B: BufMut>(ty: FrameType, id: VarInt, buf: &mut B) {
+    ty.encode(buf);
+    buf.write_var(id.size() as u64);
+    id.encode(buf);
+}
+
+/// An HTTP/3 setting identifier.
+///
+/// Used in SETTINGS frames to configure connection parameters.
+/// Standard identifiers are available as associated constants (e.g.
+/// [`SettingId::QPACK_MAX_TABLE_CAPACITY`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub struct SettingId(pub u64);
+
+impl SettingId {
+    const NONE: SettingId = SettingId(0);
+
+    /// Known identifiers in the order sent when no [`SettingsOrder`] is configured.
+    pub(crate) const DEFAULT_IDS: [SettingId; 7] = [
+        SettingId::MAX_HEADER_LIST_SIZE,
+        SettingId::ENABLE_CONNECT_PROTOCOL,
+        SettingId::ENABLE_WEBTRANSPORT,
+        SettingId::H3_DATAGRAM,
+        SettingId::WEBTRANSPORT_MAX_SESSIONS,
+        SettingId::QPACK_MAX_TABLE_CAPACITY,
+        SettingId::QPACK_MAX_BLOCKED_STREAMS,
+    ];
+
+    /// Returns a SettingId with a random number of the `0x1f * N + 0x21`
+    /// format. The multiplier N is bounded to a u32, matching Chromium's
+    /// GREASE setting ID generation.
+    pub fn grease() -> Self {
+        SettingId(fastrand::u32(..) as u64 * 0x1f + 0x21)
+    }
+
+    fn is_supported(self) -> bool {
+        matches!(
+            self,
+            SettingId::MAX_HEADER_LIST_SIZE
+                | SettingId::QPACK_MAX_TABLE_CAPACITY
+                | SettingId::QPACK_MAX_BLOCKED_STREAMS
+                | SettingId::ENABLE_CONNECT_PROTOCOL
+                | SettingId::ENABLE_WEBTRANSPORT
+                | SettingId::WEBTRANSPORT_MAX_SESSIONS
+                | SettingId::H3_DATAGRAM,
+        )
+    }
+
+    /// Returns if a Settings Identifier is forbidden
+    fn is_forbidden(&self) -> bool {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+        //# Setting identifiers that were defined in [HTTP/2] where there is no
+        //# corresponding HTTP/3 setting have also been reserved
+        //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+        //# their receipt MUST be treated as a connection error of type
+        //# H3_SETTINGS_ERROR.
+        matches!(
+            self,
+            SettingId(0x00) | SettingId(0x02) | SettingId(0x03) | SettingId(0x04) | SettingId(0x05)
+        )
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, UnexpectedEnd> {
+        Ok(SettingId(buf.get_var()?))
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        buf.write_var(self.0);
+    }
+}
+
+macro_rules! setting_identifiers {
+    {$($(#[$meta:meta])* $name:ident = $val:expr,)*} => {
+        impl SettingId {
+            $($(#[$meta])* pub const $name: SettingId = SettingId($val);)*
+        }
+    }
+}
+
+setting_identifiers! {
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` from
+    /// [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    QPACK_MAX_TABLE_CAPACITY = 0x1,
+    /// `SETTINGS_QPACK_BLOCKED_STREAMS` from
+    /// [RFC 9204 Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    QPACK_MAX_BLOCKED_STREAMS = 0x7,
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE` from
+    /// [RFC 9114 Section 7.2.4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1).
+    ///
+    /// The associated constant keeps its historical HTTP/2 name for API
+    /// compatibility; HTTP/3 renamed the setting without changing code point
+    /// `0x06`.
+    MAX_HEADER_LIST_SIZE = 0x6,
+    /// <https://datatracker.ietf.org/doc/html/rfc9220#section-5>
+    ENABLE_CONNECT_PROTOCOL = 0x8,
+    /// <https://datatracker.ietf.org/doc/html/rfc9297#name-http-3-setting>
+    H3_DATAGRAM = 0x33,
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2>
+    ENABLE_WEBTRANSPORT = 0x2B603742,
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2>
+    H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC = 0xFFD277,
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2>
+    WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
+}
+
+/// Represents the order of identifiers in the SETTINGS frame sent by a client.
+///
+/// The order is exact: identifiers that are not listed are not sent, so known
+/// settings advertised by default can be left out to match a specific client.
+/// Apply it with [`crate::client::Builder::settings_order`].
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SettingsOrder {
+    ids: SmallVec<[SettingId; SettingId::DEFAULT_IDS.len()]>,
+}
+
+/// A builder for constructing a [`SettingsOrder`].
+#[derive(Debug)]
+pub struct SettingsOrderBuilder {
+    ids: SmallVec<[SettingId; SettingId::DEFAULT_IDS.len()]>,
+}
+
+/// Extension settings sent in the SETTINGS frame of a client.
+///
+/// Holds identifiers without a typed builder method, such as browser-specific
+/// settings or controlled GREASE. Known identifiers are configured through their
+/// builder methods, and reserved HTTP/2 identifiers must never be sent, so both
+/// are ignored. Apply it with [`crate::client::Builder::experimental_settings`].
+#[cfg(feature = "unstable")]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct ExperimentalSettings {
+    settings: SmallVec<[(SettingId, u64); SettingId::DEFAULT_IDS.len()]>,
+}
+
+/// A builder for constructing [`ExperimentalSettings`].
+#[cfg(feature = "unstable")]
+#[derive(Debug)]
+pub struct ExperimentalSettingsBuilder {
+    settings: SmallVec<[(SettingId, u64); SettingId::DEFAULT_IDS.len()]>,
+}
+
+impl SettingsOrder {
+    /// Creates a new [`SettingsOrderBuilder`].
+    #[inline]
+    pub fn builder() -> SettingsOrderBuilder {
+        SettingsOrderBuilder {
+            ids: SmallVec::new(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a SettingsOrder {
+    type Item = &'a SettingId;
+    type IntoIter = std::slice::Iter<'a, SettingId>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.ids.iter()
+    }
+}
+
+impl SettingsOrderBuilder {
+    /// Pushes a setting ID to the order, ignoring duplicates.
+    pub fn push(mut self, id: SettingId) -> Self {
+        if !self.ids.contains(&id) {
+            self.ids.push(id);
+        }
+        self
+    }
+
+    /// Extends the order with multiple setting IDs.
+    pub fn extend(mut self, iter: impl IntoIterator<Item = SettingId>) -> Self {
+        for id in iter {
+            self = self.push(id);
+        }
+        self
+    }
+
+    /// Builds the [`SettingsOrder`].
+    pub fn build(self) -> SettingsOrder {
+        SettingsOrder { ids: self.ids }
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl ExperimentalSettings {
+    /// Creates a new [`ExperimentalSettingsBuilder`].
+    #[inline]
+    pub fn builder() -> ExperimentalSettingsBuilder {
+        ExperimentalSettingsBuilder {
+            settings: SmallVec::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, id: SettingId) -> Option<u64> {
+        self.settings
+            .iter()
+            .find(|(entry_id, _)| *entry_id == id)
+            .map(|(_, value)| *value)
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl<'a> IntoIterator for &'a ExperimentalSettings {
+    type Item = &'a (SettingId, u64);
+    type IntoIter = std::slice::Iter<'a, (SettingId, u64)>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.settings.iter()
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl ExperimentalSettingsBuilder {
+    /// Pushes a setting, ignoring known, reserved, and duplicate identifiers.
+    pub fn push(mut self, id: SettingId, value: u64) -> Self {
+        let ignored = id.is_supported()
+            || id.is_forbidden()
+            || self.settings.iter().any(|(entry_id, _)| *entry_id == id);
+        if !ignored {
+            self.settings.push((id, value));
+        }
+        self
+    }
+
+    /// Extends the settings with multiple `(id, value)` pairs.
+    pub fn extend(mut self, iter: impl IntoIterator<Item = (SettingId, u64)>) -> Self {
+        for (id, value) in iter {
+            self = self.push(id, value);
+        }
+        self
+    }
+
+    /// Builds the [`ExperimentalSettings`].
+    pub fn build(self) -> ExperimentalSettings {
+        ExperimentalSettings {
+            settings: self.settings,
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct Settings {
+    // SETTINGS is exchanged once per connection. Keeping its variable-length
+    // storage out of the generic `Frame` layout avoids making every request
+    // stream carry the largest possible inline SETTINGS representation.
+    entries: Vec<(SettingId, u64)>,
+}
+
+impl FrameHeader for Settings {
+    const TYPE: FrameType = FrameType::SETTINGS;
+    fn len(&self) -> usize {
+        self.entries.iter().fold(0, |len, (id, val)| {
+            len + VarInt::from_u64(id.0).unwrap().size() + VarInt::from_u64(*val).unwrap().size()
+        })
+    }
+}
+
+impl Settings {
+    pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
+        // Frame length calculation and encoding assume that both SETTINGS
+        // identifiers and values fit in QUIC variable-length integers.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4
+        if VarInt::from_u64(id.0).is_err() {
+            return Err(SettingsError::InvalidSettingId(id.0));
+        }
+        if VarInt::from_u64(value).is_err() {
+            return Err(SettingsError::InvalidSettingValue(id, value));
+        }
+
+        // These settings only take 0 or 1; a peer sending anything else gets H3_SETTINGS_ERROR.
+        // https://www.rfc-editor.org/rfc/rfc9297.html#section-2.1.1
+        // https://www.rfc-editor.org/rfc/rfc8441.html#section-3, reused by
+        // https://www.rfc-editor.org/rfc/rfc9220.html#section-3
+        let boolean = matches!(
+            id,
+            SettingId::H3_DATAGRAM | SettingId::ENABLE_CONNECT_PROTOCOL
+        );
+        if boolean && value > 1 {
+            return Err(SettingsError::InvalidSettingValue(id, value));
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+        //# The same setting identifier MUST NOT occur more than once in the
+        //# SETTINGS frame.
+        if self.entries.iter().any(|(i, _)| *i == id) {
+            return Err(SettingsError::Repeated(id));
+        }
+
+        self.entries.push((id, value));
+        Ok(())
+    }
+
+    pub fn get(&self, id: SettingId) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(entry_id, _)| *entry_id == id)
+            .map(|(_, value)| *value)
+    }
+
+    pub(crate) fn encode<T: BufMut>(&self, buf: &mut T) {
+        self.encode_header(buf);
+        for (id, val) in self.entries.iter() {
+            id.encode(buf);
+            buf.write_var(*val);
+        }
+    }
+
+    pub(super) fn decode<T: Buf>(buf: &mut T) -> Result<Settings, SettingsError> {
+        let mut settings = Settings::default();
+        while buf.has_remaining() {
+            if buf.remaining() < 2 {
+                // remains less than 2 * minimum-size varint
+                return Err(SettingsError::Malformed);
+            }
+
+            let identifier = SettingId::decode(buf).map_err(|_| SettingsError::Malformed)?;
+            let value = buf.get_var().map_err(|_| SettingsError::Malformed)?;
+
+            if identifier.is_forbidden() {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+                //# Setting identifiers that were defined in [HTTP/2] where there is no
+                //# corresponding HTTP/3 setting have also been reserved
+                //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+                //# their receipt MUST be treated as a connection error of type
+                //# H3_SETTINGS_ERROR.
+                return Err(SettingsError::InvalidSettingId(identifier.0));
+            }
+
+            if identifier.is_supported() {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+                //# Setting identifiers that were defined in [HTTP/2] where there is no
+                //# corresponding HTTP/3 setting have also been reserved
+                //# (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+                //# their receipt MUST be treated as a connection error of type
+                //# H3_SETTINGS_ERROR.
+                settings.insert(identifier, value)?;
+            } else {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+                //# Endpoints MUST NOT consider such settings to have
+                //# any meaning upon receipt.
+                #[cfg(feature = "tracing")]
+                tracing::debug!("Unsupported setting: {:#x?}", identifier);
+            }
+        }
+        Ok(settings)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SettingsError {
+    Malformed,
+    Repeated(SettingId),
+    InvalidSettingId(u64),
+    InvalidSettingValue(SettingId, u64),
+}
+
+impl std::error::Error for SettingsError {}
+
+impl fmt::Display for SettingsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SettingsError::Malformed => write!(f, "malformed settings frame"),
+            SettingsError::Repeated(id) => write!(f, "got setting 0x{:x} twice", id.0),
+            SettingsError::InvalidSettingId(id) => write!(f, "setting id 0x{:x} is invalid", id),
+            SettingsError::InvalidSettingValue(id, val) => {
+                write!(f, "setting 0x{:x} has invalid value {}", id.0, val)
+            }
+        }
+    }
+}
+
+impl From<SettingsError> for FrameError {
+    fn from(e: SettingsError) -> Self {
+        Self::Settings(e)
+    }
+}
+
+impl From<UnexpectedEnd> for FrameError {
+    fn from(e: UnexpectedEnd) -> Self {
+        FrameError::Incomplete(e.0)
+    }
+}
+
+impl From<InvalidStreamId> for FrameError {
+    fn from(e: InvalidStreamId) -> Self {
+        FrameError::InvalidStreamId(e)
+    }
+}
+
+impl From<InvalidPushId> for FrameError {
+    fn from(e: InvalidPushId) -> Self {
+        FrameError::InvalidPushId(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{assert_matches, io::Cursor};
+
+    use super::*;
+    use crate::stream::WriteBuf;
+
+    #[test]
+    fn grease_frame_type_and_length_share_one_value() {
+        for _ in 0..64 {
+            let mut buf = bytes::BytesMut::new();
+            encode_grease_frame(&mut buf);
+            let ty = buf.get_var().unwrap();
+            let len = buf.get_var().unwrap();
+            // One random 32-bit value picks the type and the payload length.
+            let n = (ty - 0x21) / 0x1f;
+            assert_eq!((ty - 0x21) % 0x1f, 0);
+            assert!(n <= u64::from(u32::MAX));
+            assert_eq!(len, n % 4);
+            assert_eq!(buf.remaining() as u64, len);
+        }
+    }
+
+    fn frame_header(ty: FrameType, len: u64) -> Cursor<Vec<u8>> {
+        let mut wire = Vec::new();
+        ty.encode(&mut wire);
+        VarInt::try_from(len).unwrap().encode(&mut wire);
+        Cursor::new(wire)
+    }
+
+    #[test]
+    fn frame_payload_limits_apply_at_the_header() {
+        use StreamKind::{Any, Control, Request};
+        let decode = |ty, len, kind| {
+            Frame::decode_stream(&mut frame_header(ty, len), usize::MAX, kind).err()
+        };
+        // These frames wait for their payload: within the limit an extra byte
+        // is still a frame error once the payload has arrived.
+        for (ty, len, kind) in [
+            (FrameType::GOAWAY, 9, Control),
+            (FrameType::SETTINGS, MAX_CONTROL_PAYLOAD, Control),
+            (FrameType::GOAWAY, 1, Any),
+            (FrameType::HEADERS, 1, Request),
+        ] {
+            assert_matches!(decode(ty, len, kind), Some(FrameError::Incomplete(_)));
+        }
+        let excessive = || FrameError::ExcessiveLoad {
+            len: MAX_CONTROL_PAYLOAD + 1,
+            limit: 64 * 1024,
+        };
+        for (ty, len, kind, error) in [
+            (
+                FrameType::H2_PING,
+                8,
+                Any,
+                FrameError::UnsupportedFrame(0x6),
+            ),
+            (
+                FrameType::DATA,
+                1,
+                Control,
+                FrameError::UnsupportedFrame(0x0),
+            ),
+            (
+                FrameType::HEADERS,
+                1,
+                Control,
+                FrameError::UnsupportedFrame(0x1),
+            ),
+            (
+                FrameType::PUSH_PROMISE,
+                1,
+                Control,
+                FrameError::UnsupportedFrame(0x5),
+            ),
+            (
+                FrameType::CANCEL_PUSH,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0x3),
+            ),
+            (
+                FrameType::SETTINGS,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0x4),
+            ),
+            (
+                FrameType::GOAWAY,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0x7),
+            ),
+            (
+                FrameType::MAX_PUSH_ID,
+                0,
+                Request,
+                FrameError::UnsupportedFrame(0xd),
+            ),
+            (
+                FrameType::CANCEL_PUSH,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+            (
+                FrameType::SETTINGS,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+            (
+                FrameType::GOAWAY,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+            (
+                FrameType::MAX_PUSH_ID,
+                MAX_CONTROL_PAYLOAD + 1,
+                Control,
+                excessive(),
+            ),
+        ] {
+            assert_eq!(decode(ty, len, kind), Some(error));
+        }
+    }
+
+    #[test]
+    fn unknown_frame_type() {
+        let mut buf = Cursor::new(&[22, 4, 0, 255, 128, 0, 3, 1, 2]);
+        assert_matches!(Frame::decode(&mut buf), Err(FrameError::UnknownFrame(22)));
+        assert_matches!(Frame::decode(&mut buf), Ok(Frame::CancelPush(PushId(2))));
+    }
+
+    #[test]
+    fn len_unexpected_end() {
+        let mut buf = Cursor::new(&[0, 255]);
+        let decoded = Frame::decode(&mut buf);
+        assert_matches!(decoded, Err(FrameError::Incomplete(3)));
+    }
+
+    #[test]
+    fn type_unexpected_end() {
+        let mut buf = Cursor::new(&[255]);
+        let decoded = Frame::decode(&mut buf);
+        assert_matches!(decoded, Err(FrameError::Incomplete(2)));
+    }
+
+    #[test]
+    fn buffer_too_short() {
+        let mut buf = Cursor::new(&[4, 4, 0, 255, 128]);
+        let decoded = Frame::decode(&mut buf);
+        assert_matches!(decoded, Err(FrameError::Incomplete(6)));
+    }
+
+    #[test]
+    fn buffered_payload_must_hold_exactly_its_fields() {
+        // A payload that ends before its fields or carries extra bytes is a
+        // frame error, not a request for more stream data.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+        for wire in [
+            &[0x07, 0x00][..],         // GOAWAY without an identifier
+            &[0x07, 0x01, 0x40],       // GOAWAY with a truncated identifier
+            &[0x07, 0x02, 0x04, 0x00], // GOAWAY with a trailing byte
+            &[0x03, 0x00],             // CANCEL_PUSH without a push ID
+            &[0x03, 0x02, 0x00, 0x00], // CANCEL_PUSH with a trailing byte
+            &[0x0d, 0x00],             // MAX_PUSH_ID without a push ID
+            &[0x0d, 0x02, 0x00, 0x00], // MAX_PUSH_ID with a trailing byte
+            &[0x05, 0x00],             // PUSH_PROMISE without a push ID
+            &[0x04, 0x01, 0x01],       // SETTINGS with a lone identifier
+            &[0x04, 0x02, 0x01, 0x40], // SETTINGS with a truncated value
+        ] {
+            assert_matches!(
+                Frame::decode(&mut Cursor::new(wire)),
+                Err(FrameError::Malformed),
+                "{wire:x?}"
+            );
+        }
+
+        // Exact payloads leave the next frame intact.
+        let mut buf = Cursor::new(&[0x07, 0x01, 0x04, 0x0d, 0x02, 0x40, 0x08]);
+        assert_matches!(Frame::decode(&mut buf), Ok(Frame::Goaway(VarInt(4))));
+        assert_matches!(Frame::decode(&mut buf), Ok(Frame::MaxPushId(PushId(8))));
+        assert!(!buf.has_remaining());
+    }
+
+    #[test]
+    fn frame_lengths_respect_the_address_space_boundary() {
+        let max_32_bit = u64::from(u32::MAX);
+        let max_addressable = usize::try_from(max_32_bit).unwrap();
+
+        for encoded_len in [max_32_bit - 1, max_32_bit] {
+            assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType::DATA, encoded_len),
+                    max_32_bit,
+                ),
+                Ok(Frame::Data(PayloadLen(len)))
+                    if len == usize::try_from(encoded_len).unwrap()
+            );
+        }
+
+        assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType::DATA, max_32_bit + 1),
+                    max_32_bit,
+                ),
+            Err(FrameError::ExcessiveLoad {
+                len,
+                limit,
+            }) if len == max_32_bit + 1 && limit == max_addressable
+        );
+        for encoded_len in [max_32_bit - 1, max_32_bit] {
+            assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType::HEADERS, encoded_len),
+                    max_32_bit,
+                ),
+                Err(FrameError::ExcessiveLoad {
+                    len,
+                    limit,
+                }) if len == encoded_len && limit == max_addressable
+            );
+        }
+        for encoded_len in [max_32_bit - 1, max_32_bit, max_32_bit + 1] {
+            assert_matches!(
+                Frame::decode_with_max_addressable(
+                    &mut frame_header(FrameType(0x21), encoded_len),
+                    max_32_bit,
+                ),
+                Err(FrameError::ExcessiveLoad {
+                    len,
+                    limit,
+                }) if len == encoded_len && limit == max_addressable
+            );
+        }
+
+        // DATA payloads are streamed and only their payload length must fit.
+        // Buffered frames also need room for the type and length prefix. A
+        // declared length must never be narrowed or allowed to change framing.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.1
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn native_32_bit_frame_lengths_do_not_truncate() {
+        let max = u64::from(u32::MAX);
+        assert_matches!(
+            Frame::decode(&mut frame_header(FrameType::DATA, max)),
+            Ok(Frame::Data(PayloadLen(len))) if len == usize::MAX
+        );
+        assert_matches!(
+            Frame::decode(&mut frame_header(FrameType::DATA, max + 1)),
+            Err(FrameError::ExcessiveLoad {
+                len,
+                limit: usize::MAX,
+            }) if len == max + 1
+        );
+        assert_matches!(
+            Frame::decode(&mut frame_header(FrameType::HEADERS, max)),
+            Err(FrameError::ExcessiveLoad {
+                len,
+                limit: usize::MAX,
+            }) if len == max
+        );
+        for encoded_len in [max - 1, max, max + 1] {
+            assert_matches!(
+                Frame::decode(&mut frame_header(FrameType(0x21), encoded_len)),
+                Err(FrameError::ExcessiveLoad {
+                    len,
+                    limit: usize::MAX,
+                }) if len == encoded_len
+            );
+        }
+    }
+
+    fn codec_frame_check(mut frame: Frame<Bytes>, wire: &[u8], check_frame: Frame<Bytes>) {
+        let mut buf = Vec::new();
+        frame.encode_with_payload(&mut buf);
+        assert_eq!(&buf, &wire);
+
+        let mut read = Cursor::new(&buf);
+        let decoded = Frame::decode(&mut read).unwrap();
+        assert_eq!(check_frame, decoded);
+    }
+
+    #[test]
+    fn settings_frame() {
+        let mut send_settings = Settings::default();
+        send_settings
+            .insert(SettingId::MAX_HEADER_LIST_SIZE, 0xfad1)
+            .unwrap();
+        send_settings
+            .insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2)
+            .unwrap();
+        send_settings
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3)
+            .unwrap();
+        send_settings.insert(SettingId(95), 0).unwrap();
+
+        // Decoded settings will not contain the unknown SettingId(95)
+        let mut recv_settings = Settings::default();
+        recv_settings
+            .insert(SettingId::MAX_HEADER_LIST_SIZE, 0xfad1)
+            .unwrap();
+        recv_settings
+            .insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2)
+            .unwrap();
+        recv_settings
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3)
+            .unwrap();
+
+        codec_frame_check(
+            Frame::Settings(send_settings),
+            &[
+                4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
+            ],
+            Frame::Settings(recv_settings),
+        );
+    }
+
+    #[test]
+    fn write_buf_streams_push_promise_payload_once() {
+        let payload = Bytes::from(vec![0x2a; 128]);
+        let expected = Frame::<Bytes>::PushPromise(PushPromise {
+            id: 7,
+            encoded: payload.clone(),
+        });
+        let mut write = WriteBuf::<Bytes>::from(Frame::<Bytes>::PushPromise(PushPromise {
+            id: 7,
+            encoded: payload,
+        }));
+        let mut wire = write.copy_to_bytes(write.remaining());
+
+        assert_eq!(Frame::<PayloadLen>::decode(&mut wire).unwrap(), expected);
+        assert!(!wire.has_remaining());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn cold_settings_do_not_expand_hot_frames() {
+        assert!(std::mem::size_of::<Settings>() <= 32);
+        assert!(std::mem::size_of::<Frame<Bytes>>() <= 64);
+    }
+
+    #[test]
+    fn settings_accept_maximum_qpack_blocked_streams_value() {
+        let max = VarInt::MAX.into_inner();
+        let mut settings = Settings::default();
+        settings
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, max)
+            .unwrap();
+        let mut expected = Settings::default();
+        expected
+            .insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, max)
+            .unwrap();
+
+        let mut frame = Frame::<Bytes>::Settings(settings);
+        let mut wire = Vec::new();
+        frame.encode_with_payload(&mut wire);
+
+        assert_eq!(
+            Frame::decode(&mut Cursor::new(wire)).unwrap(),
+            Frame::<Bytes>::Settings(expected)
+        );
+    }
+
+    #[test]
+    fn settings_reject_value_larger_than_quic_varint() {
+        let mut settings = Settings::default();
+        let value = VarInt::MAX.into_inner() + 1;
+
+        assert_eq!(
+            settings.insert(SettingId::QPACK_MAX_BLOCKED_STREAMS, value),
+            Err(SettingsError::InvalidSettingValue(
+                SettingId::QPACK_MAX_BLOCKED_STREAMS,
+                value,
+            ))
+        );
+    }
+
+    #[test]
+    fn settings_frame_emtpy() {
+        codec_frame_check(
+            Frame::Settings(Settings::default()),
+            &[4, 0],
+            Frame::Settings(Settings::default()),
+        );
+    }
+
+    #[test]
+    fn data_frame() {
+        codec_frame_check(
+            Frame::Data(Bytes::from("1234567")),
+            &[0, 7, 49, 50, 51, 52, 53, 54, 55],
+            Frame::Data(Bytes::from("1234567")),
+        );
+    }
+
+    #[test]
+    fn simple_frames() {
+        codec_frame_check(
+            Frame::CancelPush(PushId(2)),
+            &[3, 1, 2],
+            Frame::CancelPush(PushId(2)),
+        );
+        codec_frame_check(
+            Frame::Goaway(VarInt(2)),
+            &[7, 1, 2],
+            Frame::Goaway(VarInt(2)),
+        );
+        codec_frame_check(
+            Frame::MaxPushId(PushId(2)),
+            &[13, 1, 2],
+            Frame::MaxPushId(PushId(2)),
+        );
+    }
+
+    #[test]
+    fn headers_frames() {
+        codec_frame_check(
+            Frame::headers("TODO QPACK"),
+            &[1, 10, 84, 79, 68, 79, 32, 81, 80, 65, 67, 75],
+            Frame::headers("TODO QPACK"),
+        );
+        codec_frame_check(
+            Frame::PushPromise(PushPromise {
+                id: 134,
+                encoded: Bytes::from("TODO QPACK"),
+            }),
+            &[5, 12, 64, 134, 84, 79, 68, 79, 32, 81, 80, 65, 67, 75],
+            Frame::PushPromise(PushPromise {
+                id: 134,
+                encoded: Bytes::from("TODO QPACK"),
+            }),
+        );
+    }
+
+    #[test]
+    fn reserved_frame() {
+        let mut raw = vec![];
+        VarInt::from_u32(0x21 + 2 * 0x1f).encode(&mut raw);
+        raw.extend(&[6, 0, 255, 128, 0, 250, 218]);
+        let mut buf = Cursor::new(&raw);
+        let decoded = Frame::decode(&mut buf);
+        assert_matches!(decoded, Err(FrameError::UnknownFrame(95)));
+    }
+}

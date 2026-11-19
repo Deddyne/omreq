@@ -1,0 +1,314 @@
+//! Server-side HTTP/3 stream management
+
+use std::{
+    option::Option,
+    result::Result,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
+use bytes::{Buf, BytesMut};
+use futures_util::future;
+use http::{HeaderMap, Response, response};
+use quic::StreamId;
+#[cfg(feature = "tracing")]
+use tracing::{error, instrument};
+
+use super::connection::RequestEnd;
+use crate::{
+    error::{
+        Code, StreamError, connection_error_creators::CloseStream,
+        internal_error::InternalConnectionError,
+    },
+    proto::headers::Header,
+    qpack,
+    quic::{self, SendStream as _},
+    shared_state::{ConnectionState, SharedState},
+};
+
+/// Manage request and response transfer for an incoming request
+///
+/// The [`RequestStream`] struct is used to send and/or receive
+/// information from the client.
+/// After sending the final response, call [`RequestStream::finish`] to close the stream.
+/// Dropping it before then resets the response with [`Code::H3_REQUEST_CANCELLED`].
+/// Dropping it with the request body unread stops the body with [`Code::H3_NO_ERROR`].
+pub struct RequestStream<S, B> {
+    pub(super) inner: crate::connection::RequestStream<S, B>,
+    pub(super) request_end: Arc<RequestEnd>,
+}
+
+impl<S, B> AsMut<crate::connection::RequestStream<S, B>> for RequestStream<S, B> {
+    fn as_mut(&mut self) -> &mut crate::connection::RequestStream<S, B> {
+        &mut self.inner
+    }
+}
+
+impl<S, B> ConnectionState for RequestStream<S, B> {
+    fn shared_state(&self) -> &SharedState {
+        &self.inner.conn_state
+    }
+}
+
+impl<S, B> CloseStream for RequestStream<S, B> {}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::RecvStream,
+    B: Buf,
+{
+    /// Receive data sent from the client.
+    ///
+    /// This returns a chunk of the request body, or `None` if the request body is finished.
+    /// A body that differs from its Content-Length aborts the stream with
+    /// [`Code::H3_MESSAGE_ERROR`].
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
+        future::poll_fn(|cx| self.poll_recv_data(cx)).await
+    }
+
+    /// Poll for data sent from the client.
+    ///
+    /// This returns a chunk of the request body, or `None` if the request body is finished.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_data(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
+        self.inner.poll_recv_data(cx)
+    }
+
+    /// Receive an optional set of trailers for the request
+    ///
+    /// Call this once [`recv_data()`] returned `None`. Calling it while body
+    /// data remains returns [`StreamError::InvalidStreamState`] and leaves that
+    /// data readable.
+    ///
+    /// [`recv_data()`]: #method.recv_data
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
+        future::poll_fn(|cx| self.poll_recv_trailers(cx)).await
+    }
+
+    /// Poll for an optional set of trailers for the request
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        self.inner.poll_recv_trailers(cx)
+    }
+
+    /// Tell the peer to stop sending into the underlying QUIC stream
+    ///
+    /// Trailers that reference the QPACK dynamic table are no longer decoded afterwards.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn stop_sending(&mut self, error_code: Code) {
+        self.inner.stop_sending(error_code)
+    }
+
+    /// Returns the underlying stream id
+    pub fn id(&self) -> StreamId {
+        self.inner.stream.id()
+    }
+
+    /// Check if this stream was opened during 0-RTT.
+    ///
+    /// See [RFC 8470 Section 5.2](https://www.rfc-editor.org/rfc/rfc8470.html#section-5.2).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use http3::server::RequestStream;
+    /// # async fn example(mut stream: RequestStream<impl http3::quic::BidiStream<bytes::Bytes> + http3::quic::Is0rtt, bytes::Bytes>) {
+    /// if stream.is_0rtt() {
+    ///     // Reject non-idempotent methods (e.g., POST, PUT, DELETE)
+    ///     // to prevent replay attacks
+    /// }
+    /// # }
+    /// ```
+    pub fn is_0rtt(&self) -> bool
+    where
+        S: quic::Is0rtt,
+    {
+        self.inner.stream.is_0rtt()
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::SendStream<B>,
+    B: Buf,
+{
+    /// Sends response HEADERS; 1xx responses may precede the final one.
+    ///
+    /// The final response must be sent before DATA, trailers, or finish, and
+    /// only once. See [RFC 9114, Section 4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1).
+    pub async fn send_response(&mut self, resp: Response<()>) -> Result<(), StreamError> {
+        let informational = resp.status().is_informational();
+        let (parts, _) = resp.into_parts();
+        let response::Parts {
+            status,
+            headers,
+            extensions,
+            ..
+        } = parts;
+        let headers = Header::response(status, headers, extensions);
+
+        let mut block = BytesMut::new();
+        let mem_size = qpack::encode_stateless(&mut block, &headers).map_err(|_e| {
+            self.handle_connection_error_on_stream(InternalConnectionError {
+                code: Code::H3_INTERNAL_ERROR,
+                message: "Failed to encode headers".to_string(),
+            })
+        })?;
+        // Do not retain the normalized fields while the encoded block waits on
+        // QUIC backpressure.
+        drop(headers);
+
+        let max_mem_size = self.inner.settings().max_field_section_size;
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+        //# An implementation that
+        //# has received this parameter SHOULD NOT send an HTTP message header
+        //# that exceeds the indicated size, as the peer will likely refuse to
+        //# process it.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+        //# An HTTP implementation MUST NOT send frames or requests that would be
+        //# invalid based on its current understanding of the peer's settings.
+
+        if mem_size > max_mem_size {
+            return Err(StreamError::HeaderTooBig {
+                actual_size: mem_size,
+                max_size: max_mem_size,
+            });
+        }
+
+        future::poll_fn(|cx| self.inner.poll_ready(cx)).await?;
+        self.inner
+            .start_send_headers(block.freeze(), informational)?;
+        future::poll_fn(|cx| self.inner.poll_ready(cx)).await
+    }
+
+    /// Send some data on the response body.
+    pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        self.inner.send_data(buf).await
+    }
+
+    /// Stop a stream with an error code
+    ///
+    /// The code can be [`Code::H3_NO_ERROR`].
+    pub fn stop_stream(&mut self, error_code: Code) {
+        self.inner.stop_stream(error_code);
+    }
+
+    /// Send a set of trailers to end the response.
+    ///
+    /// [`RequestStream::finish`] must be called to finalize a request.
+    pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        self.inner.send_trailers(trailers).await
+    }
+
+    /// End the response without trailers.
+    ///
+    /// [`RequestStream::finish`] must be called to finalize a request.
+    pub async fn finish(&mut self) -> Result<(), StreamError> {
+        self.inner.finish().await
+    }
+
+    /// Polls for the client stopping or acknowledging the response's send direction.
+    ///
+    /// Resolves to `Some(code)` after `STOP_SENDING` and to `None` once the whole
+    /// response, including the FIN, is acknowledged. Polling never changes the
+    /// stream's state.
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        self.inner.poll_stopped(cx)
+    }
+
+    /// Returns the underlying stream id
+    pub fn send_id(&self) -> StreamId {
+        self.inner.stream.send_id()
+    }
+
+    /// Flushes a queued DATA or trailers frame into the QUIC transport.
+    ///
+    /// `Pending` registers the task for another poll. Success permits another
+    /// DATA frame while the body is open; it does not reserve QUIC flow-control
+    /// credit or wait for acknowledgment. After trailers, only finish is allowed.
+    /// Dropping the polling future leaves queued bytes owned by the stream.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        self.inner.poll_ready(cx)
+    }
+
+    /// Queues one owned body buffer as a DATA frame without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]; after success, drive `poll_ready` or
+    /// [`Self::poll_finish`] to flush the frame. The buffer is consumed even on
+    /// error. Pending output, trailers, finish or reset cause a local
+    /// [`StreamError::InvalidStreamState`] without discarding queued bytes.
+    pub fn start_send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        self.inner.start_send_data(buf)
+    }
+
+    /// Queues the final field section without waiting for I/O.
+    ///
+    /// First complete [`Self::poll_ready`]. Success forbids further DATA or
+    /// trailers; call [`Self::poll_finish`] to flush and send FIN. The peer's
+    /// field section limit is checked before queuing; an error consumes the
+    /// supplied headers. Invalid send order is a local error, not a wire error.
+    pub fn start_send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        self.inner.start_send_trailers(trailers)
+    }
+
+    /// Flushes pending DATA, trailers and optional GREASE, then submits FIN.
+    ///
+    /// Once polled, no more content may be queued. After `Pending`, retrying
+    /// continues the same finish operation without repeating queued frames.
+    /// Success is repeatable and does not wait for FIN acknowledgment; use
+    /// [`Self::poll_stopped`] for that. Receiving is unaffected.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        self.inner.poll_finish(cx)
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::BidiStream<B>,
+    B: Buf,
+{
+    /// Splits the Request-Stream into send and receive.
+    /// This can be used the send and receive data on different tasks.
+    pub fn split(
+        self,
+    ) -> (
+        RequestStream<S::SendStream, B>,
+        RequestStream<S::RecvStream, B>,
+    ) {
+        let (send, recv) = self.inner.split();
+        (
+            RequestStream {
+                inner: send,
+                request_end: self.request_end.clone(),
+            },
+            RequestStream {
+                inner: recv,
+                request_end: self.request_end,
+            },
+        )
+    }
+}
+
+impl Drop for RequestEnd {
+    fn drop(&mut self) {
+        if let Err(_error) = self.request_end.send(self.stream_id) {
+            #[cfg(feature = "tracing")]
+            error!(
+                "failed to notify connection of request end: {} {}",
+                self.stream_id, _error
+            );
+        }
+    }
+}
