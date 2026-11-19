@@ -21,9 +21,9 @@ writeFileSync(
 );
 const configuration = [
   'patch.crates-io.btls.git="https://github.com/0x676e67/btls"',
-  'patch.crates-io.btls.rev="129887582a538b8f4dcf371d15c953335312ca37"',
+  'patch.crates-io.btls.rev="5ec1c113a03626a5877b34dd6d2ea8d440897a91"',
   'patch.crates-io.btls-sys.git="https://github.com/0x676e67/btls"',
-  'patch.crates-io.btls-sys.rev="129887582a538b8f4dcf371d15c953335312ca37"',
+  'patch.crates-io.btls-sys.rev="5ec1c113a03626a5877b34dd6d2ea8d440897a91"',
   `patch.crates-io.wreq-proto.path=${JSON.stringify(resolve('vendor/wreq-proto'))}`,
   `patch.crates-io.http2.path=${JSON.stringify(resolve('vendor/http2'))}`,
 ].flatMap((c) => ['--config', c]);

@@ -6,5 +6,5 @@
   "defaults": "omreq-transport-v1",
   "requires": [],
   "transport": {},
-  "headers": [["user-agent", "Omreq/0.1.0"], ["accept", "*/*"]]
+  "headers": [["user-agent", "Omreq/0.2.0"], ["accept", "*/*"]]
 }

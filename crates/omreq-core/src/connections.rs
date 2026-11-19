@@ -72,9 +72,15 @@ impl Connections {
             }),
         }
     }
-    pub fn close(&self) {
+    /// Refuses new sockets and fails queued reservations, leaving open sockets alone.
+    /// A client calls it before cancelling its operations: a socket that a
+    /// cancelled operation releases must not let a queued reservation connect.
+    pub fn refuse(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         self.inner.scheduler.stop();
+    }
+    pub fn close(&self) {
+        self.refuse();
         // Do not keep a map lock while dropping upgraded weak references:
         // the last reference removes itself from this map on Drop.
         let records = lock(&self.inner.records)
@@ -353,6 +359,23 @@ mod tests {
         drop(a);
         assert!(pool.is_empty());
         assert!(pool.reserve(&origin("c.test"), peer()).await.is_err());
+    }
+    #[tokio::test]
+    async fn refused_pool_gives_released_capacity_to_no_queued_reservation() {
+        let pool = Connections::new(1, 1, 4, None);
+        let a = pool.reserve(&origin("a.test"), peer()).await.unwrap();
+        let pending = pool.reserve(&origin("b.test"), peer());
+        let release = async {
+            tokio::task::yield_now().await;
+            // A closing client refuses new sockets first; the open one stays usable
+            // until its operation is cancelled, which then releases its capacity.
+            pool.refuse();
+            assert!(!is_closing(&a));
+            drop(a);
+        };
+        let (result, ()) = tokio::join!(pending, release);
+        assert!(result.is_err());
+        assert!(pool.is_empty());
     }
     fn is_closing(lease: &Arc<dyn SocketLease>) -> bool {
         let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());

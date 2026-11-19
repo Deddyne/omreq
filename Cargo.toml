@@ -1,10 +1,17 @@
 [workspace]
-members = ["crates/omreq-core", "crates/omreq-napi"]
+members = ["crates/omreq-core", "crates/omreq-napi", "crates/omreq-h3-fixture"]
 resolver = "3"
-exclude = ["vendor/wreq", "vendor/http2", "vendor/wreq-proto"]
+exclude = [
+    "vendor/wreq",
+    "vendor/http2",
+    "vendor/wreq-proto",
+    "vendor/quic",
+    "vendor/quic-proto",
+    "vendor/http3",
+]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.100"
@@ -25,6 +32,9 @@ futures-util = "=0.3.34"
 sha2 = "=0.10.9"
 jsonschema = { version = "=0.61.2", default-features = false }
 psl = "=2.1.254"
+quic = { version = "=0.12.2", default-features = false, features = ["btls", "runtime-tokio"] }
+quic-proto = { version = "=0.12.2", default-features = false, features = ["btls"] }
+http3 = { version = "=0.2.0", default-features = false, features = ["unstable"] }
 
 [profile.release]
 lto = "thin"
@@ -36,5 +46,8 @@ strip = "symbols"
 http2 = { path = "vendor/http2" }
 wreq-proto = { path = "vendor/wreq-proto" }
 wreq = { path = "vendor/wreq" }
-btls = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }
-btls-sys = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }
+quic = { path = "vendor/quic" }
+quic-proto = { path = "vendor/quic-proto" }
+http3 = { path = "vendor/http3" }
+btls = { git = "https://github.com/0x676e67/btls", rev = "5ec1c113a03626a5877b34dd6d2ea8d440897a91" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "5ec1c113a03626a5877b34dd6d2ea8d440897a91" }

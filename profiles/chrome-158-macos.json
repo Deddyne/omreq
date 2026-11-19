@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "chrome/158.0.8127.37-macos-arm64",
-  "revision": 1,
+  "revision": 2,
   "target": {
     "family": "chrome",
     "version": "158.0.8127.37",
@@ -154,6 +154,160 @@
       ],
       "keepAliveHeader": true,
       "omitDefaultPriority": true
+    },
+    "http3": {
+      "tls": {
+        "cipherSuites": [
+          "TLS_AES_128_GCM_SHA256",
+          "TLS_AES_256_GCM_SHA384",
+          "TLS_CHACHA20_POLY1305_SHA256"
+        ],
+        "signatureAlgorithms": [
+          "ecdsa_secp256r1_sha256",
+          "rsa_pss_rsae_sha256",
+          "rsa_pkcs1_sha256",
+          "ecdsa_secp384r1_sha384",
+          "rsa_pss_rsae_sha384",
+          "rsa_pkcs1_sha384",
+          "rsa_pss_rsae_sha512",
+          "rsa_pkcs1_sha512",
+          "rsa_pkcs1_sha1"
+        ],
+        "supportedGroups": [
+          "X25519MLKEM768",
+          "X25519",
+          "P-256",
+          "P-384"
+        ],
+        "greaseEnabled": false,
+        "permuteExtensions": true,
+        "echGrease": true,
+        "alps": [
+          "h3"
+        ],
+        "alpsUseNewCodepoint": true,
+        "certificateCompression": [
+          "brotli"
+        ],
+        "trustAnchorIds": [
+          "82df130201",
+          "82df130206",
+          "82df13020d",
+          "82df13020e",
+          "82df13020f",
+          "82df130212",
+          "82df130213",
+          "82df130214",
+          "839a648c9b2d0107",
+          "839a648c9b2d0108",
+          "839a648c9b2d0109",
+          "839a648c9b2d010a",
+          "839a648c9b2d010b",
+          "839a648c9b2d010c",
+          "839a648c9b2d010d",
+          "839a648c9b2d0112",
+          "839a648c9b2d0113",
+          "d6790901",
+          "d6790904",
+          "d6790905",
+          "d6790906",
+          "d6790907",
+          "d6790908",
+          "d679090a",
+          "d679090b",
+          "d679090c",
+          "d679090d",
+          "d679090f"
+        ]
+      },
+      "quic": {
+        "transportParameters": [
+          {
+            "name": "googleConnectionOptions",
+            "value": "4f524947"
+          },
+          {
+            "name": "versionInformation"
+          },
+          {
+            "name": "initialMaxStreamDataBidiLocal",
+            "value": 6291456
+          },
+          {
+            "name": "initialMaxStreamDataBidiRemote",
+            "value": 6291456
+          },
+          {
+            "name": "initialMaxStreamDataUni",
+            "value": 6291456
+          },
+          {
+            "name": "maxUdpPayloadSize",
+            "value": 1472
+          },
+          {
+            "name": "initialMaxData",
+            "value": 15728640
+          },
+          {
+            "name": "initialMaxStreamsUni",
+            "value": 103
+          },
+          {
+            "name": "initialMaxStreamsBidi",
+            "value": 100
+          },
+          {
+            "name": "maxDatagramFrameSize",
+            "value": 65536
+          },
+          {
+            "name": "initialSourceConnectionId"
+          },
+          {
+            "name": "grease"
+          },
+          {
+            "name": "maxIdleTimeout",
+            "value": 30000
+          }
+        ],
+        "shuffleTransportParameters": true,
+        "initialDestinationConnectionIdLength": 8,
+        "connectionIdLength": 0,
+        "initialPacketSize": 1250,
+        "chaosProtection": true,
+        "sharedPacketNumbers": true
+      },
+      "settings": [
+        {
+          "name": "qpackMaxTableCapacity",
+          "value": 65536
+        },
+        {
+          "name": "maxFieldSectionSize",
+          "value": 262144
+        },
+        {
+          "name": "qpackBlockedStreams",
+          "value": 100
+        },
+        {
+          "name": "h3Datagram",
+          "value": 1
+        }
+      ],
+      "greaseSetting": true,
+      "greaseFrame": true,
+      "pseudoHeaderOrder": [
+        ":method",
+        ":authority",
+        ":scheme",
+        ":path"
+      ],
+      "priorityUpdate": true,
+      "qpackHuffman": "smaller-only",
+      "cookieCrumbs": true
     }
   },
   "headers": [
@@ -211,7 +365,7 @@
     ]
   ],
   "provenance": {
-    "source": "Headed Chrome 158.0.8127.37 on macOS arm64, en-US document navigation; TLS, HTTP/1 and HTTP/2 bytes verified against live capture",
-    "date": "2026-11-18"
+    "source": "Headed Chrome 158.0.8127.37 on macOS arm64, en-US document navigation; TLS, HTTP/1, HTTP/2 and HTTP/3 (QUIC Initial, SETTINGS, QPACK) bytes verified against live capture",
+    "date": "2026-11-19"
   }
 }

@@ -856,16 +856,124 @@
              record_size_limit: None,
 --- a/src/tls/conn.rs
 +++ b/src/tls/conn.rs
-@@ -337,6 +337,12 @@
-             .set_cert_store(self.cert_store.as_ref())?
+@@ -17,7 +17,7 @@
+ use btls::{
+     error::ErrorStack,
+     ex_data::Index,
+-    ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
++    ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode, Tls13Cipher},
+ };
+ use ext::SslConnectorBuilderExt;
+ use http::{Uri, Version};
+@@ -52,7 +52,6 @@
+     alps_protocols: Option<Cow<'static, [AlpsProtocol]>>,
+     alps_use_new_codepoint: bool,
+     key_shares: Option<Cow<'static, [KeyShare]>>,
+-    random_aes_hw_override: bool,
+ }
+ 
+ /// A Connector using BoringSSL to support `http` and `https` schemes.
+@@ -146,12 +145,6 @@
+         // Set ECH grease
+         cfg.set_enable_ech_grease(self.settings.enable_ech_grease);
+ 
+-        // Set random AES hardware override
+-        if self.settings.random_aes_hw_override {
+-            let random = (crate::util::fast_random() & 1) == 0;
+-            cfg.set_aes_hw_override(random);
+-        }
+-
+         // Set ALPN protocols
+         if let Some(version) = descriptor.version() {
+             match version {
+@@ -179,7 +172,7 @@
+         // Set ALPS protos
+         if let Some(ref alps_values) = self.settings.alps_protocols {
+             for alps in alps_values.iter() {
+-                cfg.add_application_settings(alps.0)?;
++                cfg.add_application_settings(alps.0, None)?;
+             }
+ 
+             // By default, the new endpoint is used.
+@@ -338,6 +331,12 @@
              .set_cert_verification(self.cert_verification)
              .set_cert_compressors(opts.certificate_compressors.as_deref())?;
-+
+ 
 +        // Backported from wreq cd76bcdf1307153de289d34e072528bdf0510a3b.
 +        if let Some(ids) = opts.trust_anchors.as_deref() {
 +            connector.set_requested_trust_anchors(ids).map_err(Error::tls)?;
 +        }
 +        set_option!(opts, grease_sigalgs_enabled, connector, set_grease_sigalgs_enabled);
- 
++
          // Set minimum TLS version
          set_option_inner_try!(min_tls_version, connector, set_min_proto_version);
+ 
+@@ -394,16 +393,30 @@
+         // Set TLS signature algorithms list
+         set_option_ref_try!(opts, sigalgs_list, connector, set_sigalgs_list);
+ 
+-        // Set TLS prreserve TLS 1.3 cipher list order
+-        set_option!(
+-            opts,
+-            preserve_tls13_cipher_list,
+-            connector,
+-            set_preserve_tls13_cipher_list
+-        );
+-
+-        // Set TLS cipher list
+-        set_option_ref_try!(opts, cipher_list, connector, set_cipher_list);
++        // Set TLS cipher list. BoringSSL keeps TLS 1.3 suites in a separate list, offered in
++        // the order they appear here; the remaining names configure TLS 1.2.
++        if let Some(ref cipher_list) = opts.cipher_list {
++            let mut tls13 = Vec::new();
++            let mut tls12 = Vec::new();
++            for name in cipher_list.split(':').filter(|name| !name.is_empty()) {
++                match name {
++                    "TLS_AES_128_GCM_SHA256" => tls13.push(Tls13Cipher::AES_128_GCM_SHA256),
++                    "TLS_AES_256_GCM_SHA384" => tls13.push(Tls13Cipher::AES_256_GCM_SHA384),
++                    "TLS_CHACHA20_POLY1305_SHA256" => {
++                        tls13.push(Tls13Cipher::CHACHA20_POLY1305_SHA256)
++                    }
++                    other => tls12.push(other),
++                }
++            }
++            if !tls13.is_empty() {
++                connector.set_tls13_ciphers(&tls13).map_err(Error::tls)?;
++            }
++            if !tls12.is_empty() {
++                connector
++                    .set_cipher_list(&tls12.join(":"))
++                    .map_err(Error::tls)?;
++            }
++        }
+ 
+         // Set TLS delegated credentials
+         set_option_ref_try!(
+@@ -416,9 +429,6 @@
+         // Set TLS record size limit
+         set_option!(opts, record_size_limit, connector, set_record_size_limit);
+ 
+-        // Set TLS aes hardware override
+-        set_option!(opts, aes_hw_override, connector, set_aes_hw_override);
+-
+         // Set TLS extension permutation
+         if let Some(ref extension_permutation) = opts.extension_permutation {
+             connector
+@@ -444,7 +454,6 @@
+             alps_use_new_codepoint: opts.alps_use_new_codepoint,
+             enable_ech_grease: opts.enable_ech_grease,
+             key_shares: opts.key_shares.clone(),
+-            random_aes_hw_override: opts.random_aes_hw_override,
+         };
+ 
+         // If the session cache is disabled, we don't need to set up any callbacks.
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -36,6 +36,7 @@
+     header
+ }
+ 
++#[allow(dead_code)] // Only multipart and verbose features use it.
+ pub(crate) fn fast_random() -> u64 {
+     use std::{
+         cell::Cell,

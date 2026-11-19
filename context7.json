@@ -1,0 +1,14 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "omreq",
+  "description": "HTTP client for Node.js and Bun with a Chrome TLS (JA3/JA4), HTTP/2 (Akamai) and header-order fingerprint. Rust + BoringSSL engine, proxies, cookies, streaming, custom fingerprint profiles.",
+  "folders": ["docs"],
+  "rules": [
+    "Import named exports: import { createClient } from 'omreq'. There is no default export and no top-level get or fetch function.",
+    "Create one client per configuration (profile, proxy, baseUrl) and reuse it; it owns the connection pool, TLS session cache and cookie jar.",
+    "HTTP 4xx and 5xx responses do not throw; check res.ok or res.status. Network, TLS, timeout and limit failures reject with OmreqError.",
+    "Read every response body with text(), json(), bytes() or the body stream, or call res.dispose(); await using disposes automatically.",
+    "The form and searchParams options take [name, value] pairs or URLSearchParams, not plain objects.",
+    "Close clients with await client.close() or declare them with await using."
+  ]
+}

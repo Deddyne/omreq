@@ -19,6 +19,9 @@ futures-util.workspace = true
 sha2.workspace = true
 jsonschema.workspace = true
 psl.workspace = true
+quic.workspace = true
+quic-proto.workspace = true
+http3.workspace = true
 # Pin the qualification graph, including upstream prereleases, deliberately.
 btls = "=0.5.6"
 btls-sys = "=0.5.6"

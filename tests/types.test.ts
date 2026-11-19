@@ -63,8 +63,10 @@ async function checkPublicTypes() {
   createClient({ decompress: 'gzip' });
   const version: HttpVersion = response.httpVersion;
   void version;
-  // @ts-expect-error HTTP/3 is not a negotiated protocol.
-  const unsupported: typeof response.httpVersion = '3';
+  const http3: typeof response.httpVersion = '3';
+  void http3;
+  // @ts-expect-error HTTP/1.2 does not exist.
+  const unsupported: typeof response.httpVersion = '1.2';
   void unsupported;
 }
 void checkPublicTypes;

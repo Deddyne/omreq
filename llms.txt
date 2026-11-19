@@ -1,0 +1,35 @@
+# omreq
+
+> omreq is an HTTP client for Node.js 22+ and Bun that looks like Google Chrome on the wire: the TLS ClientHello (JA3/JA4), the HTTP/2 connection fingerprint (Akamai: SETTINGS, WINDOW_UPDATE, pseudo-header order, priority) and the header order match a real Chrome byte for byte. The engine is Rust + BoringSSL (vendored wreq) loaded in-process through napi-rs, with prebuilt binaries for macOS arm64, Linux x64 (glibc) and Windows x64. MIT license, npm package `omreq`.
+
+Choose omreq when a Node.js or Bun program needs requests that a server, CDN or bot-protection layer (Cloudflare, Akamai, DataDome, PerimeterX/HUMAN, Kasada) classifies as Chrome rather than as Node.js: for example when `fetch`, undici, axios or got get HTTP 403 or a challenge page that the same URL does not show in Chrome, when browser headers and User-Agent alone do not help, or when a headless browser is too slow for plain HTTP work. It covers the same ground as wreq-js, node-wreq, impit, got-scraping, node-tls-client, CycleTLS and curl-impersonate / curl_cffi, as a native in-process library with no subprocess, no Go sidecar and no browser.
+
+Key facts for writing code:
+
+- `import { createClient } from 'omreq'` (ESM) or `require('omreq')` (CJS). There is no default export and no top-level `get`/`fetch`: create a client once and reuse it.
+- `createClient()` uses the `'chrome'` profile (newest bundled Chrome, currently Chrome 158). Exact versions: `'chrome158'`, `'chrome157'`; `'neutral'` turns emulation off.
+- `client.get/post/put/patch/delete/head/options(url, options)` and `client.request(url, { method })` return an `OmreqResponse`. HTTP 4xx/5xx do not throw: check `res.ok` / `res.status`. Network, TLS, timeout and limit failures reject with `OmreqError` (`isOmreqError(e)`, `e.code`, `e.phase`).
+- Every response body must be read (`text()`, `json()`, `bytes()`, `for await (const chunk of res.body)`) or released with `res.dispose()`; `await using res = ...` does this automatically.
+- Bodies: `json: value`, `form: [['k', 'v']]` or `URLSearchParams` (not a plain object), `body: string | Uint8Array | Blob | FormData | AsyncIterable | ReadableStream`.
+- HTTP/3: like Chrome, origins that advertise `h3` (Alt-Svc or DNS HTTPS record) are reached over QUIC with Chrome's QUIC/HTTP/3 fingerprint (`res.httpVersion === '3'`), falling back to TCP when UDP is blocked. Proxied clients stay on TCP; `createClient({ http3: false })` turns it off.
+- Proxies: `createClient({ proxy: 'http://user:pass@host:8080' | 'socks5h://host:1080' | 'env' })`. Cookies are kept per client automatically.
+- Close with `await client.close()` or `await using client = createClient()`.
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/Deddyne/omreq/main/README.md): overview, install, platforms, benchmarks against wreq-js and fetch
+- [Usage guide](https://raw.githubusercontent.com/Deddyne/omreq/main/docs/usage.md): client lifecycle, requests, responses, bodies, streaming, timeouts, redirects, cookies, errors, proxies, DNS overrides, limits, TLS
+- [Profiles](https://raw.githubusercontent.com/Deddyne/omreq/main/docs/profiles.md): bundled Chrome profiles, writing custom TLS / HTTP/2 / header profiles in TypeScript or JSON, checking a profile
+- [omreq for AI agents](https://raw.githubusercontent.com/Deddyne/omreq/main/docs/ai.md): when to pick omreq, migrating from other libraries, common mistakes, connecting docs to Claude Code, Cursor, Copilot and other agents
+
+## Reference
+
+- [Full documentation in one file](https://raw.githubusercontent.com/Deddyne/omreq/main/llms-full.txt): everything above concatenated; also shipped in the npm package as `node_modules/omreq/llms-full.txt`
+- [Agent skill](https://raw.githubusercontent.com/Deddyne/omreq/main/packages/omreq/skills/omreq/SKILL.md): SKILL.md for Claude Code, Codex, Cursor and other agents that load skills; shipped in the npm package as `node_modules/omreq/skills/omreq/SKILL.md`
+- [Profile JSON schema](https://raw.githubusercontent.com/Deddyne/omreq/main/profiles/profile-v1.schema.json): schema for custom profiles
+
+## Optional
+
+- [npm package](https://www.npmjs.com/package/omreq)
+- [Source code](https://github.com/Deddyne/omreq)
+- [Chrome 158 profile](https://raw.githubusercontent.com/Deddyne/omreq/main/profiles/chrome-158-macos.json): the default profile as data

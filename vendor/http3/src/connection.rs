@@ -1,0 +1,3680 @@
+use std::{
+    convert::TryFrom,
+    marker::PhantomData,
+    mem,
+    sync::Arc,
+    task::{Context, Poll, Waker},
+};
+
+use bytes::{Buf, Bytes, BytesMut};
+use futures_util::{future, ready};
+pub(crate) use guard::StreamGuard;
+use http::HeaderMap;
+use tokio::sync::mpsc;
+#[cfg(feature = "tracing")]
+use tracing::{instrument, warn};
+
+use crate::{
+    config::Config,
+    error::{
+        Code, ConnectionError, StreamError,
+        connection_error_creators::{
+            CloseRawQuicConnection, CloseStream, HandleFrameStreamErrorOnRequestStream,
+        },
+        internal_error::InternalConnectionError,
+    },
+    frame::{FrameStream, FrameStreamError},
+    proto::{
+        coding::Encode,
+        frame::{self, Frame, PayloadLen},
+        headers::Header,
+        stream::StreamType,
+        varint::VarInt,
+    },
+    qpack::{self, QpackDecoder, QpackEvent},
+    quic::{self, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming, StreamId},
+    shared_state::{ConnectionState, SharedState},
+    stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream},
+    webtransport::SessionId,
+};
+
+#[allow(missing_docs)]
+pub struct AcceptedStreams<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    #[allow(missing_docs)]
+    pub wt_uni_streams: Vec<(SessionId, BufRecvStream<C::RecvStream, B>)>,
+}
+
+impl<B, C> Default for AcceptedStreams<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    fn default() -> Self {
+        Self {
+            wt_uni_streams: Default::default(),
+        }
+    }
+}
+
+/// Connection-driver ownership of the two directional QPACK stream pairs.
+///
+/// Local encoder output and peer decoder feedback belong to `encoder`; peer
+/// encoder instructions and local decoder feedback belong to `decoder`. Request
+/// tasks share codec handles, but only this driver polls the critical streams,
+/// drains decoder events and owns the blocked-field-section registry.
+///
+/// Encoder output is FIFO across the active `encoder_send_buf` and the shared
+/// encoder's queued tail. Neither codec lock is held while polling transport I/O.
+pub(crate) struct QpackStreams<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    decoder_send_buf: BytesMut,
+    decoder_send: Option<C::SendStream>,
+    decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
+    encoder: qpack::QpackEncoder,
+    // Active prefix of the same committed encoder-stream output queue held by
+    // `QpackEncoder`; moving a batch here does not make it retractable.
+    // None between batches so a consumed view does not retain shared storage.
+    encoder_send_buf: Option<Bytes>,
+    encoder_send: Option<C::SendStream>,
+    // Each stream type waits for the stream's first instruction.
+    encoder_type_pending: bool,
+    decoder_type_pending: bool,
+    encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
+    decoder: QpackDecoder,
+    blocked_streams: qpack::BlockedStreamRegistry,
+    decoder_events_recv: mpsc::UnboundedReceiver<QpackEvent>,
+}
+
+fn invalid_qpack_decoder_configuration(error: qpack::DecoderError) -> InternalConnectionError {
+    // This failure comes from a local setting that cannot be represented on
+    // the current target, not from a field section received from the peer.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-6
+    InternalConnectionError::new(
+        Code::H3_INTERNAL_ERROR,
+        format!("invalid QPACK decoder configuration: {error}"),
+    )
+}
+
+/// Prefixes the first instructions on a QPACK stream with its deferred stream type.
+/// See <https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2>.
+fn with_stream_type(ty: StreamType, instructions: &[u8]) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(VarInt::MAX_SIZE + instructions.len());
+    ty.encode(&mut buf);
+    buf.extend_from_slice(instructions);
+    buf
+}
+
+fn local_settings(config: &Config) -> Result<frame::Settings, frame::SettingsError> {
+    #[cfg(test)]
+    if !config.send_settings {
+        return Ok(frame::Settings::default());
+    }
+
+    frame::Settings::try_from(config.clone())
+}
+
+fn wake_qpack_waiters_on_connection_error(
+    blocked_streams: &mut qpack::BlockedStreamRegistry,
+    decoder_events_recv: &mut mpsc::UnboundedReceiver<QpackEvent>,
+) {
+    blocked_streams.wake_all();
+
+    // Once the connection fails, no QPACK event can make progress. Close the
+    // channel and drain it so wakers not yet registered by the driver are also
+    // released. Normal polling uses `poll_recv`; `try_recv` is limited to this
+    // closed path.
+    decoder_events_recv.close();
+    while let Ok(event) = decoder_events_recv.try_recv() {
+        match event {
+            QpackEvent::RegisterBlocked { waker, .. } | QpackEvent::DecoderAccessWaker(waker) => {
+                waker.wake()
+            }
+            QpackEvent::HeaderAck(_)
+            | QpackEvent::StreamCancel(_)
+            | QpackEvent::ReleaseBlocked { .. } => {}
+        }
+    }
+}
+
+#[allow(missing_docs)]
+pub struct ConnectionInner<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    pub shared: Arc<SharedState>,
+    /// TODO: breaking encapsulation just to see if we can get this to work, will fix before
+    /// merging
+    pub conn: C,
+    // `None` until `critical_streams` opens it, like the QPACK send streams.
+    control_send: Option<C::SendStream>,
+    critical_streams: CriticalStreams,
+    control_recv: Option<FrameStream<C::RecvStream, B>>,
+    pub(crate) qpack_streams: QpackStreams<C, B>,
+    /// Buffers incoming uni/recv streams which have yet to be claimed.
+    ///
+    /// This is opposed to discarding them by returning in `poll_accept_recv`, which may cause them
+    /// to be missed by something else polling.
+    ///
+    /// See: <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-4.5>
+    ///
+    /// In WebTransport over HTTP/3, the client MAY send its SETTINGS frame, as well as
+    /// multiple WebTransport CONNECT requests, WebTransport data streams and WebTransport
+    /// datagrams, all within a single flight. As those can arrive out of order, a WebTransport
+    /// server could be put into a situation where it receives a stream or a datagram without a
+    /// corresponding session. Similarly, a client may receive a server-initiated stream or a
+    /// datagram before receiving the CONNECT response headers from the server.To handle this
+    /// case, WebTransport endpoints SHOULD buffer streams and datagrams until those can be
+    /// associated with an established session. To avoid resource exhaustion, the endpoints
+    /// MUST limit the number of buffered streams and datagrams. When the number of buffered
+    /// streams is exceeded, a stream SHALL be closed by sending a RESET_STREAM and/or
+    /// STOP_SENDING with the H3_WEBTRANSPORT_BUFFERED_STREAM_REJECTED error code. When the
+    /// number of buffered datagrams is exceeded, a datagram SHALL be dropped. It is up to an
+    /// implementation to choose what stream or datagram to discard.
+    accepted_streams: AcceptedStreams<C, B>,
+    pending_recv_streams: Vec<Option<AcceptRecvStream<C::RecvStream, B>>>,
+    got_peer_settings: bool,
+    pub(crate) handled_connection_error: Option<ConnectionError>,
+    pub send_grease_frame: bool,
+    // tells if the grease steam should be sent
+    send_grease_stream_flag: bool,
+    // step of the grease sending poll fn
+    grease_step: GreaseStatus<C::SendStream, B>,
+    pub config: Config,
+}
+
+impl<B, C> ConnectionState for ConnectionInner<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    fn shared_state(&self) -> &SharedState {
+        &self.shared
+    }
+}
+
+enum GreaseStatus<S, B>
+where
+    S: SendStream<B>,
+    B: Buf,
+{
+    /// Grease stream is not started
+    NotStarted(PhantomData<B>),
+    /// Grease steam is started without data
+    Started(Option<S>),
+    /// Grease stream is started with data
+    DataPrepared(Option<S>),
+    /// Data is sent on grease stream
+    DataSent(S),
+    /// Grease stream is finished
+    Finished,
+}
+
+/// A local critical unidirectional stream.
+#[derive(Clone, Copy, Debug)]
+enum CriticalStream {
+    Control,
+    Encoder,
+    Decoder,
+}
+
+/// Setup of the local control and QPACK streams, driven by the connection driver.
+///
+/// Opens the control stream and writes SETTINGS, followed by a reserved frame
+/// when GREASE is enabled. Then it opens the decoder and encoder streams. Each
+/// QPACK stream type goes out with that stream's first instruction. Setup stays
+/// pending until a request timeout or the QUIC idle timeout if the peer
+/// withholds the stream or flow-control credit required by [RFC 9114, Section 6.2].
+///
+/// [RFC 9114, Section 6.2]: https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2
+enum CriticalStreams {
+    /// Opening the control stream; SETTINGS waits only for this stream.
+    Control(frame::Settings),
+    /// Writing SETTINGS; `None` once it was handed to the transport.
+    Settings(Option<frame::Settings>),
+    /// Opening the decoder stream, then the encoder stream.
+    Qpack(CriticalStream),
+    /// Every stream is open and SETTINGS was written.
+    Ready,
+}
+
+impl CriticalStreams {
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+impl<B, C> ConnectionInner<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    fn critical_send(&mut self, stream: CriticalStream) -> &mut Option<C::SendStream> {
+        match stream {
+            CriticalStream::Control => &mut self.control_send,
+            CriticalStream::Encoder => &mut self.qpack_streams.encoder_send,
+            CriticalStream::Decoder => &mut self.qpack_streams.decoder_send,
+        }
+    }
+
+    /// Closes the connection after `stream` failed to open or to take its header.
+    ///
+    /// The current setup step tells which of the two failed.
+    fn critical_stream_error(
+        &mut self,
+        stream: CriticalStream,
+        error: StreamErrorIncoming,
+    ) -> ConnectionError {
+        let opening = matches!(
+            self.critical_streams,
+            CriticalStreams::Control(_) | CriticalStreams::Qpack(_)
+        );
+        let error = match error {
+            StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
+                return self.handle_connection_error(connection_error);
+            }
+            // The peer must not close the control or a QPACK stream.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+            StreamErrorIncoming::StreamTerminated { error_code } => InternalConnectionError::new(
+                Code::H3_CLOSED_CRITICAL_STREAM,
+                format!("{stream:?} stream was terminated with error code {error_code}"),
+            ),
+            // No critical stream exists yet, so this local transport failure
+            // cannot be reported as a stream closed by the peer.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
+            StreamErrorIncoming::Unknown(error) if opening => InternalConnectionError::new(
+                Code::H3_INTERNAL_ERROR,
+                format!("failed to open {stream:?} stream: {error}"),
+            ),
+            StreamErrorIncoming::Unknown(error) => InternalConnectionError::new(
+                Code::H3_CLOSED_CRITICAL_STREAM,
+                format!("failed to write {stream:?} stream header: {error}"),
+            ),
+        };
+        self.handle_connection_error(error)
+    }
+
+    /// Wakes every request task waiting for QPACK progress.
+    ///
+    /// The driver cannot provide decoder access or missing table entries after
+    /// a connection error, so no request may remain pending on it.
+    pub(crate) fn wake_qpack_waiters_on_connection_error(&mut self) {
+        let qpack = &mut self.qpack_streams;
+        wake_qpack_waiters_on_connection_error(
+            &mut qpack.blocked_streams,
+            &mut qpack.decoder_events_recv,
+        );
+    }
+
+    /// Drives the critical streams until every stream is open and SETTINGS is written.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn send_control_stream_headers(&mut self) -> Result<(), ConnectionError> {
+        future::poll_fn(|cx| self.poll_critical_streams(cx)).await
+    }
+
+    /// Opens the local control and QPACK streams and writes SETTINGS.
+    ///
+    /// Requests do not wait for this: they use bidirectional streams and stay
+    /// stateless until the encoder stream is open ([RFC 9204, Section 4.2]).
+    /// A failure closes the connection like any critical-stream error.
+    ///
+    /// [RFC 9204, Section 4.2]: https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+    pub(crate) fn poll_critical_streams(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        if self.critical_streams.is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        let _ = self.poll_connection_error(cx)?;
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-3.2
+        //# After the QUIC connection is
+        //# established, a SETTINGS frame MUST be sent by each endpoint as the
+        //# initial frame of their respective HTTP control stream.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+        //# Each side MUST initiate a single control stream at the beginning of
+        //# the connection and send its SETTINGS frame as the first frame on this
+        //# stream.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+        //# A SETTINGS frame MUST be sent as the first frame of
+        //# each control stream (see Section 6.2.1) by each peer, and it MUST NOT
+        //# be sent subsequently.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+        //= type=implication
+        //# SETTINGS frames MUST NOT be sent on any stream other than the control
+        //# stream.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+        //= type=implication
+        //# Endpoints MUST NOT require any data to be received from
+        //# the peer prior to sending the SETTINGS frame; settings MUST be sent
+        //# as soon as the transport is ready to send data.
+
+        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+        //# Each endpoint
+        //# MUST initiate, at most, one encoder stream and, at most, one decoder
+        //# stream.
+        loop {
+            match &mut self.critical_streams {
+                CriticalStreams::Control(settings) => {
+                    let send = match ready!(self.conn.poll_open_send(cx)) {
+                        Ok(send) => send,
+                        Err(error) => {
+                            let error = self.critical_stream_error(CriticalStream::Control, error);
+                            return Poll::Ready(Err(error));
+                        }
+                    };
+                    let settings = mem::take(settings);
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("Sending settings: {:#x?}", settings);
+                    self.control_send = Some(send);
+                    self.critical_streams = CriticalStreams::Settings(Some(settings));
+                    #[cfg(test)]
+                    if !self.config.send_settings {
+                        self.critical_streams = CriticalStreams::Qpack(CriticalStream::Decoder);
+                    }
+                }
+                CriticalStreams::Settings(settings) => {
+                    let settings = settings.take();
+                    let Some(send) = self.control_send.as_mut() else {
+                        return Poll::Ready(Err(self.handle_connection_error(
+                            InternalConnectionError::new(
+                                Code::H3_INTERNAL_ERROR,
+                                "control stream was not initialized".to_string(),
+                            ),
+                        )));
+                    };
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+                    //# These frames have no semantics, and
+                    //# they MAY be sent on any stream where frames are allowed to be sent.
+                    if let Some(settings) = settings {
+                        let buf = if self.config.send_grease {
+                            stream::WriteBuf::control_with_grease(settings)
+                        } else {
+                            stream::UniStreamHeader::Control(settings).into()
+                        };
+                        if let Err(error) = send.send_data(buf) {
+                            let error = self.critical_stream_error(CriticalStream::Control, error);
+                            return Poll::Ready(Err(error));
+                        }
+                    }
+                    if let Err(error) = ready!(send.poll_ready(cx)) {
+                        let error = self.critical_stream_error(CriticalStream::Control, error);
+                        return Poll::Ready(Err(error));
+                    }
+                    self.critical_streams = CriticalStreams::Qpack(CriticalStream::Decoder);
+                }
+                CriticalStreams::Qpack(stream) => {
+                    let stream = *stream;
+                    let send = match ready!(self.conn.poll_open_send(cx)) {
+                        Ok(send) => send,
+                        Err(error) => {
+                            return Poll::Ready(Err(self.critical_stream_error(stream, error)));
+                        }
+                    };
+                    *self.critical_send(stream) = Some(send);
+                    self.critical_streams = match stream {
+                        CriticalStream::Decoder => CriticalStreams::Qpack(CriticalStream::Encoder),
+                        _ => CriticalStreams::Ready,
+                    };
+                }
+                CriticalStreams::Ready => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    /// Creates the connection state without I/O.
+    ///
+    /// The control and QPACK streams are opened later; see
+    /// [`Self::send_control_stream_headers`].
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn new(mut conn: C, config: Config) -> Result<Self, ConnectionError> {
+        let settings = local_settings(&config).map_err(|error| {
+            conn.close_raw_connection_with_h3_error(InternalConnectionError::new(
+                Code::H3_INTERNAL_ERROR,
+                format!("invalid local SETTINGS configuration: {error}"),
+            ))
+        })?;
+        let advertised_settings: crate::config::Settings = (&settings).into();
+        let mut decoder = qpack::Decoder::new(
+            advertised_settings.qpack_max_table_capacity.unwrap_or(0),
+            advertised_settings.qpack_blocked_streams.unwrap_or(0),
+        )
+        .map_err(|error| {
+            conn.close_raw_connection_with_h3_error(invalid_qpack_decoder_configuration(error))
+        })?;
+        decoder.set_max_encoded_string_size(config.qpack_decode_buffer_size);
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+        //# Endpoints SHOULD create the HTTP control stream as well as the
+        //# unidirectional streams required by mandatory extensions (such as the
+        //# QPACK encoder and decoder streams) first, and then create additional
+
+        let critical_streams = CriticalStreams::Control(settings);
+
+        let (decoder_events_send, decoder_events_recv) = mpsc::unbounded_channel();
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+        //= type=implication
+        //# The
+        //# sender MUST NOT close the control stream, and the receiver MUST NOT
+        //# request that the sender close the control stream.
+        let blocked_streams = qpack::BlockedStreamRegistry::new(decoder.max_blocked_streams());
+        let decoder = if config.bound_decoder_instructions {
+            QpackDecoder::with_instruction_bound(decoder, decoder_events_send)
+        } else {
+            QpackDecoder::new(decoder, decoder_events_send)
+        };
+
+        let qpack_streams = QpackStreams {
+            decoder_send: None,
+            decoder_send_buf: BytesMut::new(),
+            decoder,
+            encoder: qpack::QpackEncoder::default(),
+            encoder_send_buf: None,
+            blocked_streams,
+            decoder_events_recv,
+            decoder_recv: None,
+            encoder_send: None,
+            encoder_recv: None,
+            encoder_type_pending: true,
+            decoder_type_pending: true,
+        };
+
+        Ok(Self {
+            shared: Arc::new(SharedState::default()),
+            conn,
+            control_send: None,
+            critical_streams,
+            control_recv: None,
+            qpack_streams,
+            handled_connection_error: None,
+            pending_recv_streams: Vec::with_capacity(3),
+            got_peer_settings: false,
+            send_grease_frame: config.send_grease,
+            // send grease stream if configured
+            send_grease_stream_flag: config.send_grease,
+            config,
+            accepted_streams: Default::default(),
+            // start at first step
+            grease_step: GreaseStatus::NotStarted(PhantomData),
+        })
+    }
+
+    /// Send GOAWAY with specified max_id, iff max_id is smaller than the previous one.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn shutdown<T>(
+        &mut self,
+        sent_closing: &mut Option<T>,
+        max_id: T,
+    ) -> Result<(), ConnectionError>
+    where
+        T: From<VarInt> + PartialOrd<T> + Copy,
+        VarInt: From<T>,
+    {
+        if let Some(sent_id) = sent_closing
+            && *sent_id <= max_id
+        {
+            // A cancelled call may have left that GOAWAY partly written.
+            return future::poll_fn(|cx| self.poll_control_flush(cx)).await;
+        }
+
+        self.set_closing();
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
+        //# When either endpoint chooses to close the HTTP/3
+        //# connection, the terminating endpoint SHOULD first send a GOAWAY frame
+        //# (Section 5.2) so that both endpoints can reliably determine whether
+        //# previously sent frames have been processed and gracefully complete or
+        //# terminate any necessary remaining tasks.
+        // GOAWAY follows SETTINGS on the control stream.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
+        self.send_control_stream_headers().await?;
+        let Some(control_send) = self.control_send.as_mut() else {
+            return Err(self.handle_connection_error(InternalConnectionError::new(
+                Code::H3_INTERNAL_ERROR,
+                "control stream was not initialized".to_string(),
+            )));
+        };
+        // Record the ID once the frame is in the stream: a call cancelled before
+        // that does not suppress a retry, and the driver finishes a frame
+        // cancelled after it in `poll_control_flush`.
+        let result = async {
+            // A cancelled call may have left an earlier GOAWAY in the stream.
+            future::poll_fn(|cx| control_send.poll_ready(cx)).await?;
+            control_send.send_data(Frame::Goaway(max_id.into()))?;
+            *sent_closing = Some(max_id);
+            future::poll_fn(|cx| control_send.poll_ready(cx)).await
+        }
+        .await;
+        result.map_err(|error| self.control_stream_error(error))
+    }
+
+    /// Finishes GOAWAY bytes that a cancelled [`Self::shutdown`] left on the control stream.
+    pub(crate) fn poll_control_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        // Setup writes SETTINGS itself; only GOAWAY follows it.
+        let Some(control_send) = self
+            .control_send
+            .as_mut()
+            .filter(|_| self.critical_streams.is_ready())
+        else {
+            return Poll::Ready(Ok(()));
+        };
+        let result = ready!(control_send.poll_ready(cx));
+        Poll::Ready(result.map_err(|error| self.control_stream_error(error)))
+    }
+
+    /// Closes the connection after a write on the control stream failed.
+    fn control_stream_error(&mut self, error: StreamErrorIncoming) -> ConnectionError {
+        match error {
+            StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
+                self.handle_connection_error(connection_error)
+            }
+            StreamErrorIncoming::StreamTerminated { error_code: err } => self
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+                //# If either control
+                //# stream is closed at any point, this MUST be treated as a connection
+                //# error of type H3_CLOSED_CRITICAL_STREAM.
+                .handle_connection_error(InternalConnectionError::new(
+                    Code::H3_CLOSED_CRITICAL_STREAM,
+                    format!(
+                        "control stream was requested to stop sending with error code {}",
+                        err
+                    ),
+                )),
+            StreamErrorIncoming::Unknown(error) => {
+                self.handle_connection_error(InternalConnectionError::new(
+                    Code::H3_CLOSED_CRITICAL_STREAM,
+                    format!("an error occurred on the control stream {}", error),
+                ))
+            }
+        }
+    }
+
+    #[allow(missing_docs)]
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_accept_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<C::BidiStream, ConnectionError>> {
+        let _ = self.poll_connection_error(cx)?;
+
+        // Accept the request by accepting the next bidirectional stream
+        // .into().into() converts the impl QuicError into crate::error::Error.
+        // The `?` operator doesn't work here for some reason.
+        self.conn
+            .poll_accept_bidi(cx)
+            .map_err(|e| self.handle_connection_error(e))
+    }
+
+    /// Polls incoming streams
+    ///
+    /// Accepted streams which are not control, decoder, or encoder streams are buffer in
+    /// `accepted_recv_streams`
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_accept_recv(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
+        let _ = self.poll_connection_error(cx)?;
+
+        // Get all currently pending streams
+        while let Poll::Ready(stream) = self
+            .conn
+            .poll_accept_recv(cx)
+            .map_err(|e| self.handle_connection_error(e))?
+        {
+            self.pending_recv_streams
+                .push(Some(AcceptRecvStream::new(stream)));
+        }
+
+        for stream in self.pending_recv_streams.iter_mut().filter(|s| s.is_some()) {
+            let resolved = match stream.as_mut().expect("this cannot be None").poll_type(cx) {
+                Poll::Ready(Err(stream::PollTypeError::IncomingError(e))) => {
+                    return Err(self.handle_connection_error(e));
+                }
+                Poll::Ready(Err(stream::PollTypeError::InternalError(e))) => {
+                    return Err(self.handle_connection_error(e));
+                }
+                Poll::Ready(Err(stream::PollTypeError::EndOfStream)) =>
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+                //# A receiver MUST tolerate unidirectional streams being
+                //# closed or reset prior to the reception of the unidirectional stream
+                //# header.
+                {
+                    // remove the stream if it was closed before the header was received
+                    let _ = stream.take();
+                    continue;
+                }
+                Poll::Ready(Ok(())) => stream.take().expect("this cannot be None"),
+                Poll::Pending => continue,
+            };
+
+            match resolved.into_stream() {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+                //# Only one control stream per peer is permitted;
+                //# receipt of a second stream claiming to be a control stream MUST be
+                //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
+                AcceptedRecvStream::Control(s) => {
+                    if self.control_recv.is_some() {
+                        return Err(self.handle_connection_error(InternalConnectionError::new(
+                            Code::H3_STREAM_CREATION_ERROR,
+                            "got two control streams".to_string(),
+                        )));
+                    }
+                    self.control_recv = Some(s);
+                }
+                enc @ AcceptedRecvStream::Encoder(_) => {
+                    if let Some(_prev) = self.qpack_streams.encoder_recv.replace(enc) {
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# Receipt of a second instance of either stream type MUST be
+                        //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
+
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# An endpoint MUST allow its peer to create an encoder stream and a
+                        //# decoder stream even if the connection's settings prevent their use.
+
+                        return Err(self.handle_connection_error(InternalConnectionError::new(
+                            Code::H3_STREAM_CREATION_ERROR,
+                            "got two encoder streams".to_string(),
+                        )));
+                    }
+                }
+                dec @ AcceptedRecvStream::Decoder(_) => {
+                    if let Some(_prev) = self.qpack_streams.decoder_recv.replace(dec) {
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# Receipt of a second instance of either stream type MUST be
+                        //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
+
+                        //= https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+                        //# An endpoint MUST allow its peer to create an encoder stream and a
+                        //# decoder stream even if the connection's settings prevent their use.
+
+                        return Err(self.handle_connection_error(InternalConnectionError::new(
+                            Code::H3_STREAM_CREATION_ERROR,
+                            "got two decoder streams".to_string(),
+                        )));
+                    }
+                }
+                AcceptedRecvStream::WebTransportUni(id, s)
+                    if self.config.settings.enable_webtransport =>
+                {
+                    // Store until someone else picks it up, like a webtransport session which is
+                    // not yet established.
+                    self.accepted_streams.wt_uni_streams.push((id, s))
+                }
+
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+                //= type=implication
+                //# Endpoints MUST NOT consider these streams to have any meaning upon
+                //# receipt.
+                AcceptedRecvStream::Unknown(mut stream) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+                    //# Implementations MUST discard data or
+                    //# abort reading on unidirectional streams that have unknown or
+                    //# unsupported types.
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+                    //# Recipients of unknown stream types MUST
+                    //# either abort reading of the stream or discard incoming data without
+                    //# further processing.
+
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+                    //# If reading is aborted, the recipient SHOULD use
+                    //# the H3_STREAM_CREATION_ERROR error code or a reserved error code
+                    //# (Section 8.1).
+
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+                    //= type=implication
+                    //# The recipient MUST NOT consider unknown stream types
+                    //# to be a connection error of any kind.
+
+                    stream.stop_sending(Code::H3_STREAM_CREATION_ERROR.value());
+                }
+                _ => (),
+            };
+        }
+
+        // Remove all None values
+        self.pending_recv_streams.retain(|s| s.is_some());
+
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_qpack_encoder_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        let _ = self.poll_connection_error(cx)?;
+        self.poll_qpack_encoder_stream_inner(cx)
+    }
+
+    fn poll_qpack_encoder_stream_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        // Do not accumulate decoder instructions while the decoder stream is
+        // flow-control blocked. RFC 9204 allows implementations to limit
+        // unsent decoder-stream data as part of their memory policy.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3
+        match self.poll_flush_qpack_decoder(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        let Some(accepted) = self.qpack_streams.encoder_recv.take() else {
+            return Poll::Pending;
+        };
+
+        let mut encoder_recv = match accepted {
+            AcceptedRecvStream::Encoder(stream) => stream,
+            other => {
+                self.qpack_streams.encoder_recv = Some(other);
+                return Poll::Pending;
+            }
+        };
+
+        loop {
+            if encoder_recv.has_remaining() {
+                // Parse across receive buffers without coalescing them. Advance
+                // only through complete instructions so trailing bytes remain
+                // buffered for the next read.
+                // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3
+                let (result, consumed) = {
+                    let mut read = encoder_recv.buf().cursor();
+                    let result = self.qpack_streams.decoder.poll_on_recv_encoder(
+                        cx,
+                        &mut read,
+                        &mut self.qpack_streams.decoder_send_buf,
+                    );
+                    (result, read.position())
+                };
+                encoder_recv.buf_mut().advance(consumed);
+
+                match result {
+                    Poll::Ready(Ok(insert_count)) => {
+                        self.qpack_streams
+                            .blocked_streams
+                            .update_insert_count(insert_count);
+                    }
+                    Poll::Ready(Err(err)) => {
+                        // Do not drain QPACK events before publishing the error.
+                        // A woken request can run on another executor thread and
+                        // must observe the connection error before it is polled.
+                        let (code, message) = if err.is_internal() {
+                            (
+                                Code::H3_INTERNAL_ERROR,
+                                format!(
+                                    "local QPACK decoder failed while processing the encoder stream: {err}"
+                                ),
+                            )
+                        } else {
+                            (
+                                Code::QPACK_ENCODER_STREAM_ERROR,
+                                format!("invalid QPACK encoder stream instruction: {err}"),
+                            )
+                        };
+                        return Poll::Ready(Err(self.handle_connection_error(
+                            InternalConnectionError::new(code, message),
+                        )));
+                    }
+                    Poll::Pending => {
+                        self.qpack_streams.encoder_recv =
+                            Some(AcceptedRecvStream::Encoder(encoder_recv));
+                        return Poll::Pending;
+                    }
+                };
+            }
+
+            match self.poll_flush_qpack_decoder(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {
+                    self.qpack_streams.encoder_recv =
+                        Some(AcceptedRecvStream::Encoder(encoder_recv));
+                    return Poll::Pending;
+                }
+            }
+
+            match encoder_recv.poll_read(cx) {
+                Poll::Ready(Ok(false)) => continue,
+                Poll::Ready(Ok(true)) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            "QPACK encoder stream closed".to_string(),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK encoder stream reset with error code {}", error_code),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK encoder stream error: {}", error),
+                        ),
+                    )));
+                }
+                Poll::Pending => {
+                    self.qpack_streams.encoder_recv =
+                        Some(AcceptedRecvStream::Encoder(encoder_recv));
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    /// Drives instructions received on the peer's QPACK decoder stream.
+    ///
+    /// Decoder instruction failures are reported by this endpoint's encoder as
+    /// `QPACK_DECODER_STREAM_ERROR`. Closing or resetting the stream is instead
+    /// a critical-stream failure.
+    ///
+    /// See [RFC 9204, Section 4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2)
+    /// and [Section 6](https://www.rfc-editor.org/rfc/rfc9204.html#section-6).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_qpack_decoder_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        let _ = self.poll_connection_error(cx)?;
+        self.poll_qpack_decoder_stream_inner(cx)
+    }
+
+    fn poll_qpack_decoder_stream_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>> {
+        let Some(accepted) = self.qpack_streams.decoder_recv.take() else {
+            return Poll::Pending;
+        };
+
+        let mut decoder_recv = match accepted {
+            AcceptedRecvStream::Decoder(stream) => stream,
+            other => {
+                self.qpack_streams.decoder_recv = Some(other);
+                return Poll::Pending;
+            }
+        };
+
+        loop {
+            if decoder_recv.has_remaining() {
+                // Decoder instructions are unframed and can span QUIC receive
+                // buffers. Parse through a cursor and advance only complete
+                // instructions.
+                // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4
+                let (result, consumed) = {
+                    let mut read = decoder_recv.buf().cursor();
+                    let result = self
+                        .qpack_streams
+                        .encoder
+                        .on_decoder_recv_buffered(&mut read);
+                    (result, read.position())
+                };
+                decoder_recv.buf_mut().advance(consumed);
+
+                if let Err(error) = result {
+                    let (code, message) = match error {
+                        qpack::QpackEncoderError::Encoder(error) => (
+                            Code::QPACK_DECODER_STREAM_ERROR,
+                            format!("invalid QPACK decoder stream instruction: {error}"),
+                        ),
+                        qpack::QpackEncoderError::Poisoned => (
+                            Code::H3_INTERNAL_ERROR,
+                            "QPACK encoder state is poisoned".to_string(),
+                        ),
+                    };
+                    return Poll::Ready(Err(
+                        self.handle_connection_error(InternalConnectionError::new(code, message))
+                    ));
+                }
+            }
+
+            match decoder_recv.poll_read(cx) {
+                Poll::Ready(Ok(false)) => continue,
+                Poll::Ready(Ok(true)) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            "QPACK decoder stream closed".to_string(),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK decoder stream reset with error code {error_code}"),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK decoder stream error: {error}"),
+                        ),
+                    )));
+                }
+                Poll::Pending => {
+                    self.qpack_streams.decoder_recv =
+                        Some(AcceptedRecvStream::Decoder(decoder_recv));
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    /// Drives both peer QPACK streams and flushes locally generated instructions.
+    ///
+    /// Pending encoder output does not prevent peer decoder feedback or the
+    /// receive-side decoder from progressing. One deliberate dependency remains:
+    /// peer encoder input waits for local decoder output to drain, bounding
+    /// feedback buffered while the decoder stream is flow-control blocked.
+    /// Each pending stage registers the wakeup needed to resume it.
+    ///
+    /// See [RFC 9204, Sections 4.2-4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2).
+    pub(crate) fn poll_qpack(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        let _ = self.poll_connection_error(cx)?;
+
+        if self.config.qpack_encoder_table_capacity != 0 {
+            if let Poll::Ready(Err(error)) = self.poll_flush_qpack_encoder(cx) {
+                return Err(error);
+            }
+        } else {
+            debug_assert!(self.qpack_streams.encoder_send_buf.is_none());
+        }
+
+        if self.qpack_streams.decoder_recv.is_some()
+            && let Poll::Ready(Err(error)) = self.poll_qpack_decoder_stream_inner(cx)
+        {
+            return Err(error);
+        }
+
+        if (self.qpack_streams.encoder_recv.is_some()
+            || self.qpack_streams.decoder.dynamic_table_enabled())
+            && let Poll::Ready(Err(error)) = self.poll_qpack_encoder_stream_inner(cx)
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Flushes instructions generated by this endpoint's QPACK encoder.
+    ///
+    /// Takes a new batch only after the previous one is fully consumed, and
+    /// releases consumed batches before taking more output. Pending writes keep
+    /// their unsent suffix for the next poll; no encoder lock is held during I/O.
+    /// Returns ready when no output remains, or a connection error on failure.
+    /// Pending until the critical streams are set up: queued output keeps
+    /// `QpackEncoder::ready` false, so requests stay stateless.
+    fn poll_flush_qpack_encoder(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        // Instructions must follow the stream type on the encoder stream.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+        if !self.critical_streams.is_ready() {
+            return Poll::Pending;
+        }
+
+        loop {
+            if self.qpack_streams.encoder_send_buf.is_none() {
+                self.qpack_streams.encoder_send_buf =
+                    match self.qpack_streams.encoder.take_pending_instructions() {
+                        Ok(instructions) => instructions,
+                        Err(error) => {
+                            return Poll::Ready(Err(self.handle_connection_error(
+                                InternalConnectionError::new(
+                                    Code::H3_INTERNAL_ERROR,
+                                    format!("failed to access QPACK encoder instructions: {error}"),
+                                ),
+                            )));
+                        }
+                    };
+                if let Some(batch) = &mut self.qpack_streams.encoder_send_buf
+                    && mem::take(&mut self.qpack_streams.encoder_type_pending)
+                {
+                    *batch = with_stream_type(StreamType::ENCODER, batch).freeze();
+                }
+            }
+
+            let Some(buf) = self.qpack_streams.encoder_send_buf.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+
+            let Some(encoder_send) = self.qpack_streams.encoder_send.as_mut() else {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_CLOSED_CRITICAL_STREAM,
+                        "QPACK encoder stream is unavailable".to_string(),
+                    ),
+                )));
+            };
+
+            let result = encoder_send.poll_send(cx, buf);
+            if !buf.has_remaining() {
+                drop(self.qpack_streams.encoder_send_buf.take());
+            }
+            match result {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_INTERNAL_ERROR,
+                            "QPACK encoder stream made no write progress".to_string(),
+                        ),
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK encoder stream reset with error code {error_code}"),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK encoder stream error: {error}"),
+                        ),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn poll_flush_qpack_decoder(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectionError>>
+    where
+        C::SendStream: quic::SendStreamUnframed<B>,
+    {
+        if !self.qpack_streams.decoder.dynamic_table_enabled() {
+            debug_assert!(!self.qpack_streams.decoder_send_buf.has_remaining());
+            return Poll::Ready(Ok(()));
+        }
+
+        // Losing the QPACK decoder stream is H3_CLOSED_CRITICAL_STREAM. QPACK
+        // instruction errors apply to the peer's encoder stream instead.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2
+        if let Err(err) = self.poll_qpack_decoder_events(cx) {
+            return Poll::Ready(Err(err));
+        }
+
+        // Feedback such as Stream Cancellation can be queued before the decoder
+        // stream is open; it waits for the critical stream setup.
+        if !self.critical_streams.is_ready() {
+            return if self.qpack_streams.decoder_send_buf.has_remaining() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            };
+        }
+
+        let Some(decoder_send) = self.qpack_streams.decoder_send.as_mut() else {
+            if !self.qpack_streams.decoder_send_buf.has_remaining() {
+                return Poll::Ready(Ok(()));
+            }
+            return Poll::Ready(Err(self.handle_connection_error(
+                InternalConnectionError::new(
+                    Code::H3_CLOSED_CRITICAL_STREAM,
+                    "QPACK decoder stream is unavailable".to_string(),
+                ),
+            )));
+        };
+
+        if self.qpack_streams.decoder_send_buf.has_remaining()
+            && mem::take(&mut self.qpack_streams.decoder_type_pending)
+        {
+            self.qpack_streams.decoder_send_buf =
+                with_stream_type(StreamType::DECODER, &self.qpack_streams.decoder_send_buf);
+        }
+
+        while self.qpack_streams.decoder_send_buf.has_remaining() {
+            match decoder_send.poll_send(cx, &mut self.qpack_streams.decoder_send_buf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_INTERNAL_ERROR,
+                            "QPACK decoder stream made no write progress".to_string(),
+                        ),
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error,
+                })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+                Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK decoder stream reset with error code {}", error_code),
+                        ),
+                    )));
+                }
+                Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) => {
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_CLOSED_CRITICAL_STREAM,
+                            format!("QPACK decoder stream error: {}", error),
+                        ),
+                    )));
+                }
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Waits for the control stream to be received and reads subsequent frames.
+    ///
+    /// Each call also drives the optional GREASE stream, which never delays
+    /// control frames.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_control(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
+        // check if a connection error occurred on a stream
+        let _ = self.poll_connection_error(cx)?;
+        self.poll_accept_recv(cx)?;
+        self.poll_control_frame(cx)
+    }
+
+    /// Reads the control stream after the caller has polled incoming streams.
+    ///
+    /// The caller must first drain `poll_accept_recv` to register the transport
+    /// wakeup for new streams, including when no control stream exists yet.
+    /// Keeping that accept pass outside the control-frame loop avoids polling
+    /// the same incoming-stream queue again for each buffered frame.
+    /// Returns a decoded frame, waits for the stream or its data, or reports the
+    /// same connection errors as `poll_control`. Like `poll_control`, it also
+    /// drives the GREASE stream.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) fn poll_accepted_control(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
+        let _ = self.poll_connection_error(cx)?;
+        self.poll_control_frame(cx)
+    }
+
+    fn poll_control_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+        //# Endpoints SHOULD create the HTTP control stream as well as the
+        //# unidirectional streams required by mandatory extensions (such as the
+        //# QPACK encoder and decoder streams) first, and then create additional
+        //# streams as allowed by their peer.
+        if self.send_grease_stream_flag && self.critical_streams.is_ready() {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+            //# They MAY also be
+            //# sent on connections where no data is currently being transferred.
+            // Best effort: the peer may grant only the three critical
+            // unidirectional streams, so a pending GREASE stream must not hold
+            // back control frames.
+            // https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+            let _ = self.poll_grease_stream(cx);
+        }
+
+        let Some(recv) = &mut self.control_recv else {
+            return Poll::Pending;
+        };
+
+        let polled = recv.poll_next(cx);
+        // The decoder skips unknown frames, so check whether one came first,
+        // even while the next frame is still pending.
+        if !self.got_peer_settings && recv.skipped_unknown_frame() {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+            //# However, where a known frame type is required to be in
+            //# a specific location, such as the SETTINGS frame as the first frame of
+            //# the control stream (see Section 6.2.1), an unknown frame type does
+            //# not satisfy that requirement and SHOULD be treated as an error.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+            //# If the first frame of the control stream is any other frame
+            //# type, this MUST be treated as a connection error of type
+            //# H3_MISSING_SETTINGS.
+            return Poll::Ready(Err(self.handle_connection_error(
+                InternalConnectionError::new(
+                    Code::H3_MISSING_SETTINGS,
+                    "received a frame of unknown type before settings".to_string(),
+                ),
+            )));
+        }
+
+        let res = match ready!(polled) {
+            Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error,
+            })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
+            Err(FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated {
+                error_code: err,
+            })) => {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_CLOSED_CRITICAL_STREAM,
+                        format!("control stream was reset with error code {}", err),
+                    ),
+                )));
+            }
+            Err(FrameStreamError::Quic(StreamErrorIncoming::Unknown(error))) => {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_CLOSED_CRITICAL_STREAM,
+                        format!("an error occurred on the control stream {}", error),
+                    ),
+                )));
+            }
+            Err(FrameStreamError::UnexpectedEnd) => {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_FRAME_ERROR,
+                        "received incomplete frame".to_string(),
+                    ),
+                )));
+            }
+            Err(FrameStreamError::Proto(frame_error)) => {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::got_frame_error(frame_error),
+                )));
+            }
+            Ok(None) =>
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+            //# If either control
+            //# stream is closed at any point, this MUST be treated as a connection
+            //# error of type H3_CLOSED_CRITICAL_STREAM.
+            {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_CLOSED_CRITICAL_STREAM,
+                        "control stream was closed".to_string(),
+                    ),
+                )));
+            }
+            Ok(Some(Frame::Settings(settings))) => {
+                if !self.got_peer_settings {
+                    // Received settings frame
+                    let peer_settings: crate::config::Settings = (&settings).into();
+                    self.got_peer_settings = true;
+                    self.set_settings(peer_settings);
+
+                    // If the advertised maximum cannot fit this platform's
+                    // address space, conservatively keep requests stateless.
+                    // Clamping it would use the wrong Required Insert Count
+                    // modulus (RFC 9204 Section 4.5.1.1).
+                    let peer_capacity = peer_settings
+                        .qpack_max_table_capacity
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0);
+                    let capacity = self.config.qpack_encoder_table_capacity.min(peer_capacity);
+                    if let Err(error) = self
+                        .qpack_streams
+                        .encoder
+                        .configure(peer_capacity, capacity)
+                    {
+                        return Poll::Ready(Err(self.handle_connection_error(
+                            InternalConnectionError::new(
+                                Code::H3_INTERNAL_ERROR,
+                                format!("failed to configure QPACK encoder: {error}"),
+                            ),
+                        )));
+                    }
+                    if capacity != 0 {
+                        self.waker().wake();
+                    }
+
+                    Frame::Settings(settings)
+                } else {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+                    //# If an endpoint receives a second SETTINGS
+                    //# frame on the control stream, the endpoint MUST respond with a
+                    //# connection error of type H3_FRAME_UNEXPECTED.
+                    return Poll::Ready(Err(self.handle_connection_error(
+                        InternalConnectionError::new(
+                            Code::H3_FRAME_UNEXPECTED,
+                            "second settings frame received".to_string(),
+                        ),
+                    )));
+                }
+            }
+            Ok(Some(frame)) if !self.got_peer_settings => {
+                // We received a frame before the settings frame
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+                //# If the first frame of the control stream is any other frame
+                //# type, this MUST be treated as a connection error of type
+                //# H3_MISSING_SETTINGS.
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_MISSING_SETTINGS,
+                        format!("received frame {:?} before settings", frame),
+                    ),
+                )));
+            }
+            Ok(Some(
+                frame @ Frame::Goaway(_)
+                | frame @ Frame::CancelPush(_)
+                | frame @ Frame::MaxPushId(_),
+            )) => {
+                // handle these frames in client/server imples
+                frame
+            }
+            Ok(Some(frame)) => {
+                // All other frames are not allowed on the control stream. DATA,
+                // HEADERS and PUSH_PROMISE are rejected at their frame header, and
+                // unknown frames are skipped by poll_next.
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_FRAME_UNEXPECTED,
+                        format!("received unexpected frame {:?} on control stream", frame),
+                    ),
+                )));
+            }
+        };
+
+        Poll::Ready(Ok(res))
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) fn process_goaway<T>(
+        &mut self,
+        recv_closing: &mut Option<T>,
+        id: VarInt,
+    ) -> Result<(), ConnectionError>
+    where
+        T: From<VarInt> + Copy,
+        VarInt: From<T>,
+    {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+        //# An endpoint MAY send multiple GOAWAY frames indicating different
+        //# identifiers, but the identifier in each frame MUST NOT be greater
+        //# than the identifier in any previous frame, since clients might
+        //# already have retried unprocessed requests on another HTTP connection.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+        //# Like the server,
+        //# the client MAY send subsequent GOAWAY frames so long as the specified
+        //# push ID is no greater than any previously sent value.
+        if let Some(prev_id) = recv_closing.map(VarInt::from)
+            && prev_id < id
+        {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+            //# Receiving a GOAWAY containing a larger identifier than previously
+            //# received MUST be treated as a connection error of type H3_ID_ERROR.
+            return Err(self.handle_connection_error(InternalConnectionError::new(
+                Code::H3_ID_ERROR,
+                format!(
+                    "received a GoAway ({}) greater than the former one ({})",
+                    id, prev_id
+                ),
+            )));
+        }
+        *recv_closing = Some(id.into());
+        self.set_closing();
+        Ok(())
+    }
+
+    // start grease stream and send data
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn poll_grease_stream(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if matches!(self.grease_step, GreaseStatus::NotStarted(_)) {
+            self.grease_step = match self.conn.poll_open_send(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => {
+                    // could not create grease stream
+                    // don't try again
+                    self.send_grease_stream_flag = false;
+
+                    #[cfg(feature = "tracing")]
+                    warn!("grease stream creation failed with");
+
+                    return Poll::Ready(());
+                }
+                Poll::Ready(Ok(stream)) => GreaseStatus::Started(Some(stream)),
+            };
+        };
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+        //# Stream types of the format 0x1f * N + 0x21 for non-negative integer
+        //# values of N are reserved to exercise the requirement that unknown
+        //# types be ignored.  These streams have no semantics, and they can be
+        //# sent when application-layer padding is desired.  They MAY also be
+        //# sent on connections where no data is currently being transferred.
+        if let GreaseStatus::Started(stream) = &mut self.grease_step {
+            if let Some(stream) = stream
+                && stream
+                    .send_data((StreamType::grease(), Frame::Grease))
+                    .is_err()
+            {
+                self.send_grease_stream_flag = false;
+
+                #[cfg(feature = "tracing")]
+                warn!("write data on grease stream failed with");
+
+                return Poll::Ready(());
+            };
+            self.grease_step = GreaseStatus::DataPrepared(stream.take());
+        };
+
+        if let GreaseStatus::DataPrepared(stream) = &mut self.grease_step {
+            if let Some(stream) = stream {
+                match stream.poll_ready(cx) {
+                    Poll::Ready(Ok(_)) => (),
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(_)) => {
+                        // could not write grease frame
+                        // don't try again
+                        self.send_grease_stream_flag = false;
+
+                        #[cfg(feature = "tracing")]
+                        warn!("write data on grease stream failed with");
+
+                        return Poll::Ready(());
+                    }
+                };
+            }
+            self.grease_step = GreaseStatus::DataSent(match stream.take() {
+                Some(stream) => stream,
+                None => {
+                    // this should never happen
+                    self.send_grease_stream_flag = false;
+                    return Poll::Ready(());
+                }
+            });
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+        //= type=implication
+        //# When sending a reserved stream type,
+        //# the implementation MAY either terminate the stream cleanly or reset
+        //# it.
+        if let GreaseStatus::DataSent(stream) = &mut self.grease_step {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.3
+            //= type=exception
+            //# When resetting the stream, either the H3_NO_ERROR error code or
+            //# a reserved error code (Section 8.1) SHOULD be used.
+            // We terminate the stream cleanly so no H3_NO_ERROR is needed
+            match stream.poll_finish(cx) {
+                Poll::Ready(Ok(_)) => (),
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => {
+                    // could not finish grease stream
+                    // don't try again
+                    self.send_grease_stream_flag = false;
+
+                    #[cfg(feature = "tracing")]
+                    warn!("finish grease stream failed with");
+
+                    return Poll::Ready(());
+                }
+            };
+            self.grease_step = GreaseStatus::Finished;
+        };
+
+        // grease stream is closed
+        // don't do another one
+        self.send_grease_stream_flag = false;
+        Poll::Ready(())
+    }
+
+    #[inline(always)]
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn accepted_streams_mut(&mut self) -> &mut AcceptedStreams<C, B> {
+        &mut self.accepted_streams
+    }
+
+    #[inline(always)]
+    pub(super) fn dynamic_qpack_decoder(&self) -> Option<QpackDecoder> {
+        self.qpack_streams
+            .decoder
+            .dynamic_table_enabled()
+            .then(|| self.qpack_streams.decoder.clone())
+    }
+
+    #[inline(always)]
+    pub(super) fn dynamic_qpack_encoder(&self) -> Option<qpack::QpackEncoder> {
+        (self.config.qpack_encoder_table_capacity != 0).then(|| self.qpack_streams.encoder.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qpack_blocked_stream_count(&self) -> usize {
+        self.qpack_streams.blocked_streams.len()
+    }
+
+    fn poll_qpack_decoder_events(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
+        while let Poll::Ready(Some(event)) = self.qpack_streams.decoder_events_recv.poll_recv(cx) {
+            match event {
+                QpackEvent::HeaderAck(stream_id) => {
+                    self.qpack_streams.decoder.write_section_acknowledgment(
+                        stream_id,
+                        &mut self.qpack_streams.decoder_send_buf,
+                    )
+                }
+                QpackEvent::StreamCancel(stream_id) => self
+                    .qpack_streams
+                    .decoder
+                    .write_stream_cancellation(stream_id, &mut self.qpack_streams.decoder_send_buf),
+                QpackEvent::RegisterBlocked {
+                    stream_id,
+                    required_ref,
+                    waker,
+                } => {
+                    if let Err(waker) =
+                        self.qpack_streams
+                            .blocked_streams
+                            .register(stream_id, required_ref, waker)
+                    {
+                        // The encoder must stay within the blocked-stream limit
+                        // advertised by the decoder. Exceeding it is a connection
+                        // error, not a request-stream error.
+                        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2
+                        let error = self.handle_connection_error(InternalConnectionError::new(
+                            Code::QPACK_DECOMPRESSION_FAILED,
+                            format!(
+                                "QPACK blocked-stream limit exceeded: {}",
+                                qpack::DecoderError::TooManyBlockedStreams
+                            ),
+                        ));
+                        waker.wake();
+                        return Err(error);
+                    }
+                }
+                QpackEvent::ReleaseBlocked {
+                    stream_id,
+                    required_ref,
+                } => self
+                    .qpack_streams
+                    .blocked_streams
+                    .release(stream_id, required_ref),
+                // Missing references use `RegisterBlocked`. This event only
+                // waits for a write guard scoped to `poll_on_recv_encoder`, or
+                // for the decoder instructions queued before it. Both are done
+                // before the driver can consume the event.
+                QpackEvent::DecoderAccessWaker(waker) => waker.wake(),
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct DecoderGuard {
+    stream_id: StreamId,
+    shared: Arc<SharedState>,
+    cancel_on_drop: bool,
+    // A Stream Cancellation was queued, so no later field section is decoded.
+    cancelled: bool,
+    blocked: Option<usize>,
+    decoder: QpackDecoder,
+    prefix: Option<qpack::FieldSectionPrefix>,
+}
+
+impl DecoderGuard {
+    /// Registers this stream after decoding reports missing dynamic table entries.
+    ///
+    /// Repeated polls update the waker for the same Required Insert Count. If the
+    /// count changes, the previous driver registration is released first.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
+    fn block(&mut self, required_ref: usize, waker: &Waker) -> Result<(), qpack::DecoderError> {
+        if self.blocked.is_some_and(|blocked| blocked != required_ref) {
+            self.unblock();
+        }
+
+        self.decoder
+            .queue_blocked_stream(self.stream_id, required_ref, waker)?;
+        self.blocked = Some(required_ref);
+        Ok(())
+    }
+
+    /// Removes this stream's active blocked-field registration.
+    ///
+    /// An encoder-stream update may already have removed the entry, so release
+    /// is idempotent.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
+    fn unblock(&mut self) {
+        if let Some(required_ref) = self.blocked.take() {
+            self.decoder
+                .release_blocked_stream(self.stream_id, required_ref);
+        }
+    }
+
+    /// Queues a Section Acknowledgment for a decoded dynamic field section.
+    ///
+    /// Only a non-zero Required Insert Count needs acknowledgment. Static-table
+    /// and literal-only field sections have a count of zero.
+    ///
+    /// See [RFC 9204, Section 4.4.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1).
+    fn acknowledge(&mut self, dyn_ref: bool) -> Result<(), qpack::DecoderError> {
+        if dyn_ref {
+            self.decoder.queue_section_acknowledgment(self.stream_id)?;
+            self.shared.waker().wake();
+        }
+
+        Ok(())
+    }
+
+    /// Marks the receive side complete without sending Stream Cancellation.
+    ///
+    /// End of stream is normal completion and does not abandon any field section.
+    ///
+    /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
+    fn finish_reading(&mut self) {
+        self.unblock();
+        self.cancel_on_drop = false;
+    }
+
+    /// Cancels outstanding field sections when the receive side is abandoned.
+    ///
+    /// STOP_SENDING and `Drop` can both reach this path, so cancellation is
+    /// queued at most once.
+    ///
+    /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
+    fn cancel_reading(&mut self) {
+        self.unblock();
+        if std::mem::take(&mut self.cancel_on_drop) {
+            self.cancelled = true;
+            if self.decoder.queue_stream_cancellation(self.stream_id) {
+                self.shared.waker().wake();
+            }
+        }
+    }
+}
+
+impl Drop for DecoderGuard {
+    fn drop(&mut self) {
+        self.cancel_reading();
+    }
+}
+
+pub(crate) enum RequestDecodeState {
+    Stateless { max_encoded_string_size: usize },
+    Dynamic(Box<DecoderGuard>),
+    SendOnly,
+}
+
+impl RequestDecodeState {
+    pub(crate) fn new(
+        stream_id: StreamId,
+        shared: &Arc<SharedState>,
+        max_encoded_string_size: usize,
+        decoder: Option<QpackDecoder>,
+    ) -> Self {
+        match decoder {
+            Some(decoder) => Self::Dynamic(Box::new(DecoderGuard {
+                stream_id,
+                shared: shared.clone(),
+                // Dropping before end of stream abandons any remaining field section
+                // and requires Stream Cancellation.
+                cancel_on_drop: true,
+                cancelled: false,
+                blocked: None,
+                decoder,
+                prefix: None,
+            })),
+            None => Self::Stateless {
+                max_encoded_string_size,
+            },
+        }
+    }
+
+    fn cancel_reading(&mut self) {
+        if let Self::Dynamic(state) = self {
+            state.cancel_reading();
+        }
+    }
+
+    fn finish_reading(&mut self) {
+        if let Self::Dynamic(state) = self {
+            state.finish_reading();
+        }
+    }
+
+    /// Whether reading was cancelled and `field_section` references the dynamic table.
+    fn refuses_after_cancellation<T: Buf>(&self, field_section: &T) -> bool {
+        matches!(self, Self::Dynamic(state)
+            if state.cancelled
+                && qpack::references_dynamic_table(state.prefix.as_ref(), field_section))
+    }
+}
+
+#[allow(missing_docs)]
+pub struct RequestStream<S, B> {
+    pub(super) stream: StreamGuard<S, B>,
+    pub(super) trailers: Option<Bytes>,
+    pub(super) conn_state: Arc<SharedState>,
+    pub(super) max_field_section_size: u64,
+    send_grease_frame: bool,
+    send_state: SendState,
+    decode_state: RequestDecodeState,
+    content_length: ContentLength,
+}
+
+/// Content-Length tracking for the received body.
+/// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
+enum ContentLength {
+    Unchecked,
+    /// DATA bytes the received Content-Length still allows.
+    Remaining(u64),
+    /// The body was rejected; later reads repeat the error.
+    Malformed(&'static str),
+}
+
+// Tracks frame ownership and the point after which no more HTTP content may be queued.
+#[derive(Clone, Copy, PartialEq)]
+enum SendState {
+    Ready,
+    Data,
+    Trailers,
+    Finishing,
+    Finished,
+    Reset,
+    // A server response has not queued its final HEADERS; 1xx HEADERS may still be sent.
+    Head,
+    // A 1xx HEADERS frame is queued; flushing it returns to Head.
+    Interim,
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::RecvStream,
+{
+    /// Creates a client request with cancellation armed for both directions.
+    /// Dropping either unfinished direction sends H3_REQUEST_CANCELLED.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
+    pub(crate) fn new(
+        mut stream: FrameStream<S, B>,
+        max_field_section_size: u64,
+        max_qpack_decode_buffer_size: usize,
+        grease: bool,
+        conn_state: Arc<SharedState>,
+        decoder: Option<QpackDecoder>,
+    ) -> Self
+    where
+        S: quic::SendStream<B>,
+        B: Buf,
+    {
+        stream.set_max_field_section_size(max_qpack_decode_buffer_size);
+        let decode_state = RequestDecodeState::new(
+            stream.id(),
+            &conn_state,
+            max_qpack_decode_buffer_size,
+            decoder,
+        );
+
+        Self {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel
+            //# requests.
+            stream: StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED),
+            max_field_section_size,
+            send_grease_frame: grease,
+            send_state: SendState::Ready,
+            trailers: None,
+            conn_state,
+            decode_state,
+            content_length: ContentLength::Unchecked,
+        }
+    }
+
+    /// Creates a server request that keeps the cancellation armed by its resolver.
+    /// Sending awaits the final response HEADERS before DATA, trailers, or FIN.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1>.
+    pub(crate) fn with_decode_state(
+        stream: StreamGuard<S, B>,
+        max_field_section_size: u64,
+        conn_state: Arc<SharedState>,
+        grease: bool,
+        decode_state: RequestDecodeState,
+    ) -> Self {
+        Self {
+            stream,
+            conn_state,
+            max_field_section_size,
+            trailers: None,
+            send_grease_frame: grease,
+            send_state: SendState::Head,
+            decode_state,
+            content_length: ContentLength::Unchecked,
+        }
+    }
+}
+
+impl<S, B> ConnectionState for RequestStream<S, B> {
+    fn shared_state(&self) -> &SharedState {
+        &self.conn_state
+    }
+}
+
+impl<S, B> CloseStream for RequestStream<S, B> {}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::RecvStream,
+{
+    /// Cancels QPACK state when the receive side is reset or abandoned.
+    ///
+    /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
+    pub(crate) fn cancel_qpack_reading(&mut self) {
+        self.decode_state.cancel_reading();
+    }
+
+    /// Completes both HTTP receive ownership and QPACK field-section tracking.
+    /// EOF is normal completion, not cancellation (RFC 9204, Section 4.4.2).
+    /// <https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2>
+    fn finish_reading(&mut self) {
+        self.decode_state.finish_reading();
+        self.stream.finish_reading();
+    }
+
+    /// Cancels outstanding QPACK work before converting a receive error.
+    ///
+    /// See [RFC 9204, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2).
+    pub(crate) fn handle_receive_stream_error(&mut self, error: FrameStreamError) -> StreamError {
+        self.cancel_qpack_reading();
+        self.handle_frame_stream_error_on_request_stream(error)
+    }
+
+    /// Requires the DATA frames that follow to carry exactly `length` bytes.
+    /// `None` leaves the body length unchecked.
+    pub(crate) fn expect_content_length(&mut self, length: Option<u64>) {
+        self.content_length = length.map_or(ContentLength::Unchecked, ContentLength::Remaining);
+    }
+
+    /// Aborts the directions this handle still owns as a stream error.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-8>.
+    pub(crate) fn abort(&mut self, code: Code) {
+        self.stream.set_cancel_codes(code, code);
+        self.cancel_request();
+        if self.send_state != SendState::Finished {
+            self.send_state = SendState::Reset;
+        }
+    }
+
+    /// Aborts the stream for a body that differs from its Content-Length.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.2>.
+    fn reject_malformed(&mut self, reason: &'static str) -> StreamError {
+        self.content_length = ContentLength::Malformed(reason);
+        self.abort(Code::H3_MESSAGE_ERROR);
+        Self::malformed(reason)
+    }
+
+    fn malformed(reason: &str) -> StreamError {
+        StreamError::StreamError {
+            code: Code::H3_MESSAGE_ERROR,
+            reason: reason.into(),
+        }
+    }
+
+    /// Reads the next body frame and checks DATA lengths against Content-Length.
+    fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
+        let frame = ready!(self.stream.poll_next(cx))
+            .map_err(|error| self.handle_receive_stream_error(error))?;
+        let ContentLength::Remaining(remaining) = self.content_length else {
+            return Poll::Ready(Ok(frame));
+        };
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //# A request or response that is defined as having content when it
+        //# contains a Content-Length header field (Section 8.6 of [HTTP]) is
+        //# malformed if the value of the Content-Length header field does not
+        //# equal the sum of the DATA frame lengths received.
+        match &frame {
+            Some(Frame::Data(PayloadLen(len))) => {
+                let len = u64::try_from(*len).unwrap_or(u64::MAX);
+                let Some(remaining) = remaining.checked_sub(len) else {
+                    return Poll::Ready(Err(
+                        self.reject_malformed("DATA exceeds the content-length")
+                    ));
+                };
+                self.content_length = ContentLength::Remaining(remaining);
+            }
+            // Trailers or the end of the stream end the body.
+            Some(Frame::Headers(_)) | None if remaining != 0 => {
+                return Poll::Ready(Err(
+                    self.reject_malformed("DATA is shorter than the content-length")
+                ));
+            }
+            _ => {}
+        }
+        Poll::Ready(Ok(frame))
+    }
+
+    /// Receive some of the request/response body.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_data(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<impl Buf + use<S, B>>, StreamError>> {
+        // The rejected frame's payload must not be returned later.
+        if let ContentLength::Malformed(reason) = self.content_length {
+            return Poll::Ready(Err(Self::malformed(reason)));
+        }
+
+        // Body EOF can precede decoding the trailers. Keep their QPACK state
+        // armed until recv_trailers processes them or the caller abandons them.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.2
+        if self.trailers.is_some() {
+            return Poll::Ready(Ok(None));
+        }
+
+        // Empty DATA frames do not end the body. Keep reading until payload,
+        // trailers, transport EOF, or Pending; only EOF completes the guard.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.1
+        while !self.stream.has_data() {
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
+                    self.finish_reading();
+                    return Poll::Ready(Ok(None));
+                }
+                Some(Frame::Headers(encoded)) => {
+                    self.trailers = Some(encoded);
+                    // Received trailers, no more data expected
+                    return Poll::Ready(Ok(None));
+                }
+                Some(Frame::Data { .. }) => (),
+                Some(other_frame) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+                    //# Receipt of an invalid sequence of frames MUST be treated as a
+                    //# connection error of type H3_FRAME_UNEXPECTED.
+                    // Control frames are rejected at their frame header.
+                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_FRAME_UNEXPECTED,
+                            format!("unexpected frame: {:?}", other_frame),
+                        ),
+                    )));
+                }
+            };
+        }
+
+        self.stream
+            .poll_data(cx)
+            .map_err(|error| self.handle_receive_stream_error(error))
+    }
+
+    /// Poll receive trailers.
+    ///
+    /// Call this once [`Self::poll_recv_data`] returned `None`. Calling it while
+    /// body data remains returns [`StreamError::InvalidStreamState`] and leaves
+    /// that data readable.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        if let ContentLength::Malformed(reason) = self.content_length {
+            return Poll::Ready(Err(Self::malformed(reason)));
+        }
+
+        let mut trailers = if let Some(encoded) = self.trailers.take() {
+            encoded
+        } else {
+            if self.stream.has_data() {
+                return Poll::Ready(Err(StreamError::InvalidStreamState {
+                    reason: "read the remaining body data before the trailers".into(),
+                }));
+            }
+            match ready!(self.poll_next_frame(cx))? {
+                None => {
+                    self.finish_reading();
+                    return Poll::Ready(Ok(None));
+                }
+                Some(Frame::Headers(encoded)) => encoded,
+                // DATA may follow DATA, so only the local call order is wrong.
+                // The frame's payload stays readable through `poll_recv_data`.
+                Some(Frame::Data { .. }) => {
+                    return Poll::Ready(Err(StreamError::InvalidStreamState {
+                        reason: "the body has not ended".into(),
+                    }));
+                }
+                Some(other_frame) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+                    //# Receipt of an invalid sequence of frames MUST be treated as a
+                    //# connection error of type H3_FRAME_UNEXPECTED.
+                    // Control frames are rejected at their frame header.
+                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_FRAME_UNEXPECTED,
+                            format!("unexpected frame: {:?}", other_frame),
+                        ),
+                    )));
+                }
+            }
+        };
+
+        // After Stream Cancellation the peer expects no Section Acknowledgment for
+        // this stream and may evict the entries dynamic trailers reference.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.2.2
+        if self.decode_state.refuses_after_cancellation(&trailers) {
+            return Poll::Ready(Err(StreamError::InvalidStreamState {
+                reason: "the trailers are no longer read".into(),
+            }));
+        }
+
+        if !self.stream.is_eos() {
+            // Get the trailing frame. After trailers no known frame is allowed.
+            // But there still can be unknown frames.
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //# Receipt of an invalid sequence of frames MUST be treated as a
+            //# connection error of type H3_FRAME_UNEXPECTED.
+            match self.stream.poll_next(cx) {
+                Poll::Ready(Err(frame_stream_error)) => {
+                    return Poll::Ready(Err(self.handle_receive_stream_error(frame_stream_error)));
+                }
+                // Received a known frame after trailers -> fail.
+                Poll::Ready(Ok(Some(trailing_frame))) => {
+                    return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            Code::H3_FRAME_UNEXPECTED,
+                            format!("unexpected frame: {:?}", trailing_frame),
+                        ),
+                    )));
+                }
+                // Stream is finished no problematic frames received
+                Poll::Ready(Ok(None)) => (),
+                // Save the trailers and try again.
+                Poll::Pending => {
+                    self.trailers = Some(trailers);
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        let decode_result = match self.poll_decode_field_section(cx, &mut trailers) {
+            Poll::Ready(decode_result) => decode_result,
+            Poll::Pending => {
+                self.trailers = Some(trailers);
+                return Poll::Pending;
+            }
+        };
+
+        let qpack::Decoded { fields, .. } = match decode_result {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+            //# the message header it will accept on an individual HTTP message.
+            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                self.cancel_qpack_reading();
+                return Poll::Ready(Err(StreamError::HeaderTooBig {
+                    actual_size: cancel_size,
+                    max_size: self.max_field_section_size,
+                }));
+            }
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let code = if error.is_internal() {
+                    Code::H3_INTERNAL_ERROR
+                } else {
+                    Code::QPACK_DECOMPRESSION_FAILED
+                };
+                return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                    InternalConnectionError::new(
+                        code,
+                        format!("failed to decode trailers: {error}"),
+                    ),
+                )));
+            }
+        };
+
+        self.finish_reading();
+        Poll::Ready(Ok(Some(
+            Header::try_from(fields)
+                .and_then(Header::into_trailers)
+                .map_err(|error| {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+                    //# Malformed requests or responses that are
+                    //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+                    //# Clients MUST NOT
+                    //# accept a malformed response.
+                    let code = error.code();
+                    self.stop_sending(code);
+                    StreamError::StreamError {
+                        code,
+                        reason: format!("rejected trailers: {error}"),
+                    }
+                })?,
+        )))
+    }
+
+    /// Stops receiving with `err_code` and cancels outstanding QPACK decoding.
+    /// The send direction remains open; Drop preserves this explicit receive code.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn stop_sending(&mut self, err_code: Code) {
+        self.cancel_qpack_reading();
+        self.stream.stop_sending(err_code);
+    }
+
+    #[inline(always)]
+    pub(crate) fn poll_decode_field_section(
+        &mut self,
+        cx: &mut Context<'_>,
+        field_section: &mut Bytes,
+    ) -> Poll<Result<qpack::Decoded, qpack::DecoderError>> {
+        let decode_result = match &mut self.decode_state {
+            RequestDecodeState::Stateless {
+                max_encoded_string_size,
+            } => Poll::Ready(qpack::decode_stateless_limited(
+                field_section,
+                self.max_field_section_size,
+                *max_encoded_string_size,
+            )),
+            RequestDecodeState::Dynamic(state) => state.decoder.poll_decode_field_section(
+                cx,
+                field_section,
+                self.max_field_section_size,
+                &mut state.prefix,
+            ),
+            RequestDecodeState::SendOnly => {
+                return Poll::Ready(Err(qpack::DecoderError::Internal(
+                    "attempted to decode a field section on a send-only stream half",
+                )));
+            }
+        };
+
+        match decode_result {
+            Poll::Ready(Ok(decoded)) => {
+                if let RequestDecodeState::Dynamic(state) = &mut self.decode_state {
+                    state.prefix = None;
+                    state.unblock();
+                    if let Some(err) = state.acknowledge(decoded.dyn_ref).err() {
+                        return Poll::Ready(Err(err));
+                    }
+
+                    // EOS proves there can be no later field section on this stream.
+                    if self.stream.is_eos() {
+                        state.finish_reading();
+                    }
+                }
+
+                Poll::Ready(Ok(decoded))
+            }
+            Poll::Ready(Err(qpack::DecoderError::MissingRefs(required_ref)))
+                if required_ref > 0 =>
+            {
+                // A blocked-stream limit violation wakes all registered requests
+                // before closing the connection. Do not queue another waiter.
+                if let RequestDecodeState::Dynamic(state) = &mut self.decode_state {
+                    if state.shared.get_conn_error().is_some() {
+                        return Poll::Ready(Err(qpack::DecoderError::Internal(
+                            "connection closed while a QPACK field section was blocked",
+                        )));
+                    }
+                    if let Err(err) = state.block(required_ref, cx.waker()) {
+                        return Poll::Ready(Err(err));
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(qpack::DecoderError::MissingRefs(required_ref)))
+            }
+            Poll::Ready(Err(err)) => {
+                if let RequestDecodeState::Dynamic(state) = &mut self.decode_state {
+                    state.prefix = None;
+                }
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::SendStream<B>,
+    B: Buf,
+{
+    /// Send some data on the response body.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_data(buf)?;
+        future::poll_fn(|cx| self.poll_ready(cx)).await
+    }
+
+    /// Send a set of trailers to end the request.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.poll_ready(cx)).await?;
+        self.start_send_trailers(trailers)?;
+        future::poll_fn(|cx| self.poll_ready(cx)).await
+    }
+
+    /// Resets the send direction with `code`, preserving the receive direction.
+    /// A later Drop does not replace this code with `H3_REQUEST_CANCELLED`.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn stop_stream(&mut self, code: Code) {
+        self.stream.reset(code.into());
+        self.send_state = SendState::Reset;
+    }
+
+    /// Finishes the send direction after flushing any pending output.
+    /// Only successful completion disables reset on Drop; a pending or failed
+    /// finish leaves cancellation armed. Receiving is unaffected.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn finish(&mut self) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.poll_finish(cx)).await
+    }
+
+    /// Polls for the peer stopping or acknowledging the send direction.
+    /// Never changes stream state; see [`quic::SendStream::poll_stopped`].
+    pub fn poll_stopped(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        self.stream
+            .poll_stopped(cx)
+            .map_ok(|code| code.map(Code::from))
+            .map_err(|e| self.handle_quic_stream_error(e))
+    }
+
+    /// Flushes the pending frame without waiting for peer acknowledgment.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        ready!(self.stream.poll_ready(cx)).map_err(|e| self.handle_quic_stream_error(e))?;
+        if self.send_state == SendState::Data {
+            self.send_state = SendState::Ready;
+        }
+        if self.send_state == SendState::Interim {
+            self.send_state = SendState::Head;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Queues one DATA frame after the previous frame has been flushed.
+    pub fn start_send_data(&mut self, buf: B) -> Result<(), StreamError> {
+        self.check_send_ready()?;
+        self.stream
+            .send_data(Frame::Data(buf))
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = SendState::Data;
+        Ok(())
+    }
+
+    /// Queues the final field section after the previous frame has been flushed.
+    pub fn start_send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        self.check_send_ready()?;
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+        //= type=TODO
+        //# Characters in field names MUST be
+        //# converted to lowercase prior to their encoding.
+        let mut block = BytesMut::new();
+
+        let headers = Header::trailer(trailers);
+        let mem_size = qpack::encode_stateless(&mut block, &headers).map_err(|_e| {
+            self.handle_connection_error_on_stream(InternalConnectionError {
+                code: Code::H3_INTERNAL_ERROR,
+                message: "Failed to encode trailers".to_string(),
+            })
+        })?;
+        // Do not retain the normalized fields while the encoded block waits on
+        // QUIC backpressure.
+        drop(headers);
+
+        let max_mem_size = self.settings().max_field_section_size;
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+        //# An implementation that
+        //# has received this parameter SHOULD NOT send an HTTP message header
+        //# that exceeds the indicated size, as the peer will likely refuse to
+        //# process it.
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
+        //# An HTTP implementation MUST NOT send frames or requests that would be
+        //# invalid based on its current understanding of the peer's settings.
+
+        if mem_size > max_mem_size {
+            return Err(StreamError::HeaderTooBig {
+                actual_size: mem_size,
+                max_size: max_mem_size,
+            });
+        }
+
+        self.stream
+            .send_data(Frame::Headers(block.freeze()))
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = SendState::Trailers;
+        Ok(())
+    }
+
+    /// Flushes all queued frames, emits GREASE once, then submits FIN.
+    /// A server response must queue its final HEADERS first.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        if self.send_state == SendState::Reset {
+            return Poll::Ready(Err(StreamError::InvalidStreamState {
+                reason: "send direction was reset".into(),
+            }));
+        }
+        if self.send_state == SendState::Finished {
+            return Poll::Ready(Ok(()));
+        }
+        if matches!(self.send_state, SendState::Head | SendState::Interim) {
+            // A response without final HEADERS is malformed.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+            return Poll::Ready(Err(StreamError::InvalidStreamState {
+                reason: "send the final response HEADERS before finishing".into(),
+            }));
+        }
+        self.send_state = SendState::Finishing;
+        ready!(self.poll_ready(cx))?;
+        if self.send_grease_frame {
+            // Reserved frames may follow trailers.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.8
+            // Commit this flag when queued, so cancelling a pending flush cannot
+            // cause the next poll to append another GREASE frame.
+            self.stream
+                .send_data(Frame::Grease)
+                .map_err(|e| self.handle_quic_stream_error(e))?;
+            self.send_grease_frame = false;
+            ready!(self.poll_ready(cx))?;
+        }
+        ready!(self.stream.poll_finish(cx)).map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = SendState::Finished;
+        Poll::Ready(Ok(()))
+    }
+
+    fn check_send_ready(&self) -> Result<(), StreamError> {
+        if matches!(self.send_state, SendState::Head | SendState::Interim) {
+            // A response starts with HEADERS, not DATA or trailers.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+            return Err(StreamError::InvalidStreamState {
+                reason: "send the final response HEADERS before DATA or trailers".into(),
+            });
+        }
+        if self.send_state != SendState::Ready {
+            return Err(StreamError::InvalidStreamState {
+                reason: "flush the pending frame before sending; no content is allowed after trailers, finish, or reset".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Queues response HEADERS until the next successful `poll_ready` flush.
+    /// Informational HEADERS keep the response open for its final HEADERS.
+    pub(crate) fn start_send_headers(
+        &mut self,
+        block: Bytes,
+        informational: bool,
+    ) -> Result<(), StreamError> {
+        // Leave Head in the same step that queues the final HEADERS, so a
+        // cancelled flush cannot unlock early DATA. HEADERS after the final
+        // response would be read as trailers.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+        let reason = match self.send_state {
+            SendState::Head => None,
+            SendState::Interim => Some("flush the pending informational response first"),
+            SendState::Finishing | SendState::Finished | SendState::Reset => {
+                Some("no response HEADERS are allowed after finish or reset")
+            }
+            SendState::Ready | SendState::Data | SendState::Trailers => {
+                Some("the final response HEADERS were already sent")
+            }
+        };
+        if let Some(reason) = reason {
+            return Err(StreamError::InvalidStreamState {
+                reason: reason.into(),
+            });
+        }
+        self.stream
+            .send_data(Frame::Headers(block))
+            .map_err(|e| self.handle_quic_stream_error(e))?;
+        self.send_state = if informational {
+            SendState::Interim
+        } else {
+            SendState::Data
+        };
+        Ok(())
+    }
+}
+
+impl<S, B> RequestStream<S, B>
+where
+    S: quic::BidiStream<B>,
+    B: Buf,
+{
+    /// Splits transport and cancellation ownership by direction.
+    /// Buffered trailers and QPACK decoding state stay with the receive half.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) fn split(
+        self,
+    ) -> (
+        RequestStream<S::SendStream, B>,
+        RequestStream<S::RecvStream, B>,
+    ) {
+        let (send, recv) = self.stream.split();
+
+        (
+            RequestStream {
+                stream: send,
+                trailers: None,
+                conn_state: self.conn_state.clone(),
+                max_field_section_size: 0,
+                send_grease_frame: self.send_grease_frame,
+                send_state: self.send_state,
+                decode_state: RequestDecodeState::SendOnly,
+                content_length: ContentLength::Unchecked,
+            },
+            RequestStream {
+                stream: recv,
+                trailers: self.trailers,
+                conn_state: self.conn_state,
+                max_field_section_size: self.max_field_section_size,
+                send_grease_frame: self.send_grease_frame,
+                send_state: self.send_state,
+                decode_state: self.decode_state,
+                content_length: self.content_length,
+            },
+        )
+    }
+}
+
+impl<S, B> RequestStream<S, B> {
+    /// Abandons this handle's remaining directions now, with their drop codes.
+    /// Uses the same ownership state as Drop and releases QPACK at most once.
+    pub(crate) fn cancel_request(&mut self) {
+        self.decode_state.cancel_reading();
+        self.stream.cancel_remaining();
+    }
+}
+
+mod guard {
+    use std::{
+        ops::Deref,
+        task::{Context, Poll},
+    };
+
+    use bytes::Buf;
+
+    use crate::{
+        error::Code,
+        frame::{FrameStream, FrameStreamError},
+        proto::frame::{Frame, PayloadLen},
+        quic::{self, SendStream, StreamErrorIncoming},
+        stream::WriteBuf,
+    };
+
+    type Cancel<S, B> = fn(&mut FrameStream<S, B>, Code);
+
+    /// Cancels a request stream's open directions when their owner is dropped.
+    ///
+    /// Callbacks retain each direction's trait capability after splitting, without
+    /// requiring receive-only streams to implement `SendStream` (or vice versa).
+    /// A server changes the codes when it hands the request to the application.
+    /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
+    pub(crate) struct StreamGuard<S, B> {
+        inner: Option<FrameStream<S, B>>,
+        reset_on_drop: Option<Cancel<S, B>>,
+        stop_sending_on_drop: Option<Cancel<S, B>>,
+        reset_code: Code,
+        stop_sending_code: Code,
+    }
+
+    impl<S, B> StreamGuard<S, B> {
+        /// Wraps a stream with both cancellation callbacks disabled.
+        /// Used for halves whose callbacks are transferred by split.
+        pub(crate) fn without_cancellation(stream: FrameStream<S, B>) -> Self {
+            Self {
+                inner: Some(stream),
+                reset_on_drop: None,
+                stop_sending_on_drop: None,
+                reset_code: Code::H3_REQUEST_CANCELLED,
+                stop_sending_code: Code::H3_REQUEST_CANCELLED,
+            }
+        }
+
+        /// Sets the codes used by the callbacks still armed.
+        pub(crate) fn set_cancel_codes(&mut self, reset: Code, stop_sending: Code) {
+            self.reset_code = reset;
+            self.stop_sending_code = stop_sending;
+        }
+
+        /// Disables receive cancellation after EOF and any buffered trailers are processed.
+        /// The send direction keeps its current state.
+        pub(crate) fn finish_reading(&mut self) {
+            self.stop_sending_on_drop = None;
+        }
+
+        /// The inner stream. `None` only while `split` is consuming this guard,
+        /// which drops it without borrowing.
+        fn stream_mut(&mut self) -> &mut FrameStream<S, B> {
+            self.inner.as_mut().expect("stream is present")
+        }
+    }
+
+    impl<S, B> Deref for StreamGuard<S, B> {
+        type Target = FrameStream<S, B>;
+
+        fn deref(&self) -> &Self::Target {
+            self.inner.as_ref().expect("stream is present")
+        }
+    }
+
+    impl<S, B> Drop for StreamGuard<S, B> {
+        fn drop(&mut self) {
+            self.cancel_remaining();
+        }
+    }
+
+    impl<S: quic::RecvStream, B> StreamGuard<S, B> {
+        /// Stops receiving with the caller's code and prevents Drop from replacing it.
+        /// This does not reset the send direction or release QPACK state.
+        pub(super) fn stop_sending(&mut self, code: Code) {
+            self.stop_sending_on_drop = None;
+            self.stream_mut().stop_sending(code);
+        }
+    }
+
+    impl<S: quic::SendStream<B> + quic::RecvStream, B: Buf> StreamGuard<S, B> {
+        /// Wraps a new request stream with cancellation armed for both directions.
+        /// See <https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1.1>.
+        pub(crate) fn new(stream: FrameStream<S, B>, code: Code) -> Self {
+            Self {
+                inner: Some(stream),
+                reset_on_drop: Some(|stream, code| stream.reset(code.into())),
+                stop_sending_on_drop: Some(|stream, code| stream.stop_sending(code)),
+                reset_code: code,
+                stop_sending_code: code,
+            }
+        }
+    }
+
+    impl<S: quic::BidiStream<B>, B: Buf> StreamGuard<S, B> {
+        /// Transfers each open direction to its half without cancelling either one.
+        /// A direction already finished or explicitly stopped stays disarmed.
+        pub(super) fn split(
+            mut self,
+        ) -> (StreamGuard<S::SendStream, B>, StreamGuard<S::RecvStream, B>) {
+            let (send, recv) = self.inner.take().expect("stream is present").split();
+            let mut send = StreamGuard::without_cancellation(send);
+            let mut recv = StreamGuard::without_cancellation(recv);
+            send.set_cancel_codes(self.reset_code, self.stop_sending_code);
+            recv.set_cancel_codes(self.reset_code, self.stop_sending_code);
+
+            if self.reset_on_drop.take().is_some() {
+                send.reset_on_drop = Some(|stream, code| stream.reset(code.into()));
+            }
+
+            if self.stop_sending_on_drop.take().is_some() {
+                recv.stop_sending_on_drop = Some(|stream, code| stream.stop_sending(code));
+            }
+
+            (send, recv)
+        }
+    }
+
+    impl<S: quic::RecvStream, B> StreamGuard<S, B> {
+        /// Reads the next frame. Receiving does not complete either direction,
+        /// so this leaves both cancellation callbacks as they are.
+        pub(crate) fn poll_next(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
+            self.stream_mut().poll_next(cx)
+        }
+
+        /// Reads the current frame's payload, leaving cancellation as it is.
+        pub(crate) fn poll_data(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<impl Buf + use<S, B>>, FrameStreamError>> {
+            self.stream_mut().poll_data(cx)
+        }
+    }
+
+    impl<S, B> SendStream<B> for StreamGuard<S, B>
+    where
+        S: SendStream<B>,
+        B: Buf,
+    {
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            self.stream_mut().poll_ready(cx)
+        }
+
+        fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
+            self.stream_mut().send_data(data)
+        }
+
+        fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            let result = self.stream_mut().poll_finish(cx);
+            // Pending or failed FIN does not complete the send direction. If the
+            // request is then dropped, its cancellation callback must still run.
+            if matches!(result, Poll::Ready(Ok(()))) {
+                self.reset_on_drop = None;
+            }
+            result
+        }
+
+        fn poll_stopped(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+            self.stream_mut().poll_stopped(cx)
+        }
+
+        fn reset(&mut self, reset_code: u64) {
+            self.reset_on_drop = None;
+            self.stream_mut().reset(reset_code);
+        }
+
+        fn send_id(&self) -> quic::StreamId {
+            self.deref().send_id()
+        }
+    }
+
+    impl<S, B> StreamGuard<S, B> {
+        /// Cancels only directions still owned by this handle. Taking callbacks
+        /// makes explicit rejection followed by Drop idempotent.
+        pub(super) fn cancel_remaining(&mut self) {
+            let Some(stream) = self.inner.as_mut() else {
+                return;
+            };
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+            //# Implementations SHOULD cancel requests by abruptly terminating any
+            //# directions of a stream that are still open.  To do so, an
+            //# implementation resets the sending parts of streams and aborts reading
+            //# on the receiving parts of streams; see Section 2.4 of
+            //# [QUIC-TRANSPORT].
+            if let Some(reset) = self.reset_on_drop.take() {
+                reset(stream, self.reset_code);
+            }
+            if let Some(stop_sending) = self.stop_sending_on_drop.take() {
+                stop_sending(stream, self.stop_sending_code);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod qpack_field_section_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_util::task::{ArcWake, waker};
+
+    use super::*;
+
+    fn field_section_guard() -> (DecoderGuard, mpsc::UnboundedReceiver<QpackEvent>) {
+        let (events_send, events_recv) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::new(qpack::Decoder::new(0, 0).unwrap(), events_send);
+        let shared = Arc::new(SharedState::default());
+
+        (
+            DecoderGuard {
+                stream_id: StreamId(0),
+                shared,
+                cancel_on_drop: true,
+                cancelled: false,
+                blocked: None,
+                decoder,
+                prefix: None,
+            },
+            events_recv,
+        )
+    }
+
+    #[test]
+    fn request_decode_state_stays_within_two_words() {
+        assert!(std::mem::size_of::<RequestDecodeState>() <= 2 * std::mem::size_of::<usize>());
+    }
+
+    #[test]
+    fn send_half_does_not_cancel_the_receive_decode_state() {
+        let (guard, mut events) = field_section_guard();
+        let send = RequestDecodeState::SendOnly;
+        let recv = RequestDecodeState::Dynamic(Box::new(guard));
+
+        drop(send);
+        assert!(events.try_recv().is_err());
+
+        drop(recv);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::StreamCancel(StreamId(0)))
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn static_field_section_does_not_emit_acknowledgment() {
+        let (mut guard, mut events) = field_section_guard();
+
+        guard.acknowledge(false).unwrap();
+        guard.finish_reading();
+        drop(guard);
+
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn each_dynamic_field_section_emits_an_acknowledgment() {
+        let (mut guard, mut events) = field_section_guard();
+
+        // Response headers and trailers are separate field sections on the same stream.
+        guard.acknowledge(true).unwrap();
+        guard.acknowledge(true).unwrap();
+        guard.finish_reading();
+        drop(guard);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                events.try_recv(),
+                Ok(QpackEvent::HeaderAck(StreamId(0)))
+            ));
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn abandoning_stream_after_acknowledgment_emits_cancellation() {
+        let (mut guard, mut events) = field_section_guard();
+
+        guard.acknowledge(true).unwrap();
+        drop(guard);
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::HeaderAck(StreamId(0)))
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::StreamCancel(StreamId(0)))
+        ));
+    }
+
+    #[test]
+    fn explicit_cancellation_is_idempotent() {
+        let (mut guard, mut events) = field_section_guard();
+
+        guard.cancel_reading();
+        guard.cancel_reading();
+        drop(guard);
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::StreamCancel(StreamId(0)))
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn blocked_stream_limit_counts_each_stream_once() {
+        let mut blocked_streams = qpack::BlockedStreamRegistry::new(1);
+        let waker = futures_util::task::noop_waker();
+
+        assert!(
+            blocked_streams
+                .register(StreamId(0), 1, waker.clone())
+                .is_ok()
+        );
+        assert!(
+            blocked_streams
+                .register(StreamId(0), 1, waker.clone())
+                .is_ok()
+        );
+        assert!(
+            blocked_streams
+                .register(StreamId(4), 2, waker.clone())
+                .is_err()
+        );
+
+        blocked_streams.release(StreamId(0), 1);
+        assert!(blocked_streams.register(StreamId(4), 2, waker).is_ok());
+    }
+
+    struct WakeCounter {
+        wakes: AtomicUsize,
+        shared: Arc<SharedState>,
+    }
+
+    impl ArcWake for WakeCounter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            assert!(arc_self.shared.get_conn_error().is_some());
+            arc_self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn qpack_waiters_observe_connection_error_before_wake() {
+        let shared = Arc::new(SharedState::default());
+        let counter = Arc::new(WakeCounter {
+            wakes: AtomicUsize::new(0),
+            shared: shared.clone(),
+        });
+        let waker = waker(counter.clone());
+        let mut blocked_streams = qpack::BlockedStreamRegistry::new(4);
+        blocked_streams
+            .register(StreamId(0), 1, waker.clone())
+            .unwrap();
+        let (events_send, mut events_recv) = mpsc::unbounded_channel();
+        events_send
+            .send(QpackEvent::RegisterBlocked {
+                stream_id: StreamId(4),
+                required_ref: 2,
+                waker: waker.clone(),
+            })
+            .unwrap();
+        events_send
+            .send(QpackEvent::DecoderAccessWaker(waker))
+            .unwrap();
+
+        shared.set_conn_error(
+            InternalConnectionError::new(
+                Code::QPACK_ENCODER_STREAM_ERROR,
+                "invalid encoder instruction".into(),
+            )
+            .into(),
+        );
+        wake_qpack_waiters_on_connection_error(&mut blocked_streams, &mut events_recv);
+
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 3);
+        assert!(
+            events_send
+                .send(QpackEvent::HeaderAck(StreamId(0)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blocked_stream_limit_defers_wake_until_error_is_published() {
+        let shared = Arc::new(SharedState::default());
+        let counter = Arc::new(WakeCounter {
+            wakes: AtomicUsize::new(0),
+            shared: shared.clone(),
+        });
+        let mut blocked_streams = qpack::BlockedStreamRegistry::new(0);
+
+        let waker = blocked_streams
+            .register(StreamId(0), 1, waker(counter.clone()))
+            .expect_err("the blocked-stream limit should reject the field section");
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 0);
+
+        shared.set_conn_error(
+            InternalConnectionError::new(
+                Code::QPACK_DECOMPRESSION_FAILED,
+                "blocked-stream limit exceeded".into(),
+            )
+            .into(),
+        );
+        waker.wake();
+
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn invalid_local_qpack_configuration_is_an_internal_error() {
+        let conversion_error = u8::try_from(u16::MAX).unwrap_err();
+        let error =
+            invalid_qpack_decoder_configuration(qpack::DecoderError::BufSize(conversion_error));
+
+        assert_eq!(error.code, Code::H3_INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn closed_qpack_decoder_event_channel_is_internal() {
+        let (events_send, events_recv) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::new(qpack::Decoder::new(0, 0).unwrap(), events_send);
+        drop(events_recv);
+
+        let error = decoder
+            .queue_section_acknowledgment(StreamId(0))
+            .unwrap_err();
+        assert!(error.is_internal());
+    }
+
+    #[test]
+    fn local_qpack_decoder_settings_match_the_wire_frame() {
+        let mut config = Config {
+            send_grease: false,
+            ..Config::default()
+        };
+        config.settings.qpack_max_table_capacity = Some(256);
+        config.settings.qpack_blocked_streams = Some(4);
+        config.settings_order = Some(
+            frame::SettingsOrder::builder()
+                .push(frame::SettingId::MAX_HEADER_LIST_SIZE)
+                .build(),
+        );
+
+        let wire_settings = local_settings(&config).unwrap();
+        let effective: crate::config::Settings = (&wire_settings).into();
+        assert_eq!(effective.qpack_max_table_capacity, None);
+        assert_eq!(effective.qpack_blocked_streams, None);
+
+        config.send_settings = false;
+        let wire_settings = local_settings(&config).unwrap();
+        let effective: crate::config::Settings = (&wire_settings).into();
+        assert_eq!(effective.qpack_max_table_capacity, None);
+        assert_eq!(effective.qpack_blocked_streams, None);
+    }
+}
+
+#[cfg(test)]
+mod request_drop_tests {
+    use std::sync::Mutex;
+
+    use futures_util::FutureExt;
+
+    use super::*;
+    use crate::stream::WriteBuf;
+
+    #[derive(Clone, Default)]
+    enum Finish {
+        #[default]
+        Ready,
+        Pending,
+        Failed,
+    }
+
+    #[derive(Clone, Default)]
+    struct Probe {
+        events: Arc<Mutex<Vec<(&'static str, u64)>>>,
+        finish: Finish,
+        incoming: Option<Bytes>,
+        backpressure: bool,
+        pending_write: bool,
+        pending_read: bool,
+        pressure_each_frame: bool,
+        queued: Bytes,
+        wire: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl quic::RecvStream for Probe {
+        type Buf = Bytes;
+
+        fn poll_data(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+            if self.incoming.is_none() && self.pending_read {
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(self.incoming.take()))
+        }
+
+        fn stop_sending(&mut self, code: u64) {
+            self.events.lock().unwrap().push(("stop", code));
+        }
+
+        fn recv_id(&self) -> StreamId {
+            StreamId(0)
+        }
+    }
+
+    impl quic::SendStream<Bytes> for Probe {
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            if self.pending_write && std::mem::take(&mut self.backpressure) {
+                // A frame prefix can be committed before transport backpressure.
+                let prefix = self.queued.split_to(self.queued.len().min(1));
+                self.wire.lock().unwrap().extend_from_slice(&prefix);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if std::mem::take(&mut self.pending_write) {
+                self.events.lock().unwrap().push(("flushed", 0));
+            }
+            self.wire.lock().unwrap().extend_from_slice(&self.queued);
+            self.queued = Bytes::new();
+            Poll::Ready(Ok(()))
+        }
+
+        fn send_data<D: Into<WriteBuf<Bytes>>>(
+            &mut self,
+            data: D,
+        ) -> Result<(), StreamErrorIncoming> {
+            assert!(!self.pending_write, "previous frame has not been flushed");
+            self.backpressure |= self.pressure_each_frame;
+            self.pending_write = self.backpressure;
+            let mut data = data.into();
+            self.queued = data.copy_to_bytes(data.remaining());
+            Ok(())
+        }
+
+        fn poll_finish(&mut self, _: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            match self.finish {
+                Finish::Pending => return Poll::Pending,
+                Finish::Failed => {
+                    return Poll::Ready(Err(StreamErrorIncoming::StreamTerminated {
+                        error_code: Code::H3_REQUEST_REJECTED.value(),
+                    }));
+                }
+                Finish::Ready => {}
+            }
+            self.events.lock().unwrap().push(("fin", 0));
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_stopped(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+            Poll::Pending
+        }
+
+        fn reset(&mut self, code: u64) {
+            self.events.lock().unwrap().push(("reset", code));
+        }
+        fn send_id(&self) -> StreamId {
+            StreamId(0)
+        }
+    }
+
+    impl quic::BidiStream<Bytes> for Probe {
+        type SendStream = Self;
+        type RecvStream = Self;
+
+        fn split(self) -> (Self, Self) {
+            (self.clone(), self)
+        }
+    }
+
+    fn stream() -> (RequestStream<Probe, Bytes>, Probe) {
+        stream_with_probe(Probe::default())
+    }
+
+    fn stream_with_probe(probe: Probe) -> (RequestStream<Probe, Bytes>, Probe) {
+        let stream = RequestStream::new(
+            FrameStream::new(BufRecvStream::new(probe.clone())),
+            u64::MAX,
+            1024,
+            false,
+            Arc::new(SharedState::default()),
+            None,
+        );
+        (stream, probe)
+    }
+
+    fn server_stream_with_probe(probe: Probe) -> (RequestStream<Probe, Bytes>, Probe) {
+        let conn_state = Arc::new(SharedState::default());
+        let mut stream = FrameStream::new(BufRecvStream::new(probe.clone()));
+        stream.set_max_field_section_size(1024);
+
+        let decode_state = RequestDecodeState::new(stream.id(), &conn_state, 1024, None);
+        let stream = StreamGuard::new(stream, Code::H3_REQUEST_CANCELLED);
+        let request_stream =
+            RequestStream::with_decode_state(stream, u64::MAX, conn_state, false, decode_state);
+
+        (request_stream, probe)
+    }
+
+    #[tokio::test]
+    async fn completion_and_explicit_codes_survive_drop() {
+        let (mut stream, probe) = stream();
+        stream.finish().await.unwrap();
+        assert!(
+            future::poll_fn(|cx| stream.poll_recv_data(cx))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(stream);
+        assert_eq!(*probe.events.lock().unwrap(), [("fin", 0)]);
+
+        let (mut stream, probe) = self::stream();
+        stream.stop_stream(Code::H3_NO_ERROR);
+        stream.stop_sending(Code::H3_MESSAGE_ERROR);
+        drop(stream);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_NO_ERROR.value()),
+                ("stop", Code::H3_MESSAGE_ERROR.value()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_a_request_after_cancelled_finish_still_resets_upload() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            finish: Finish::Pending,
+            ..Probe::default()
+        });
+        assert!(stream.finish().now_or_never().is_none());
+        let (send, recv) = stream.split();
+        drop(send);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [("reset", Code::H3_REQUEST_CANCELLED.value())]
+        );
+        drop(recv);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+                ("stop", Code::H3_REQUEST_CANCELLED.value()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_flushes_a_cancelled_write_before_fin_or_grease() {
+        for grease in [false, true] {
+            let (mut stream, probe) = stream_with_probe(Probe {
+                backpressure: true,
+                ..Probe::default()
+            });
+            stream.send_grease_frame = grease;
+            assert!(
+                stream
+                    .send_data(Bytes::from_static(b"pending body"))
+                    .now_or_never()
+                    .is_none()
+            );
+            stream.finish().await.unwrap();
+            drop(stream);
+            assert_eq!(
+                *probe.events.lock().unwrap(),
+                [
+                    ("flushed", 0),
+                    ("fin", 0),
+                    ("stop", Code::H3_REQUEST_CANCELLED.value()),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_finish_does_not_disarm_drop() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            finish: Finish::Failed,
+            ..Probe::default()
+        });
+        assert!(matches!(
+            stream.finish().await,
+            Err(StreamError::RemoteTerminate { code, .. })
+                if code == Code::H3_REQUEST_REJECTED.value()
+        ));
+        drop(stream);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+                ("stop", Code::H3_REQUEST_CANCELLED.value()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn split_after_finish_preserves_receive_cancellation() {
+        let (mut stream, probe) = stream();
+        stream.finish().await.unwrap();
+        let (send, recv) = stream.split();
+        drop(send);
+        assert_eq!(*probe.events.lock().unwrap(), [("fin", 0)]);
+        drop(recv);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [("fin", 0), ("stop", Code::H3_REQUEST_CANCELLED.value())]
+        );
+    }
+
+    #[tokio::test]
+    async fn received_trailers_complete_receive_cancellation() {
+        // HEADERS with an empty QPACK field section, followed by transport EOF.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.2
+        let (mut stream, probe) = stream_with_probe(Probe {
+            incoming: Some(Bytes::from_static(&[0x01, 0x02, 0x00, 0x00])),
+            ..Probe::default()
+        });
+        assert!(
+            future::poll_fn(|cx| stream.poll_recv_data(cx))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            future::poll_fn(|cx| stream.poll_recv_trailers(cx))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(stream);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [("reset", Code::H3_REQUEST_CANCELLED.value())]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_body_eof_keeps_unread_trailers_armed() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            incoming: Some(Bytes::from_static(&[0x01, 0x02, 0x00, 0x00])),
+            ..Probe::default()
+        });
+        let (events_send, mut events) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::new(qpack::Decoder::new(1024, 1).unwrap(), events_send);
+        stream.decode_state =
+            RequestDecodeState::new(StreamId(0), &stream.conn_state, 1024, Some(decoder));
+        for _ in 0..2 {
+            assert!(
+                future::poll_fn(|cx| stream.poll_recv_data(cx))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(stream.trailers.is_some());
+        drop(stream);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::StreamCancel(StreamId(0)))
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+                ("stop", Code::H3_REQUEST_CANCELLED.value()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_receive_side_decodes_only_static_trailers() {
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5
+        // Required Insert Count 1, Base 1 and dynamic entry 0.
+        const DYNAMIC: &[u8] = &[0x01, 0x03, 0x02, 0x00, 0x80];
+        // Required Insert Count 0 and static `age: 0`.
+        const STATIC: &[u8] = &[0x01, 0x03, 0x00, 0x00, 0xc2];
+        // Required Insert Count 1, Base 0, then `foo: baz` whose post-base name
+        // reference starts the field lines with a zero byte.
+        const BLOCKED: &[u8] = b"\x01\x07\x02\x80\x00\x03baz";
+
+        // The blocked trailers are cancelled before their entry arrives.
+        for (trailers, blocked, decodes) in [
+            (DYNAMIC, false, false),
+            (STATIC, false, true),
+            (BLOCKED, true, false),
+        ] {
+            let (mut stream, _probe) = stream_with_probe(Probe {
+                incoming: Some(Bytes::from_static(trailers)),
+                ..Probe::default()
+            });
+            let (events_send, mut events) = mpsc::unbounded_channel();
+            let decoder = QpackDecoder::new(qpack::Decoder::new(1024, 1).unwrap(), events_send);
+            let insert = || {
+                let mut encoder_stream = BytesMut::new();
+                qpack::DynamicTableSizeUpdate(1024).encode(&mut encoder_stream);
+                qpack::InsertWithoutNameRef::new("foo", "bar")
+                    .encode(&mut encoder_stream)
+                    .unwrap();
+                assert_eq!(
+                    decoder.poll_on_recv_encoder(
+                        &mut Context::from_waker(futures_util::task::noop_waker_ref()),
+                        &mut std::io::Cursor::new(encoder_stream),
+                        &mut Vec::new(),
+                    ),
+                    Poll::Ready(Ok(1))
+                );
+            };
+            if !blocked {
+                insert();
+            }
+            stream.decode_state = RequestDecodeState::new(
+                StreamId(0),
+                &stream.conn_state,
+                1024,
+                Some(decoder.clone()),
+            );
+
+            // The trailers are buffered before reading stops.
+            assert!(
+                future::poll_fn(|cx| stream.poll_recv_data(cx))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if blocked {
+                let poll = future::poll_fn(|cx| Poll::Ready(stream.poll_recv_trailers(cx))).await;
+                assert!(poll.is_pending());
+            }
+            stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            if blocked {
+                insert();
+            }
+            let received = future::poll_fn(|cx| stream.poll_recv_trailers(cx)).await;
+            if decodes {
+                assert_eq!(received.unwrap().unwrap()["age"], "0");
+            } else {
+                assert!(matches!(
+                    received,
+                    Err(StreamError::InvalidStreamState { .. })
+                ));
+            }
+
+            // The peer rejects a Section Acknowledgment after Stream Cancellation.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+            let instructions: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                .filter(|event| {
+                    matches!(
+                        event,
+                        QpackEvent::HeaderAck(_) | QpackEvent::StreamCancel(_)
+                    )
+                })
+                .collect();
+            assert!(matches!(
+                instructions[..],
+                [QpackEvent::StreamCancel(StreamId(0))]
+            ));
+        }
+    }
+
+    #[test]
+    fn receive_drop_cancels_quic_and_qpack_once_after_split() {
+        let (mut stream, probe) = stream();
+        let (events_send, mut events) = mpsc::unbounded_channel();
+        let decoder = QpackDecoder::new(qpack::Decoder::new(1024, 1).unwrap(), events_send);
+        stream.decode_state =
+            RequestDecodeState::new(StreamId(0), &stream.conn_state, 1024, Some(decoder));
+        // Required Insert Count 1, Base 1, dynamic entry 0: the table is empty.
+        // https://www.rfc-editor.org/rfc/rfc9204.html#section-2.2.1
+        let mut field_section = Bytes::from_static(&[0x02, 0x00, 0x80]);
+        assert!(
+            future::poll_fn(|cx| stream.poll_decode_field_section(cx, &mut field_section))
+                .now_or_never()
+                .is_none()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::RegisterBlocked {
+                stream_id: StreamId(0),
+                required_ref: 1,
+                ..
+            })
+        ));
+        let (send, recv) = stream.split();
+        drop(send);
+        assert!(
+            events.try_recv().is_err(),
+            "send half must not cancel the decoder"
+        );
+        drop(recv);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::ReleaseBlocked {
+                stream_id: StreamId(0),
+                required_ref: 1,
+            })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QpackEvent::StreamCancel(StreamId(0)))
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+                ("stop", Code::H3_REQUEST_CANCELLED.value()),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_transfers_each_direction_with_its_cancellation() {
+        let (stream, probe) = stream();
+        let (send, recv) = stream.split();
+        assert!(probe.events.lock().unwrap().is_empty());
+        drop(recv);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [("stop", Code::H3_REQUEST_CANCELLED.value())]
+        );
+        drop(send);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("stop", Code::H3_REQUEST_CANCELLED.value()),
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+            ]
+        );
+
+        let (mut stream, probe) = self::stream();
+        stream.stop_sending(Code::H3_MESSAGE_ERROR);
+        let (send, recv) = stream.split();
+        drop(recv);
+        drop(send);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("stop", Code::H3_MESSAGE_ERROR.value()),
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+            ]
+        );
+
+        let (mut stream, probe) = server_stream_with_probe(Probe::default());
+        stream
+            .stream
+            .set_cancel_codes(Code::H3_REQUEST_REJECTED, Code::H3_NO_ERROR);
+        let (send, recv) = stream.split();
+        drop(send);
+        drop(recv);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_REJECTED.value()),
+                ("stop", Code::H3_NO_ERROR.value()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_data_frames_preserve_body_and_trailers() {
+        for client in [false, true] {
+            for trailers in [false, true] {
+                // Empty DATA before and after content, then optional trailers.
+                // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.1
+                let mut wire = vec![0, 0, 0, 0, 0, 3, b'a', b'b', b'c', 0, 0];
+                if trailers {
+                    wire.extend_from_slice(&[1, 2, 0, 0]);
+                }
+                let make_stream = if client {
+                    stream_with_probe
+                } else {
+                    server_stream_with_probe
+                };
+                let (mut stream, probe) = make_stream(Probe {
+                    incoming: Some(Bytes::from(wire)),
+                    ..Probe::default()
+                });
+                let mut body = Vec::new();
+                while let Some(mut data) = future::poll_fn(|cx| stream.poll_recv_data(cx))
+                    .await
+                    .unwrap()
+                {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(body, b"abc");
+                assert_eq!(
+                    future::poll_fn(|cx| stream.poll_recv_trailers(cx))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    trailers
+                );
+                drop(stream);
+                assert_eq!(
+                    *probe.events.lock().unwrap(),
+                    [("reset", Code::H3_REQUEST_CANCELLED.value())]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_data_before_pending_keeps_receive_cancellation_armed() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            incoming: Some(Bytes::from_static(&[0, 0])),
+            pending_read: true,
+            ..Probe::default()
+        });
+        assert!(
+            future::poll_fn(|cx| stream.poll_recv_data(cx))
+                .now_or_never()
+                .is_none()
+        );
+        drop(stream);
+        assert_eq!(
+            *probe.events.lock().unwrap(),
+            [
+                ("reset", Code::H3_REQUEST_CANCELLED.value()),
+                ("stop", Code::H3_REQUEST_CANCELLED.value()),
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn poll_send_retains_pending_data_and_mixes_with_async() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            pressure_each_frame: true,
+            ..Probe::default()
+        });
+        stream.start_send_data(Bytes::from_static(b"one")).unwrap();
+        assert!(matches!(
+            stream.start_send_data(Bytes::from_static(b"discarded")),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        assert!(
+            future::poll_fn(|cx| stream.poll_ready(cx))
+                .now_or_never()
+                .is_none()
+        );
+        // The cancelled poll retains the frame; the async entry flushes it first.
+        stream.send_data(Bytes::from_static(b"two")).await.unwrap();
+        stream.finish().await.unwrap();
+        assert_eq!(&*probe.wire.lock().unwrap(), b"\x00\x03one\x00\x03two");
+        assert!(stream.get_conn_error().is_none());
+    }
+
+    #[test]
+    fn poll_finish_survives_pending_grease_and_split() {
+        let (mut stream, probe) = stream_with_probe(Probe {
+            pressure_each_frame: true,
+            ..Probe::default()
+        });
+        stream.send_grease_frame = true;
+        stream.start_send_data(Bytes::from_static(b"body")).unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(stream.poll_finish(&mut cx).is_pending()); // DATA
+        assert!(stream.poll_finish(&mut cx).is_pending()); // GREASE
+        assert!(matches!(
+            stream.start_send_data(Bytes::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        let (mut send, recv) = stream.split();
+        assert!(matches!(send.poll_finish(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(send.poll_finish(&mut cx), Poll::Ready(Ok(()))));
+        // FIN submission must not be mistaken for peer acknowledgment.
+        assert!(send.poll_stopped(&mut cx).is_pending());
+        drop(send);
+        let bytes = probe.wire.lock().unwrap();
+        assert_eq!(&bytes[..6], b"\x00\x04body");
+        let mut grease = &bytes[6..];
+        let ty = crate::proto::varint::VarInt::decode(&mut grease)
+            .unwrap()
+            .into_inner();
+        assert_eq!((ty - 0x21) % 0x1f, 0);
+        assert_eq!(grease, b"\x06grease");
+        assert_eq!(
+            probe
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| *name == "fin")
+                .count(),
+            1
+        );
+        assert!(
+            !probe
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| *name == "reset")
+        );
+        drop(recv);
+    }
+
+    #[tokio::test]
+    async fn poll_trailers_enforce_limit_and_send_order() {
+        let (mut stream, probe) = stream();
+        stream.set_settings(crate::config::Settings {
+            max_field_section_size: 40,
+            ..crate::config::Settings::default()
+        });
+        let mut fields = HeaderMap::new();
+        fields.insert("trailer", "too large".parse().unwrap());
+        assert!(matches!(
+            stream.start_send_trailers(fields),
+            Err(StreamError::HeaderTooBig { .. })
+        ));
+        assert!(probe.wire.lock().unwrap().is_empty());
+        stream.send_data(Bytes::from_static(b"ok")).await.unwrap();
+        let mut fields = HeaderMap::new();
+        fields.insert("x", "y".parse().unwrap());
+        stream.start_send_trailers(fields).unwrap();
+        future::poll_fn(|cx| stream.poll_ready(cx)).await.unwrap();
+        assert!(matches!(
+            stream.start_send_trailers(HeaderMap::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        assert!(matches!(
+            stream.send_data(Bytes::new()).await,
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+        stream.finish().await.unwrap();
+        assert!(stream.get_conn_error().is_none());
+        assert!(matches!(
+            stream.start_send_data(Bytes::new()),
+            Err(StreamError::InvalidStreamState { .. })
+        ));
+    }
+}

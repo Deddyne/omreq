@@ -38,7 +38,7 @@ export interface NativeOperation {
  */
 export type NativeStarted = [
   status: number,
-  httpVersion: '1.0' | '1.1' | '2',
+  httpVersion: '1.0' | '1.1' | '2' | '3',
   url: string | undefined,
   headers: string,
   redirects: string | undefined,

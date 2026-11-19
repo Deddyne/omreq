@@ -98,6 +98,12 @@ impl HeaderPolicy {
         }
     }
 }
+impl HeaderPolicy {
+    /// Orders headers as on HTTP/2, which HTTP/3 shares.
+    pub fn order_h2(&self, headers: &mut HeaderMap) {
+        self.h2.call(headers);
+    }
+}
 impl OnPreserveHeaderCallback for HeaderPolicy {
     fn call(&self, headers: &mut HeaderMap) {
         self.h2.call(headers);
