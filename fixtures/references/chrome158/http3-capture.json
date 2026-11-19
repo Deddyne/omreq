@@ -10,8 +10,7 @@
     "chaos": {
       "firstPacketHasHeadAndTail": true,
       "pings": true,
-      "splitCrypto": true,
-      "spreadPadding": true
+      "splitCrypto": true
     },
     "clientHello": {
       "legacyVersion": 771,
