@@ -74,7 +74,7 @@ fn input_err() -> Error {
 }
 #[napi(catch_unwind)]
 pub fn build_info() -> String {
-    serde_json::json!({"version":env!("CARGO_PKG_VERSION"), "bridgeAbi":serde_json::from_str::<serde_json::Value>(include_str!("../../../bridge.json")).expect("bundled bridge version")["abi"],"nodeApi":8,"engineBuildId":BUILD_ID,"capabilities":CAPABILITIES,"transport":"wreq/0.16.3", "tls":"btls/0.5.6+129887582a538b8f4dcf371d15c953335312ca37", "boringSslRevision":"f1f2556a5dfa59e147d9d47279cc3f7f8a18b433", "bundledTrustStores":["webpki-root-certs/1.0.12","chromium-roots/0.1.1"], "cookiePslVersion":omreq_core::COOKIE_PSL_VERSION,"stage":"internal-prototype"}).to_string()
+    serde_json::json!({"version":env!("CARGO_PKG_VERSION"), "bridgeAbi":serde_json::from_str::<serde_json::Value>(include_str!("../../../bridge.json")).expect("bundled bridge version")["abi"],"nodeApi":8,"engineBuildId":BUILD_ID,"capabilities":CAPABILITIES,"transport":"wreq/0.16.3", "tls":"btls/0.5.6+5ec1c113a03626a5877b34dd6d2ea8d440897a91", "boringSslRevision":"427ec40cc8edc545253289232e885708c409e5ea", "bundledTrustStores":["webpki-root-certs/1.0.12","chromium-roots/0.1.1"], "cookiePslVersion":omreq_core::COOKIE_PSL_VERSION,"stage":"internal-prototype"}).to_string()
 }
 #[napi(catch_unwind)]
 pub fn check_profile(text: String) -> Result<String> {
@@ -96,6 +96,7 @@ pub fn check_profile(text: String) -> Result<String> {
                 cookies: true,
                 proxies: Vec::new(),
                 resolve: Default::default(),
+                http3: true,
             },
         );
         if validation.is_err() {
@@ -155,6 +156,7 @@ impl Started {
         Self {
             status: meta.status,
             version: match meta.http_version.as_str() {
+                "3" => "3",
                 "2" => "2",
                 "1.0" => "1.0",
                 _ => "1.1",

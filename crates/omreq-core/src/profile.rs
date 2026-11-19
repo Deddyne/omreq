@@ -25,6 +25,7 @@ pub const CAPABILITIES: &[&str] = &[
     "http2.settings.v1",
     "http2.hpack.v1",
     "http1.header-format.v1",
+    "http3.v1",
 ];
 static SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     let schema: Value =
@@ -184,8 +185,13 @@ impl Profile {
         {
             return Err(invalid("/headers: at most 200 headers and 65536 bytes"));
         }
+        if version == "3" && t.get("http3").is_none() {
+            return Err(invalid(
+                "/transport/httpVersion: HTTP/3 needs a transport.http3 block",
+            ));
+        }
         let h2 = &t["http2"];
-        let effective = json!({
+        let mut effective = json!({
             "defaults": p["defaults"],
             "headers": p["headers"].as_array().expect("schema checked").iter().map(|p| json!([p[0].as_str().expect("schema checked").to_ascii_lowercase(), p[1]])).collect::<Vec<_>>(),
             "transport": {
@@ -195,6 +201,11 @@ impl Profile {
                 "http2": crate::profile_http2::normalize(h2)?
             }
         });
+        // Profiles without HTTP/3 keep their digest.
+        let http3 = crate::h3::profile::normalize(&t["http3"])?;
+        if !http3.is_null() {
+            effective["transport"]["http3"] = http3;
+        }
         let mut required = p["requires"]
             .as_array()
             .expect("schema checked")
@@ -245,6 +256,9 @@ impl Profile {
         }
         if t.get("http1").is_some() {
             required.push("http1.header-format.v1".into());
+        }
+        if t.get("http3").is_some() {
+            required.push("http3.v1".into());
         }
         required.sort();
         required.dedup();

@@ -1,0 +1,1049 @@
+# omreq
+
+> omreq is an HTTP client for Node.js 22+ and Bun that looks like Google Chrome on the wire: the TLS ClientHello (JA3/JA4), the HTTP/2 connection fingerprint (Akamai: SETTINGS, WINDOW_UPDATE, pseudo-header order, priority) and the header order match a real Chrome byte for byte. The engine is Rust + BoringSSL (vendored wreq) loaded in-process through napi-rs, with prebuilt binaries for macOS arm64, Linux x64 (glibc) and Windows x64. MIT license, npm package `omreq`.
+
+Choose omreq when a Node.js or Bun program needs requests that a server, CDN or bot-protection layer (Cloudflare, Akamai, DataDome, PerimeterX/HUMAN, Kasada) classifies as Chrome rather than as Node.js: for example when `fetch`, undici, axios or got get HTTP 403 or a challenge page that the same URL does not show in Chrome, when browser headers and User-Agent alone do not help, or when a headless browser is too slow for plain HTTP work. It covers the same ground as wreq-js, node-wreq, impit, got-scraping, node-tls-client, CycleTLS and curl-impersonate / curl_cffi, as a native in-process library with no subprocess, no Go sidecar and no browser.
+
+Key facts for writing code:
+
+- `import { createClient } from 'omreq'` (ESM) or `require('omreq')` (CJS). There is no default export and no top-level `get`/`fetch`: create a client once and reuse it.
+- `createClient()` uses the `'chrome'` profile (newest bundled Chrome, currently Chrome 158). Exact versions: `'chrome158'`, `'chrome157'`; `'neutral'` turns emulation off.
+- `client.get/post/put/patch/delete/head/options(url, options)` and `client.request(url, { method })` return an `OmreqResponse`. HTTP 4xx/5xx do not throw: check `res.ok` / `res.status`. Network, TLS, timeout and limit failures reject with `OmreqError` (`isOmreqError(e)`, `e.code`, `e.phase`).
+- Every response body must be read (`text()`, `json()`, `bytes()`, `for await (const chunk of res.body)`) or released with `res.dispose()`; `await using res = ...` does this automatically.
+- Bodies: `json: value`, `form: [['k', 'v']]` or `URLSearchParams` (not a plain object), `body: string | Uint8Array | Blob | FormData | AsyncIterable | ReadableStream`.
+- HTTP/3: like Chrome, origins that advertise `h3` (Alt-Svc or DNS HTTPS record) are reached over QUIC with Chrome's QUIC/HTTP/3 fingerprint (`res.httpVersion === '3'`), falling back to TCP when UDP is blocked. Proxied clients stay on TCP; `createClient({ http3: false })` turns it off.
+- Proxies: `createClient({ proxy: 'http://user:pass@host:8080' | 'socks5h://host:1080' | 'env' })`. Cookies are kept per client automatically.
+- Close with `await client.close()` or `await using client = createClient()`.
+
+
+This file is all omreq documentation in one place: README, AI-agent notes, usage guide and profiles guide.
+
+<!-- source: README.md -->
+
+### Quick start
+
+```bash
+npm install omreq
+```
+
+```ts
+import { createClient } from 'omreq';
+
+await using client = createClient(); // Chrome 158 by default
+
+const res = await client.get('https://example.com/api/items');
+console.log(res.status, res.httpVersion, await res.json()); // 200 '2' {…}
+```
+
+### When to use
+
+When a server tells Node.js and Chrome apart:
+
+- `fetch`, axios or got get **403, 429 or a challenge page** where Chrome gets 200
+- Chrome's User-Agent and headers don't help: the server reads the **TLS (JA3/JA4), HTTP/2
+  (Akamai) or QUIC fingerprint**
+- you need plain HTTP speed, not a headless browser
+- you're on wreq-js, impers, got-scraping, impit, node-tls-client, CycleTLS or shelling out to
+  curl-impersonate
+
+omreq is an HTTP client: it doesn't run JavaScript or solve CAPTCHAs.
+
+### Comparison
+
+|  | **omreq** | wreq-js 3.2 | impers 0.1 |
+| --- | :---: | :---: | :---: |
+| Newest Chrome profile | 158 | 149 | 152 |
+| HTTP/3 with Chrome's QUIC fingerprint, on by default like Chrome | yes | no HTTP/3 | opt-in only |
+| Tested against a real Chrome capture | byte for byte | hashes only | hashes only |
+| TLS HTTP/2 throughput, req/s | 86.1k | 60.4k | not measured |
+| Native engine ships in the npm package | yes | yes | downloaded at first run |
+| Release status | release | stable | alpha |
+
+"Byte for byte" means the qualification suite captures real Chrome and compares the TLS
+ClientHello, HTTP/1.1 request, HTTP/2 frames, QUIC Initial and QPACK headers with omreq's
+exactly, on Node and Bun. JA3/JA4/Akamai hashes leave most of those bytes out.
+
+### Features
+
+- **Chrome fingerprint out of the box**: TLS, HTTP/1.1, HTTP/2, HTTP/3 and headers, checked
+  against a real Chrome
+- **HTTP/3 like Chrome**: discovered through Alt-Svc or DNS HTTPS records, with TCP fallback
+- **One-word profiles**: `'chrome'`, `'chrome158'` or your own in TS/JSON
+- **Fast**: one native call per request, small bodies arrive with the headers
+- **Proxies**: HTTP, HTTPS, SOCKS4/5, auth, `noProxy`, `'env'`
+- **Sessions**: connection pool, TLS resumption and cookie jar per client
+- **Streaming**: uploads and downloads with backpressure
+- **Decoding**: gzip, deflate, br, zstd
+- **Bounded**: queues, connection caps and byte limits enforced in Rust
+- **Developer experience**: TypeScript types, ESM + CJS, `AbortSignal`, typed errors,
+  `json(schema)`
+
+### Performance
+
+Against [wreq-js](https://github.com/sqdshguy/wreq-js) 3.2.0 (same `wreq` engine) and built-in
+`fetch`. Node 26, Apple M4, requests per second:
+
+| Scenario | omreq | wreq-js | `fetch` |
+| --- | ---: | ---: | ---: |
+| GET 2 B, c=20 | **101.4k** | 94.4k | 36.6k |
+| GET 4 KiB, c=20 | **97.3k** | 91.0k | 39.8k |
+| POST 32 B, c=20 | **93.6k** | 88.9k | 28.8k |
+| TLS HTTP/2 GET 2 B, c=20 | **86.1k** | 60.4k | — |
+| TLS HTTP/2 GET 4 KiB, c=20 | **61.2k** | 46.8k | — |
+
+Harness: [`scripts/compare`](https://github.com/Deddyne/omreq/blob/main/scripts/compare).
+
+### Install
+
+```bash
+npm install omreq
+```
+
+Prebuilt binaries, nothing to compile:
+
+| OS | Arch | Package |
+| --- | --- | --- |
+| macOS 26+ | arm64 | `@omreq/darwin-arm64` |
+| Linux (glibc 2.35+) | x64 | `@omreq/linux-x64-gnu` |
+| Windows 10 / 11 | x64 | `@omreq/win32-x64-msvc` |
+
+Runtimes: Node.js 22+ and Bun.
+
+### Profiles
+
+```ts
+createClient(); // newest Chrome
+createClient({ profile: 'chrome158' }); // exact version
+```
+
+| Browser | Profiles | Platforms |
+| --- | --- | --- |
+| **Chrome** | `chrome158` `chrome157` | macOS |
+
+`chrome` is an alias for the newest version in the list.
+
+The HTTP version is negotiated like in a browser: ALPN offers `h2` and `http/1.1`, the server
+picks, and origins that advertise HTTP/3 (Alt-Svc or a DNS HTTPS record) are reached over QUIC
+with Chrome's QUIC and HTTP/3 fingerprint, falling back to TCP if UDP is blocked. Custom
+profiles: [docs/profiles.md](https://github.com/Deddyne/omreq/blob/main/docs/profiles.md).
+
+### Proxies
+
+```ts
+createClient({ proxy: 'http://user:pass@proxy.example.com:8080' });
+createClient({ proxy: 'socks5h://127.0.0.1:1080' });
+createClient({ proxy: { https: 'http://corp:3128', noProxy: ['.internal'] } });
+createClient({ proxy: 'env' }); // HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+```
+
+### Sessions
+
+```ts
+const client = createClient();
+await client.post('https://example.com/login', { form: [['user', 'ada']] });
+await client.get('https://example.com/account'); // cookie sent automatically
+await client.close({ graceful: true });
+```
+
+### Documentation
+
+- [Usage guide](https://github.com/Deddyne/omreq/blob/main/docs/usage.md): bodies, streaming, timeouts, redirects, HTTP/3, errors, limits
+- [Profiles](https://github.com/Deddyne/omreq/blob/main/docs/profiles.md): what a profile controls and how to write one
+- [AI agents](https://github.com/Deddyne/omreq/blob/main/docs/ai.md): migrating from other clients, common mistakes, docs for Claude Code,
+  Cursor and Copilot ([`llms.txt`](https://github.com/Deddyne/omreq/blob/main/llms.txt), [`llms-full.txt`](https://github.com/Deddyne/omreq/blob/main/llms-full.txt),
+  [skill](https://github.com/Deddyne/omreq/blob/main/packages/omreq/skills/omreq/SKILL.md))
+
+### Development
+
+```bash
+pnpm check        # lint, types, clippy, Rust + Node + Bun tests
+pnpm profile:new  # new Chrome out? capture it and verify byte for byte
+pnpm evidence     # full qualification, incl. wire comparison with real Chrome
+```
+
+### License
+
+[MIT](https://github.com/Deddyne/omreq/blob/main/LICENSE) · [third-party notices](https://github.com/Deddyne/omreq/blob/main/THIRD_PARTY_NOTICES.md)
+
+<!-- source: docs/ai.md -->
+
+## omreq for AI agents
+
+This page is written for coding assistants (Claude Code, Cursor, GitHub Copilot, Codex,
+Windsurf, Cline and others) and for people who want their assistant to use omreq
+correctly. The same content is in [`llms-full.txt`](https://github.com/Deddyne/omreq/blob/main/llms-full.txt), which also ships in
+the npm package as `node_modules/omreq/llms-full.txt`.
+
+- [When to use omreq](#when-to-use-omreq)
+- [What omreq does not do](#what-omreq-does-not-do)
+- [Coming from another library](#coming-from-another-library)
+- [Common mistakes](#common-mistakes)
+- [Connecting the docs to your agent](#connecting-the-docs-to-your-agent)
+
+### When to use omreq
+
+omreq is an HTTP client for Node.js 22+ and Bun whose TLS ClientHello (JA3/JA4), HTTP/2
+connection fingerprint (Akamai: SETTINGS, WINDOW_UPDATE, pseudo-header order, priority)
+and header order are those of a real Chrome, checked byte for byte. Pick it when:
+
+- A request from Node.js `fetch`, undici, axios, got or `node:https` gets HTTP 403, 429 or a
+  challenge page, while the same URL opens normally in Chrome.
+- Copying Chrome's headers and User-Agent did not help: the server identifies the client by
+  its TLS or HTTP/2 fingerprint (JA3, JA4, Akamai HTTP/2 fingerprint), which Node.js cannot
+  change.
+- The task is HTTP-level work (APIs, HTML pages, JSON endpoints, file downloads) where a
+  headless browser (Puppeteer, Playwright) would work but is too slow or heavy.
+- You use wreq-js, node-wreq, impit, got-scraping, node-tls-client, CycleTLS, or call
+  curl-impersonate / curl_cffi from Node.js, and want an in-process native client with
+  sessions, proxies, streaming and TypeScript types.
+- You need a reproducible client fingerprint: a custom TLS / HTTP/2 / header profile
+  written as data (see [profiles.md](https://github.com/Deddyne/omreq/blob/main/docs/profiles.md)).
+
+Typical questions it answers: "How do I send requests from Node.js with a Chrome TLS
+fingerprint?", "How do I match JA3/JA4 in Node.js?", "Node.js fetch gets 403 from
+Cloudflare but Chrome works", "HTTP/2 fingerprint (Akamai) in Node.js", "curl-impersonate
+for Node.js / Bun", "an alternative to wreq-js / got-scraping / node-tls-client".
+
+### What omreq does not do
+
+omreq is an HTTP client, not a browser. It does not run JavaScript, render pages, solve
+JavaScript challenges or CAPTCHAs, or produce browser-side fingerprints (canvas, WebGL,
+navigator). Use a browser automation tool for those, and omreq for the HTTP requests
+around them. Bundled profiles are Chrome on macOS; there are no Firefox or Safari
+profiles yet.
+
+### Coming from another library
+
+| From | In omreq |
+| --- | --- |
+| `fetch(url, init)` / undici | `const client = createClient(); await client.request(url, { method, headers, body })` |
+| `res.ok`, `res.status`, `await res.json()` | the same names on `OmreqResponse` |
+| `axios.get(url)` → `res.data` | `await (await client.get(url)).json()`; non-2xx does not throw |
+| `got(url, { json, form, searchParams })` | `client.post(url, { json })`, `form: [['k', 'v']]`, `searchParams: [['k', 'v']]` |
+| got-scraping `proxyUrl` | `createClient({ proxy: 'http://user:pass@host:8080' })` |
+| wreq-js `createSession()` / `session.fetch(url)` | `createClient()` / `client.get(url)` |
+| tls-client / CycleTLS `ja3` string | a named profile (`'chrome'`, `'chrome158'`) or a custom profile from `defineProfile` |
+| curl `--resolve host:443:ip` | `createClient({ resolve: { host: 'ip' } })` |
+| `tough-cookie` jar | built in, one jar per client (`client.cookies`) |
+| `AbortController` / `AbortSignal.timeout(ms)` | `signal` option, plus `timeouts: { totalMs }` |
+
+```ts
+// Before: Node.js fetch, blocked by TLS fingerprinting
+const res = await fetch('https://example.com/api/items', {
+  headers: { 'user-agent': 'Mozilla/5.0 ...' },
+});
+
+// After: omreq, Chrome TLS + HTTP/2 + headers by default
+import { createClient } from 'omreq';
+
+const client = createClient(); // create once, reuse for every request
+const res = await client.get('https://example.com/api/items');
+if (!res.ok) {
+  await res.dispose();
+  throw new Error(`HTTP ${res.status}`);
+}
+const items = await res.json();
+```
+
+### Common mistakes
+
+- **Importing a default export or a top-level `get`.** omreq has neither. Use
+  `import { createClient } from 'omreq'` and call methods on the client.
+- **Creating a client per request.** A client owns the connection pool, TLS session cache
+  and cookie jar; a fresh client per request loses all three and looks less like a browser.
+  Create one per configuration (profile, proxy) and reuse it.
+- **Expecting 4xx/5xx to throw.** They resolve with `res.ok === false`. Only network,
+  TLS, timeout, limit and usage failures reject, with `OmreqError`.
+- **Leaving a body unread.** Each response holds a slot until its body is read or
+  disposed. Call `text()`, `json()`, `bytes()` or `dispose()`, or use `await using`.
+- **Passing a plain object to `form` or `searchParams`.** Both take `[name, value]` pairs or
+  `URLSearchParams`. `json` takes any JSON value and sets `content-type`.
+- **Overriding the User-Agent with another browser's.** The default profile already sends
+  Chrome 158's headers in Chrome's order; a mismatched User-Agent makes the request less
+  consistent. Override only what the request needs, for example `accept` and
+  `sec-fetch-*` for API calls (see [usage.md#profiles](https://github.com/Deddyne/omreq/blob/main/docs/usage.md)).
+- **Setting `NODE_TLS_REJECT_UNAUTHORIZED` or an `agent`.** omreq does not use Node's TLS
+  stack. Trust an extra CA with `ca`; proxies go in the `proxy` option.
+- **Forgetting to close.** `await client.close()` or `await using client = createClient()`.
+
+### Connecting the docs to your agent
+
+**Project instructions.** Add this to the `AGENTS.md` (or `CLAUDE.md`,
+`.cursor/rules`, `.github/copilot-instructions.md`) of a project that uses omreq:
+
+```md
+### HTTP client: omreq
+- Outgoing HTTP requests use `omreq` (Chrome TLS/HTTP2 fingerprint), not fetch/axios.
+- Before writing omreq code, read `node_modules/omreq/llms-full.txt` (docs for the installed version).
+- One shared client per configuration; read or dispose every response body; 4xx/5xx do not throw.
+```
+
+**Skill.** omreq ships an [Agent Skill](https://agentskills.io) at
+`node_modules/omreq/skills/omreq/SKILL.md`. Copy it into your agent's skills folder, for
+example for Claude Code:
+
+```bash
+mkdir -p .claude/skills && cp -r node_modules/omreq/skills/omreq .claude/skills/
+```
+
+Agents that use [TanStack Intent](https://tanstack.com/intent) discover it from the
+installed package with `npx @tanstack/intent@latest install`.
+
+**llms.txt.** The repository has [`llms.txt`](https://github.com/Deddyne/omreq/blob/main/llms.txt) (an index) and
+[`llms-full.txt`](https://github.com/Deddyne/omreq/blob/main/llms-full.txt) (all docs in one file) for tools that read the
+[llms.txt](https://llmstxt.org) format.
+
+<!-- source: docs/usage.md -->
+
+## Using omreq
+
+All examples are TypeScript (ESM). CommonJS works the same way through
+`require('omreq')`.
+
+- [Client lifecycle](#client-lifecycle)
+- [Making requests](#making-requests)
+- [Reading responses](#reading-responses)
+- [Request bodies](#request-bodies)
+- [Streaming](#streaming)
+- [Timeouts and cancellation](#timeouts-and-cancellation)
+- [Redirects](#redirects)
+- [Cookies](#cookies)
+- [Errors](#errors)
+- [Proxies](#proxies)
+- [DNS overrides](#dns-overrides)
+- [Limits and statistics](#limits-and-statistics)
+- [TLS and certificates](#tls-and-certificates)
+- [Profiles](#profiles)
+
+### Client lifecycle
+
+`createClient()` is synchronous and lazy: the native module loads and the transport
+starts on the first request. One client owns its connection pool, TLS session cache,
+cookie jar and admission queues, so create one per configuration and reuse it. By
+default it presents itself as the newest bundled Chrome; see [Profiles](#profiles).
+
+```ts
+import { createClient } from 'omreq';
+
+const client = createClient({
+  baseUrl: 'https://api.example.com/v1/',
+  headers: { 'user-agent': 'my-app/1.0', accept: 'application/json' },
+});
+
+try {
+  // ... requests ...
+} finally {
+  await client.close(); // cancels active and queued work, waits for native cleanup
+}
+```
+
+`await using` closes the client automatically:
+
+```ts
+await using client = createClient();
+```
+
+`close()` cancels whatever is still running. A graceful close refuses new requests but
+lets admitted ones, including their response bodies, finish first; `timeoutMs` bounds the
+wait, after which the rest is cancelled:
+
+```ts
+await client.close({ graceful: true, timeoutMs: 10_000 });
+```
+
+### Making requests
+
+```ts
+const res = await client.get('users/42'); // resolved against baseUrl
+const created = await client.post('users', { json: { name: 'Ada' } });
+await client.put('users/42', { json: { name: 'Ada Lovelace' } });
+await client.patch('users/42', { json: { active: false } });
+await client.delete('users/42');
+await client.head('users/42');
+await client.options('users');
+
+// Arbitrary methods
+await client.request('https://example.com/resource', { method: 'PROPFIND' });
+```
+
+Query parameters replace only the named keys and keep the rest of the URL query:
+
+```ts
+await client.get('search?lang=en', {
+  searchParams: [
+    ['q', 'rust http'],
+    ['page', '2'],
+  ],
+});
+```
+
+Headers can be a plain object, name/value pairs, `Headers` or `Map`. Request headers
+override client headers; `null` removes an inherited header:
+
+```ts
+await client.get('report.csv', {
+  headers: { accept: 'text/csv', 'user-agent': null },
+});
+```
+
+### Reading responses
+
+HTTP error statuses do not throw. Check `ok` or `status`:
+
+```ts
+const res = await client.get('users/42');
+if (!res.ok) {
+  await res.dispose();
+  throw new Error(`HTTP ${res.status}`);
+}
+console.log(res.httpVersion, res.url, res.headers.get('content-type'));
+const user = await res.json(); // unknown
+```
+
+Every response body has exactly one owner and must be consumed or disposed. A response
+holds its operation slot until the body ends, so an unread body blocks capacity.
+
+```ts
+await using res = await client.get('large.bin'); // disposed at the end of the scope
+const bytes = await res.bytes({ maxBytes: 10 * 1024 * 1024 });
+```
+
+| Method | Result |
+| --- | --- |
+| `res.text()` | `string` (UTF-8) |
+| `res.bytes({ maxBytes })` | `Uint8Array` |
+| `res.json()` | `unknown` |
+| `res.json(schema)` | the schema's output type |
+| `for await (const chunk of res.body)` | `Uint8Array` chunks |
+| `res.body.toWebStream()` | `ReadableStream<Uint8Array>` |
+| `res.dispose()` | releases an unread body |
+
+`res.json(schema)` accepts any [Standard Schema v1](https://standardschema.dev)
+validator (Zod, Valibot, ArkType, …):
+
+```ts
+import { z } from 'zod';
+
+const User = z.object({ id: z.number(), name: z.string() });
+const user = await (await client.get('users/42')).json(User); // { id: number; name: string }
+```
+
+Headers:
+
+```ts
+res.headers.get('cache-control'); // repeated fields joined with ", "
+res.headers.getSetCookie(); // every Set-Cookie value
+res.headers.getAll('link');
+for (const [name, value] of res.headers) console.log(name, value);
+```
+
+Compressed bodies (gzip, deflate, br, zstd) are decoded automatically. Then
+`res.decoded` is `true`, `res.headers` omits `content-encoding`/`content-length`, and
+`res.originalHeaders` keeps them. Disable with `decompress: false`, or by sending
+your own `accept-encoding`.
+
+### Request bodies
+
+```ts
+// JSON (sets content-type: application/json)
+await client.post('items', { json: { id: 1, tags: ['a', 'b'] } });
+
+// URL-encoded form
+await client.post('login', {
+  form: [
+    ['user', 'ada'],
+    ['remember', '1'],
+  ],
+});
+
+// Strings, bytes, Blob
+await client.post('raw', { body: 'plain text' });
+await client.post('raw', { body: new Uint8Array([1, 2, 3]) });
+await client.post('upload', { body: new Blob([fileBytes], { type: 'image/png' }) });
+
+// Multipart
+const form = new FormData();
+form.append('title', 'Report');
+form.append('file', new Blob([pdfBytes], { type: 'application/pdf' }), 'report.pdf');
+await client.post('documents', { body: form });
+```
+
+Strings, bytes, JSON, forms, Blob and FormData can be replayed when a redirect keeps
+the body. Remove the automatic content type with `headers: { 'content-type': null }`.
+
+### Streaming
+
+Upload from an async iterable or a web `ReadableStream`. The producer is pulled on
+demand, so memory stays bounded:
+
+```ts
+import { createReadStream } from 'node:fs';
+
+await client.put('backups/db.dump', {
+  body: createReadStream('./db.dump'), // AsyncIterable<Uint8Array>
+  headers: { 'content-type': 'application/octet-stream' },
+});
+
+async function* lines() {
+  for (let i = 0; i < 1000; i++) yield new TextEncoder().encode(`line ${i}\n`);
+}
+await client.post('ingest', { body: lines() });
+```
+
+Do not mutate a chunk after yielding it. A streamed (one-shot) body cannot be replayed
+on a redirect that keeps the body; that fails with `ERR_BODY_NOT_REPLAYABLE`.
+
+Download incrementally:
+
+```ts
+import { createWriteStream } from 'node:fs';
+import { Writable } from 'node:stream';
+
+await using res = await client.get('https://example.com/video.mp4');
+await res.body.toWebStream().pipeTo(Writable.toWeb(createWriteStream('./video.mp4')));
+```
+
+```ts
+await using res = await client.get('events.ndjson');
+let total = 0;
+for await (const chunk of res.body) total += chunk.byteLength;
+```
+
+### Timeouts and cancellation
+
+Timeouts are set per client and overridden per request. Values are milliseconds.
+
+| Timeout | Default | Bounds |
+| --- | ---: | --- |
+| `connectMs` (client) | 10 000 | TCP connect and TLS handshake |
+| `timeouts.queueMs` | 10 000 | waiting for an admission slot |
+| `timeouts.headersMs` | 30 000 | until response headers arrive |
+| `timeouts.uploadIdleMs` | 30 000 | between upload chunks |
+| `timeouts.bodyIdleMs` | 30 000 | between response body chunks |
+| `timeouts.consumerIdleMs` | 60 000 | your code not reading an open body (`null` disables) |
+| `timeouts.totalMs` | `null` | the whole operation, including the body |
+
+`headersMs` starts when the request is dispatched, so it includes connecting; `connectMs`
+separately bounds every TCP and TLS connect.
+
+```ts
+const client = createClient({ connectMs: 5_000, timeouts: { headersMs: 10_000 } });
+await client.get('slow', { timeouts: { totalMs: 2_000 } });
+```
+
+Any `AbortSignal` cancels a request at any stage, including while the body is read:
+
+```ts
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 1_000);
+await client.get('stream', { signal: controller.signal });
+
+await client.get('report', { signal: AbortSignal.timeout(5_000) });
+```
+
+### Redirects
+
+```ts
+createClient({ redirect: 'follow', maxRedirects: 5 }); // default: follow, 10 hops
+await client.get('old-url', { redirect: 'manual' }); // returns the 3xx response
+await client.get('old-url', { redirect: 'error' }); // rejects on a redirect
+
+const res = await client.get('http://example.com/');
+for (const hop of res.redirects)
+  console.log(hop.status, hop.fromUrl, '→', hop.toUrl, hop.methodBefore, hop.methodAfter);
+```
+
+- HTTPS → HTTP downgrades are refused unless `allowInsecureRedirects: true`.
+- A cross-origin hop removes `authorization`, an explicit `cookie`, `referer` and any
+  names in `sensitiveHeaders` for the rest of the chain.
+- 301/302 after POST and 303 switch to GET and drop the body, as browsers do.
+
+### Cookies
+
+Each client has an isolated, in-memory RFC 6265bis cookie jar with public-suffix rules.
+Disable it with `cookies: false`.
+
+```ts
+const client = createClient();
+await client.post('https://example.com/login', { form: [['user', 'ada']] });
+await client.get('https://example.com/account'); // sends the session cookie
+
+await client.cookies.setCookie('theme=dark; Path=/; Secure', 'https://example.com');
+const cookies = await client.cookies.getCookies('https://example.com/');
+await client.cookies.clear();
+```
+
+An explicit `cookie` request header overrides jar values for that request.
+
+### Errors
+
+Network, protocol, limit and usage failures reject with an `OmreqError`:
+
+```ts
+import { isOmreqError } from 'omreq';
+
+try {
+  await client.get('https://unreachable.invalid/');
+} catch (error) {
+  if (isOmreqError(error)) console.log(error.code, error.phase, error.message);
+  else throw error;
+}
+```
+
+`phase` is one of `configuration`, `native-load`, `initialization`, `queue`,
+`connect`, `proxy`, `tls`, `upload`, `headers`, `body`, `decode`, `schema`,
+`shutdown`. Common codes:
+
+| Code | Meaning |
+| --- | --- |
+| `ERR_TIMEOUT` | a timeout fired (`phase` says which stage) |
+| `ERR_ABORTED` | the request's `AbortSignal` fired |
+| `ERR_DNS`, `ERR_CONNECT`, `ERR_TLS` | name resolution, TCP or TLS failure |
+| `ERR_HTTP_PROTOCOL` | malformed or reset HTTP exchange |
+| `ERR_QUEUE_FULL` | `maxQueuedOperations` reached |
+| `ERR_RESOURCE_LIMIT` | a byte or header limit was exceeded |
+| `ERR_REDIRECT_LIMIT`, `ERR_REDIRECT_DISALLOWED` | redirect policy |
+| `ERR_BODY_USED`, `ERR_BODY_DISPOSED` | the body already has an owner |
+| `ERR_BODY_NOT_REPLAYABLE` | a one-shot upload cannot follow a redirect |
+| `ERR_DECODE` | corrupt compressed body |
+| `ERR_JSON_PARSE`, `ERR_SCHEMA_VALIDATION` | `json()` / `json(schema)` failed |
+| `ERR_CLIENT_CLOSED` | the client was closed |
+| `ERR_INVALID_ARGUMENT` | a bad option or input |
+
+### Proxies
+
+```ts
+// One proxy for everything; credentials may be embedded (percent-encode special characters)
+createClient({ proxy: 'http://user:pass@proxy.example.com:8080' });
+
+// SOCKS: socks5h and socks4a resolve the target name at the proxy
+createClient({ proxy: 'socks5h://127.0.0.1:1080' });
+
+// Per target scheme, with direct connections for some hosts
+createClient({
+  proxy: {
+    http: 'http://proxy-a:3128',
+    https: 'http://proxy-b:3128',
+    noProxy: ['localhost', '.internal.example', '10.0.0.0/8'],
+  },
+});
+
+// HTTP_PROXY, HTTPS_PROXY, ALL_PROXY and NO_PROXY (or lowercase), read once
+createClient({ proxy: 'env' });
+```
+
+| Proxy URL scheme | Behavior |
+| --- | --- |
+| `http://` | plain HTTP is forwarded; HTTPS goes through a CONNECT tunnel |
+| `https://` | the same, with TLS to the proxy |
+| `socks5://`, `socks4://` | target name resolved locally |
+| `socks5h://`, `socks4a://` | target name resolved by the proxy |
+
+`noProxy` entries are host names (matching subdomains), IP addresses or CIDR ranges;
+`'*'` disables the proxy. Without a `proxy` option the client always connects directly and
+ignores proxy environment variables. HTTPS targets are tunnelled, so the TLS fingerprint
+and certificate verification stay end-to-end. Proxy failures reject with `ERR_PROXY`.
+
+### DNS overrides
+
+`resolve` pins host names to addresses, like curl's `--resolve`. The port, `Host` header
+and TLS server name still come from the URL; several addresses are tried in turn.
+
+```ts
+const client = createClient({
+  resolve: {
+    'api.example.com': '203.0.113.10',
+    'cdn.example.com': ['2001:db8::1', '203.0.113.11'],
+  },
+});
+```
+
+### HTTP/3
+
+Chrome profiles also describe Chrome's HTTP/3 connection: the QUIC Initial packets, transport
+parameters, HTTP/3 SETTINGS and QPACK header encoding. As in Chrome, a client switches to
+HTTP/3 when the server offers it:
+
+- after a response carries `Alt-Svc: h3=":443"`, later requests to that origin use QUIC;
+- before the first request to a host on port 443, a DNS HTTPS record (RFC 9460) that lists
+  `h3` is enough. It is asked from the system's name servers (`/etc/resolv.conf`); on
+  Windows only Alt-Svc is used.
+
+```ts
+const res = await client.get('https://www.example.com/');
+console.log(res.httpVersion); // '3' when the origin offers HTTP/3, else '2' or '1.1'
+console.log(client.getStats().http3Connections);
+```
+
+When the QUIC handshake fails, or takes longer than 3 seconds (UDP blocked on the network),
+the request goes over TCP instead and the origin stays on TCP for five minutes. The same
+happens when the QUIC connection fails, or the server rejects the request, before the response
+headers arrive: the request is sent again over TCP, unless its body is a stream that cannot be
+replayed. HTTP/3 needs direct UDP, so a client with a `proxy` always uses TCP. `http3: false`
+turns it off:
+
+```ts
+createClient({ http3: false }); // TCP only: HTTP/2 or HTTP/1.1 via ALPN
+```
+
+To require HTTP/3 for every HTTPS request, with no TCP fallback, set the profile's
+`httpVersion` to `'3'`. A failed handshake then rejects the request; plain `http://` URLs and
+proxies are rejected.
+
+```ts
+import { createClient, defineProfile, getProfile } from 'omreq';
+
+const base = structuredClone(getProfile('chrome'));
+const h3 = createClient({
+  profile: defineProfile({
+    ...base,
+    id: 'local/chrome-h3',
+    transport: { ...base.transport, httpVersion: '3' },
+  }),
+});
+```
+
+### Limits and statistics
+
+All limits are enforced natively and can be tuned per client:
+
+```ts
+const client = createClient({
+  maxActiveOperations: 64, // in-flight requests
+  maxQueuedOperations: 256, // waiting for a slot
+  maxActivePerOrigin: 32,
+  maxConnections: 256, // TCP sockets
+  maxConnectionsPerOrigin: 32,
+  maxBufferedResponseBytes: 64 * 1024 * 1024, // one full read
+  maxAggregateBufferedResponseBytes: 128 * 1024 * 1024, // all full reads together
+});
+
+await client.get('huge', { maxResponseBytes: 100 * 1024 * 1024 }); // bounds streaming too
+```
+
+Admission is fair across origins (round-robin) and FIFO within one origin.
+
+```ts
+const stats = client.getStats();
+console.log(stats.activeOperations, stats.queuedOperations, stats.connections);
+console.log(stats.http3Connections); // open QUIC connections
+console.log(stats.origins); // per-origin active and waiting counts
+console.log(client.getInfo()); // profile, engine build, state
+```
+
+### TLS and certificates
+
+Certificates and hostnames are always verified. Trust an extra CA (for example a
+private or test CA) with `ca`, a PEM string:
+
+```ts
+import { readFileSync } from 'node:fs';
+
+const client = createClient({ ca: readFileSync('./internal-ca.pem', 'utf8') });
+```
+
+`trustStore: 'bundled'` (default) uses the bundled Mozilla roots; `'chromium'` uses the
+Chromium root store. Chrome profiles also name Chrome's root store anchors in the TLS
+handshake (Trust Anchor IDs), and servers may answer with a chain that ends at one of them,
+so those named Chromium roots are trusted as well.
+
+### Profiles
+
+A profile describes how the client looks on the wire: TLS versions, cipher suites,
+groups and extensions, HTTP/2 settings and pseudo-header order, HTTP/1 header casing and
+default headers. Pick a bundled one by name:
+
+```ts
+createClient(); // 'chrome': the newest bundled Chrome (Chrome 158)
+createClient({ profile: 'chrome158' }); // an exact version
+createClient({ profile: 'neutral' }); // no browser emulation
+```
+
+The Chrome profiles send Chrome's navigation headers. For API traffic, override the
+ones that should differ:
+
+```ts
+const api = createClient({
+  headers: { accept: 'application/json', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' },
+});
+```
+
+Or define your own — see [profiles.md](https://github.com/Deddyne/omreq/blob/main/docs/profiles.md):
+
+```ts
+import { createClient, defineProfile } from 'omreq';
+
+const profile = defineProfile({
+  schemaVersion: 1,
+  id: 'local/my-client',
+  revision: 1,
+  target: { family: 'custom', platform: 'generic' },
+  defaults: 'omreq-transport-v1',
+  requires: [],
+  transport: { httpVersion: 'auto', tls: { minVersion: '1.2', maxVersion: '1.3' } },
+  headers: [['user-agent', 'MyClient/1']],
+});
+
+const client = createClient({ profile });
+```
+
+<!-- source: docs/profiles.md -->
+
+## Profiles
+
+A profile describes how an omreq client presents itself on the wire: the TLS
+ClientHello, HTTP/2 connection settings and header framing, HTTP/1 header layout and
+the default request headers. Profiles are plain data, written in TypeScript or JSON,
+validated against [`profiles/profile-v1.schema.json`](https://github.com/Deddyne/omreq/blob/main/profiles/profile-v1.schema.json)
+and applied by the native engine without rebuilding it.
+
+```ts
+import { createClient, defineProfile } from 'omreq';
+
+const client = createClient({ profile: defineProfile({ /* ... */ }) });
+```
+
+Most code only picks a bundled profile by name:
+
+| Name | Profile |
+| --- | --- |
+| `chrome` | the newest bundled Chrome — the default |
+| `chrome158` | Chrome 158.0.8127.37 on macOS ([`profiles/chrome-158-macos.json`](https://github.com/Deddyne/omreq/blob/main/profiles/chrome-158-macos.json)) |
+| `chrome157` | Chrome 157.0.8103.79 on macOS ([`profiles/chrome-157-macos.json`](https://github.com/Deddyne/omreq/blob/main/profiles/chrome-157-macos.json)) |
+| `neutral` | transport defaults, `user-agent: Omreq/<version>`, `accept: */*` |
+
+```ts
+createClient(); // same as { profile: 'chrome' }
+createClient({ profile: 'neutral' });
+```
+
+The rest of this page is about writing your own profile.
+
+### Why profiles
+
+Servers and CDNs often look at more than the URL and headers. TLS extension order,
+cipher suites, key-share groups, HTTP/2 SETTINGS and pseudo-header order form a
+fingerprint of the client. A profile makes every one of these choices explicit and
+reproducible, so two clients built from the same profile are byte-for-byte identical
+on the wire, and you can describe a new client shape without waiting for a library
+release.
+
+A profile only selects behavior the engine already supports. If a field is valid but
+the engine cannot apply it, the client fails with `ERR_PROFILE_UNSUPPORTED` before
+any connection is made; nothing is silently ignored.
+
+### Structure
+
+```ts
+import { defineProfile } from 'omreq';
+
+export const profile = defineProfile({
+  schemaVersion: 1,
+  id: 'acme/api-client', // any "namespace/name"
+  revision: 3, // bump when the profile changes
+  target: { family: 'custom', platform: 'generic' },
+  defaults: 'omreq-transport-v1', // base every unset field falls back to
+  requires: [], // engine capabilities the profile needs
+
+  transport: {
+    httpVersion: 'auto', // 'auto' (ALPN, plus HTTP/3 when offered), '1.1', '2' or '3'
+
+    tls: {
+      minVersion: '1.2',
+      maxVersion: '1.3',
+      alpn: ['h2', 'http/1.1'],
+      cipherSuites: [
+        'TLS_AES_128_GCM_SHA256',
+        'TLS_AES_256_GCM_SHA384',
+        'TLS_CHACHA20_POLY1305_SHA256',
+        'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
+        'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
+      ],
+      supportedGroups: ['X25519MLKEM768', 'X25519', 'P-256', 'P-384'],
+      signatureAlgorithms: [
+        'ecdsa_secp256r1_sha256',
+        'rsa_pss_rsae_sha256',
+        'rsa_pkcs1_sha256',
+      ],
+      greaseEnabled: true,
+      permuteExtensions: true,
+      sessionTickets: true,
+      certificateCompression: ['brotli'],
+    },
+
+    http2: {
+      initialConnectionWindowSize: 15_728_640,
+      settings: [
+        { name: 'headerTableSize', value: 65_536 },
+        { name: 'enablePush', value: 0 },
+        { name: 'initialWindowSize', value: 6_291_456 },
+        { name: 'maxHeaderListSize', value: 262_144 },
+      ],
+      pseudoHeaderOrder: [':method', ':authority', ':scheme', ':path'],
+      headersPriority: { dependency: 0, weight: 256, exclusive: true },
+      hpackHuffman: 'smaller-only',
+    },
+
+    http1: {
+      headerOrder: ['Host', 'Connection', 'User-Agent', 'Accept', 'Accept-Encoding'],
+      keepAliveHeader: true,
+    },
+  },
+
+  headers: [
+    ['user-agent', 'AcmeClient/3.0'],
+    ['accept', 'application/json'],
+    ['accept-language', 'en-US,en;q=0.9'],
+  ],
+});
+```
+
+#### TLS (`transport.tls`)
+
+| Field | Meaning |
+| --- | --- |
+| `minVersion`, `maxVersion` | `'1.2'` or `'1.3'` |
+| `alpn` | protocols offered, in order |
+| `cipherSuites` | offered suites, in order |
+| `supportedGroups` | key-exchange groups, including post-quantum `X25519MLKEM768` |
+| `signatureAlgorithms` | offered signature schemes, in order |
+| `greaseEnabled`, `greaseSignatureAlgorithms` | GREASE values (RFC 8701) |
+| `permuteExtensions` | randomize extension order per connection |
+| `echGrease` | send a GREASE Encrypted Client Hello |
+| `ocspStapling`, `signedCertificateTimestamps` | request OCSP and SCTs |
+| `sessionTickets`, `preSharedKey` | session resumption |
+| `alps`, `alpsUseNewCodepoint` | ALPS for `h2` and its codepoint |
+| `certificateCompression` | `['brotli']` or `[]` |
+| `renegotiation` | allow TLS 1.2 renegotiation |
+
+#### HTTP/2 (`transport.http2`)
+
+| Field | Meaning |
+| --- | --- |
+| `settings` | SETTINGS frame entries, sent in this exact order |
+| `initialWindowSize`, `initialConnectionWindowSize`, `maxFrameSize` | flow control |
+| `pseudoHeaderOrder` | order of `:method`, `:authority`, `:scheme`, `:path` |
+| `headersPriority` | priority carried on HEADERS frames |
+| `hpackHuffman` | `'always'` or `'smaller-only'` Huffman coding |
+
+#### HTTP/3 (`transport.http3`)
+
+Optional. Without it a profile never uses HTTP/3; with it and `httpVersion: 'auto'`, origins
+that advertise `h3` are reached over QUIC (see [usage.md#http3](https://github.com/Deddyne/omreq/blob/main/docs/usage.md)), and
+`httpVersion: '3'` uses it for every HTTPS request.
+
+| Field | Meaning |
+| --- | --- |
+| `tls` | the ClientHello inside the QUIC Initial packets: `cipherSuites`, `supportedGroups`, `signatureAlgorithms`, `greaseEnabled`, `permuteExtensions`, `echGrease`, `ocspStapling`, `signedCertificateTimestamps`, `alps` (`['h3']`), `alpsUseNewCodepoint`, `certificateCompression`, `trustAnchorIds`; ALPN is always `h3` |
+| `quic.transportParameters` | QUIC transport parameters in wire order: `{ name, value }` for known ones, `googleConnectionOptions` (hex), `versionInformation`, `grease`, `initialSourceConnectionId`, or `{ name: 'custom', id, value }` |
+| `quic.shuffleTransportParameters` | send them in a random order per connection, as Chrome does |
+| `quic.initialDestinationConnectionIdLength`, `quic.connectionIdLength` | connection ID lengths (Chrome: 8 and 0) |
+| `quic.initialPacketSize` | size every Initial datagram is padded to (Chrome: 1250) |
+| `quic.chaosProtection` | Chrome's randomized layout of the ClientHello across Initial packets |
+| `quic.sharedPacketNumbers` | one packet number sequence across all packet number spaces, starting at 1 |
+| `settings` | HTTP/3 SETTINGS in wire order: `qpackMaxTableCapacity`, `maxFieldSectionSize`, `qpackBlockedStreams`, `enableConnectProtocol`, `h3Datagram` |
+| `greaseSetting`, `greaseFrame` | a reserved SETTINGS entry and a reserved frame on the control stream |
+| `pseudoHeaderOrder` | order of `:method`, `:authority`, `:scheme`, `:path` |
+| `priorityUpdate` | send a PRIORITY_UPDATE frame for requests with a non-default `priority` header |
+| `qpackHuffman` | `'always'` or `'smaller-only'` Huffman coding |
+| `cookieCrumbs` | split `cookie` into one field per pair, as Chrome does |
+
+#### HTTP/1 (`transport.http1`)
+
+| Field | Meaning |
+| --- | --- |
+| `headerOrder` | header order and spelling (case is preserved) |
+| `keepAliveHeader` | send `Connection: keep-alive` |
+| `omitDefaultPriority` | drop the profile's `priority` header on HTTP/1 unless a client or request sets it |
+
+#### Headers
+
+`headers` are name/value pairs applied to every request before client and request
+headers. Transport-owned headers (`host`, `connection`, `content-length`,
+`transfer-encoding`, …) and credentials (`cookie`, `authorization`) are rejected in a
+profile.
+
+### JSON profiles
+
+The same object can live in a `.json` file:
+
+```ts
+import { readFileSync } from 'node:fs';
+import { createClient, parseProfile, serializeProfile } from 'omreq';
+
+const profile = parseProfile(readFileSync('./acme.profile.json', 'utf8'));
+const client = createClient({ profile });
+
+// Canonical JSON with sorted keys, suitable for diffs and hashing
+const text = serializeProfile(profile);
+```
+
+### Checking a profile
+
+`checkProfile` validates a profile against the installed engine without any network
+access and returns the normalized configuration the engine will use:
+
+```ts
+import { checkProfile } from 'omreq';
+
+const report = await checkProfile(profile);
+if (!report.compatible) {
+  for (const issue of report.issues) console.error(issue.path, issue.message);
+}
+console.log(report.profileDigest, report.engineBuildId);
+```
+
+`defineProfile` and `parseProfile` throw `ERR_PROFILE_INVALID` for schema errors.
+`createClient` defers native validation to the first request, which then fails with
+`ERR_PROFILE_UNSUPPORTED` if the engine rejects the profile.
+
+### Bundled profiles
+
+```ts
+import { getProfile, listProfiles } from 'omreq';
+
+listProfiles();
+// [{ name: 'chrome157', aliases: […], default: false, … },
+//  { name: 'chrome158', aliases: ['chrome', …], default: true, … },
+//  { name: 'neutral', aliases: ['omreq/custom-default'], default: false, … }]
+
+// Start from a bundled profile and change one thing
+const base = getProfile('chrome');
+const custom = defineProfile({
+  ...structuredClone(base),
+  id: 'acme/chrome-de',
+  headers: base.headers.map(([name, value]) =>
+    name === 'accept-language' ? [name, 'de-DE,de;q=0.9'] : [name, value],
+  ),
+});
+```
+
+Bundled Chrome profiles are compared byte-for-byte with a real Chrome of the same version:
+the TLS ClientHello (GREASE values and permuted extensions normalized), the HTTP/1 request,
+the HTTP/2 connection preface, SETTINGS, WINDOW_UPDATE and first HEADERS frame, and for
+HTTP/3 the decrypted QUIC Initial packets, the control stream and the QPACK field sections. A
+`checkProfile` report and `client.getInfo()` say `verification: 'bundled-verified'` for an
+unmodified bundled profile and `'custom-unverified'` otherwise.
+
+### Adding a new Chrome version
+
+When Chrome updates, install it on a Mac and run:
+
+```bash
+pnpm profile:new
+```
+
+The script drives the installed Chrome against local fixtures (no network), takes
+its request headers, HTTP/2 SETTINGS, window, priority and header order, and writes
+`profiles/chrome-<major>-macos.json` starting from the previous version. It then
+compares the new profile with that Chrome byte for byte: 16 TLS first flights,
+HTTP/2, HTTP/3 and HTTP/1 on Node and Bun, and TLS 1.2/1.3 resumption. On a match the
+captures are saved to `fixtures/references/chrome<major>/` and become regression
+tests, `pnpm generate` registers the name, and `chrome` points to the new version.
+
+If TLS changed, the script stops and names the report to look at. Update
+`transport.tls` by hand, then rerun only the check:
+
+```bash
+pnpm profile:qualify --profile chrome159 --write-references
+```

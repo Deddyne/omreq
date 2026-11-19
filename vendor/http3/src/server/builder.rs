@@ -1,0 +1,181 @@
+//! Builder of HTTP/3 server connections.
+//!
+//! Use this struct to create a new [`Connection`].
+//! Settings for the [`Connection`] can be provided here.
+//!
+//! # Example
+//!
+//! ```rust
+//! fn doc<C,B>(conn: C)
+//! where
+//! C: http3::quic::Connection<B>,
+//! B: bytes::Buf,
+//! {
+//!     let mut server_builder = http3::server::builder();
+//!     // Set the maximum field section size
+//!     server_builder.max_field_section_size(1000);
+//!     // do not send grease types
+//!     server_builder.send_grease(false);
+//!     // Build the Connection
+//!     let mut http3_conn = server_builder.build(conn);
+//! }
+//! ```
+
+use std::{collections::HashSet, result::Result};
+
+use bytes::Buf;
+use tokio::sync::mpsc;
+
+use super::connection::Connection;
+use crate::{
+    config::Config,
+    connection::ConnectionInner,
+    error::ConnectionError,
+    quic::{self},
+};
+
+/// Create a builder of HTTP/3 server connections
+///
+/// This function creates a [`Builder`] that carries settings that can
+/// be shared between server connections.
+pub fn builder() -> Builder {
+    Builder::new()
+}
+
+/// Builder of HTTP/3 server connections.
+pub struct Builder {
+    pub(crate) config: Config,
+}
+
+impl Builder {
+    /// Creates a new [`Builder`] with default settings.
+    pub(super) fn new() -> Self {
+        Builder {
+            config: Default::default(),
+        }
+    }
+
+    // Not public API, just used in unit tests
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn send_settings(&mut self, value: bool) -> &mut Self {
+        self.config.send_settings = value;
+        self
+    }
+
+    /// Sets the largest uncompressed field section this server will accept.
+    ///
+    /// The value is advertised to the client as
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`. Each field contributes its name and
+    /// value lengths plus 32 bytes. By default, the server advertises the
+    /// largest value the setting can encode.
+    ///
+    /// See [RFC 9114 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2.2).
+    pub fn max_field_section_size(&mut self, value: u64) -> &mut Self {
+        self.config.settings.max_field_section_size = value;
+        self
+    }
+
+    /// Limits compressed QPACK input buffered before a field section is decoded.
+    ///
+    /// This is a local memory limit, not an HTTP/3 setting. It applies to an
+    /// encoded HEADERS payload and to one encoded string on the peer's QPACK
+    /// encoder stream. The default is 16 MiB.
+    ///
+    /// See [RFC 9204, Section 7.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.3)
+    /// and [Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).
+    pub fn max_qpack_decode_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.config.qpack_decode_buffer_size = value;
+        self
+    }
+
+    /// Set the QPACK dynamic table capacity the client encoder may use, in bytes.
+    ///
+    /// Sent as `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (0x1). When this is not
+    /// called, the setting is omitted and the protocol default of `0` applies.
+    /// The blocked-stream limit remains `0`, so a client may reference only
+    /// entries the server has already acknowledged.
+    ///
+    /// HTTP/3 encodes this setting as a QUIC variable-length integer. The value
+    /// must also fit the target's address space and the connection's memory
+    /// budget.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2),
+    /// [Section 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3),
+    /// and [Section 5](https://www.rfc-editor.org/rfc/rfc9204.html#section-5).
+    pub fn qpack_max_table_capacity<T: Into<Option<u64>>>(&mut self, value: T) -> &mut Self {
+        self.config.settings.qpack_max_table_capacity = value.into();
+        self
+    }
+
+    /// Send grease values to the Client.
+    /// See [setting](https://www.rfc-editor.org/rfc/rfc9114.html#settings-parameters), [frame](https://www.rfc-editor.org/rfc/rfc9114.html#frame-reserved) and [stream](https://www.rfc-editor.org/rfc/rfc9114.html#stream-grease) for more information.
+    #[inline]
+    pub fn send_grease(&mut self, value: bool) -> &mut Self {
+        self.config.send_grease = value;
+        self
+    }
+
+    /// Indicates to the peer that WebTransport is supported.
+    ///
+    /// See: [establishing a webtransport session](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1)
+    ///
+    ///
+    /// **Server**:
+    /// Supporting for webtransport also requires setting `enable_extended_connect`
+    /// `enable_datagram` and `max_webtransport_sessions`.
+    #[inline]
+    pub fn enable_webtransport(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_webtransport = value;
+        self
+    }
+
+    /// Enables the extended CONNECT protocol required for various HTTP/3 extensions.
+    pub fn enable_extended_connect(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_extended_connect = value;
+        self
+    }
+
+    /// Limits the maximum number of WebTransport sessions
+    pub fn max_webtransport_sessions(&mut self, value: u64) -> &mut Self {
+        self.config.settings.max_webtransport_sessions = value;
+        self
+    }
+
+    /// Indicates that the client or server supports HTTP/3 datagrams
+    ///
+    /// See: <https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1>
+    pub fn enable_datagram(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_datagram = value;
+        self
+    }
+}
+
+impl Builder {
+    /// Build an HTTP/3 connection from a QUIC connection
+    ///
+    /// This method creates a [`Connection`] instance with the settings in the [`Builder`].
+    pub async fn build<C, B>(&self, conn: C) -> Result<Connection<C, B>, ConnectionError>
+    where
+        C: quic::Connection<B>,
+        B: Buf,
+    {
+        let mut inner = ConnectionInner::new(conn, self.config.clone())?;
+        // The server still sends SETTINGS before it accepts requests.
+        inner.send_control_stream_headers().await?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let max_field_section_size = self.config.settings.max_field_section_size;
+        let max_qpack_decode_buffer_size = self.config.qpack_decode_buffer_size;
+        Ok(Connection {
+            inner,
+            max_field_section_size,
+            max_qpack_decode_buffer_size,
+            request_end_send: sender,
+            request_end_recv: receiver,
+            ongoing_streams: HashSet::new(),
+            sent_closing: None,
+            recv_closing: None,
+            last_accepted_stream: None,
+        })
+    }
+}

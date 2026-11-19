@@ -78,7 +78,8 @@
           "enum": [
             "auto",
             "1.1",
-            "2"
+            "2",
+            "3"
           ]
         },
         "tls": {
@@ -475,6 +476,456 @@
             },
             "omitDefaultPriority": {
               "type": "boolean"
+            }
+          }
+        },
+        "http3": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "HTTP/3 over QUIC. Without this block a profile never uses HTTP/3.",
+          "properties": {
+            "tls": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "The TLS 1.3 ClientHello in QUIC Initial packets; ALPN is always h3.",
+              "properties": {
+                "cipherSuites": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 3,
+                  "uniqueItems": true,
+                  "items": {
+                    "enum": [
+                      "TLS_AES_128_GCM_SHA256",
+                      "TLS_AES_256_GCM_SHA384",
+                      "TLS_CHACHA20_POLY1305_SHA256"
+                    ]
+                  }
+                },
+                "signatureAlgorithms": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 64,
+                  "uniqueItems": true,
+                  "items": {
+                    "enum": [
+                      "mldsa44",
+                      "mldsa65",
+                      "mldsa87",
+                      "ecdsa_secp256r1_sha256",
+                      "rsa_pss_rsae_sha256",
+                      "rsa_pkcs1_sha256",
+                      "ecdsa_secp384r1_sha384",
+                      "rsa_pss_rsae_sha384",
+                      "rsa_pkcs1_sha384",
+                      "rsa_pss_rsae_sha512",
+                      "rsa_pkcs1_sha512",
+                      "rsa_pkcs1_sha1"
+                    ]
+                  }
+                },
+                "supportedGroups": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 64,
+                  "uniqueItems": true,
+                  "items": {
+                    "enum": [
+                      "X25519MLKEM768",
+                      "X25519",
+                      "P-256",
+                      "P-384"
+                    ]
+                  }
+                },
+                "greaseEnabled": {
+                  "type": "boolean"
+                },
+                "permuteExtensions": {
+                  "type": "boolean"
+                },
+                "echGrease": {
+                  "type": "boolean"
+                },
+                "ocspStapling": {
+                  "type": "boolean"
+                },
+                "signedCertificateTimestamps": {
+                  "type": "boolean"
+                },
+                "alps": {
+                  "type": "array",
+                  "maxItems": 1,
+                  "items": {
+                    "enum": [
+                      "h3"
+                    ]
+                  }
+                },
+                "alpsUseNewCodepoint": {
+                  "type": "boolean"
+                },
+                "certificateCompression": {
+                  "type": "array",
+                  "maxItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "const": "brotli"
+                  }
+                },
+                "trustAnchorIds": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 510,
+                    "pattern": "^(?:[0-9a-f]{2})+$"
+                  }
+                }
+              }
+            },
+            "quic": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "transportParameters": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 32,
+                  "description": "Transport parameters in wire order. Values are integers, except googleConnectionOptions and custom (hex bytes); initialSourceConnectionId, versionInformation and grease take none.",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name"
+                    ],
+                    "properties": {
+                      "name": {
+                        "enum": [
+                          "maxIdleTimeout",
+                          "maxUdpPayloadSize",
+                          "initialMaxData",
+                          "initialMaxStreamDataBidiLocal",
+                          "initialMaxStreamDataBidiRemote",
+                          "initialMaxStreamDataUni",
+                          "initialMaxStreamsBidi",
+                          "initialMaxStreamsUni",
+                          "maxDatagramFrameSize",
+                          "initialSourceConnectionId",
+                          "versionInformation",
+                          "grease",
+                          "googleConnectionOptions",
+                          "custom"
+                        ]
+                      },
+                      "id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4611686018427387903
+                      },
+                      "value": {
+                        "oneOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 4611686018427387903
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^([0-9a-f]{2}){0,64}$"
+                          }
+                        ]
+                      }
+                    },
+                    "allOf": [
+                      {
+                        "if": {
+                          "properties": {
+                            "name": {
+                              "const": "custom"
+                            }
+                          }
+                        },
+                        "then": {
+                          "required": [
+                            "id",
+                            "value"
+                          ],
+                          "properties": {
+                            "value": {
+                              "type": "string",
+                              "pattern": "^([0-9a-f]{2}){0,64}$"
+                            }
+                          }
+                        },
+                        "else": {
+                          "not": {
+                            "required": [
+                              "id"
+                            ]
+                          }
+                        }
+                      },
+                      {
+                        "if": {
+                          "properties": {
+                            "name": {
+                              "const": "googleConnectionOptions"
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "value": {
+                              "type": "string",
+                              "pattern": "^([0-9a-f]{2}){0,64}$"
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "if": {
+                          "properties": {
+                            "name": {
+                              "enum": [
+                                "maxIdleTimeout",
+                                "maxUdpPayloadSize",
+                                "initialMaxData",
+                                "initialMaxStreamDataBidiLocal",
+                                "initialMaxStreamDataBidiRemote",
+                                "initialMaxStreamDataUni",
+                                "initialMaxStreamsBidi",
+                                "initialMaxStreamsUni",
+                                "maxDatagramFrameSize"
+                              ]
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "value": {
+                              "type": "integer"
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "if": {
+                          "properties": {
+                            "name": {
+                              "const": "maxIdleTimeout"
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "value": {
+                              "maximum": 600000
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "if": {
+                          "properties": {
+                            "name": {
+                              "const": "maxUdpPayloadSize"
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "value": {
+                              "minimum": 1200,
+                              "maximum": 65527
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "if": {
+                          "properties": {
+                            "name": {
+                              "enum": [
+                                "initialMaxStreamsBidi",
+                                "initialMaxStreamsUni"
+                              ]
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "value": {
+                              "maximum": 1152921504606846976
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "if": {
+                          "properties": {
+                            "name": {
+                              "const": "maxDatagramFrameSize"
+                            }
+                          }
+                        },
+                        "then": {
+                          "properties": {
+                            "value": {
+                              "maximum": 4294967295
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "shuffleTransportParameters": {
+                  "type": "boolean"
+                },
+                "initialDestinationConnectionIdLength": {
+                  "type": "integer",
+                  "minimum": 8,
+                  "maximum": 20
+                },
+                "connectionIdLength": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 20
+                },
+                "initialPacketSize": {
+                  "type": "integer",
+                  "minimum": 1200,
+                  "maximum": 1452
+                },
+                "chaosProtection": {
+                  "type": "boolean"
+                },
+                "sharedPacketNumbers": {
+                  "type": "boolean",
+                  "description": "Number packets of every packet number space from one sequence starting at 1, as Chromium does."
+                }
+              }
+            },
+            "settings": {
+              "type": "array",
+              "maxItems": 16,
+              "description": "SETTINGS in wire order.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "name",
+                  "value"
+                ],
+                "properties": {
+                  "name": {
+                    "enum": [
+                      "qpackMaxTableCapacity",
+                      "maxFieldSectionSize",
+                      "qpackBlockedStreams",
+                      "enableConnectProtocol",
+                      "h3Datagram"
+                    ]
+                  },
+                  "value": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4611686018427387903
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "name": {
+                          "const": "qpackMaxTableCapacity"
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "value": {
+                          "maximum": 1048576
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "name": {
+                          "const": "qpackBlockedStreams"
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "value": {
+                          "maximum": 1000
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "name": {
+                          "enum": [
+                            "enableConnectProtocol",
+                            "h3Datagram"
+                          ]
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "value": {
+                          "maximum": 1
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "greaseSetting": {
+              "type": "boolean",
+              "description": "A reserved setting with a random value after the listed ones."
+            },
+            "greaseFrame": {
+              "type": "boolean",
+              "description": "A reserved frame after SETTINGS on the control stream."
+            },
+            "pseudoHeaderOrder": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  ":method",
+                  ":authority",
+                  ":scheme",
+                  ":path"
+                ]
+              }
+            },
+            "priorityUpdate": {
+              "type": "boolean",
+              "description": "Announce a non-default request priority in a PRIORITY_UPDATE frame."
+            },
+            "qpackHuffman": {
+              "enum": [
+                "always",
+                "smaller-only"
+              ]
+            },
+            "cookieCrumbs": {
+              "type": "boolean",
+              "description": "Send each cookie as its own field line."
             }
           }
         }

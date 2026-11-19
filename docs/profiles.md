@@ -55,7 +55,7 @@ export const profile = defineProfile({
   requires: [], // engine capabilities the profile needs
 
   transport: {
-    httpVersion: 'auto', // 'auto' (ALPN), '1.1' or '2'
+    httpVersion: 'auto', // 'auto' (ALPN, plus HTTP/3 when offered), '1.1', '2' or '3'
 
     tls: {
       minVersion: '1.2',
@@ -135,6 +135,28 @@ export const profile = defineProfile({
 | `headersPriority` | priority carried on HEADERS frames |
 | `hpackHuffman` | `'always'` or `'smaller-only'` Huffman coding |
 
+### HTTP/3 (`transport.http3`)
+
+Optional. Without it a profile never uses HTTP/3; with it and `httpVersion: 'auto'`, origins
+that advertise `h3` are reached over QUIC (see [usage.md#http3](usage.md#http3)), and
+`httpVersion: '3'` uses it for every HTTPS request.
+
+| Field | Meaning |
+| --- | --- |
+| `tls` | the ClientHello inside the QUIC Initial packets: `cipherSuites`, `supportedGroups`, `signatureAlgorithms`, `greaseEnabled`, `permuteExtensions`, `echGrease`, `ocspStapling`, `signedCertificateTimestamps`, `alps` (`['h3']`), `alpsUseNewCodepoint`, `certificateCompression`, `trustAnchorIds`; ALPN is always `h3` |
+| `quic.transportParameters` | QUIC transport parameters in wire order: `{ name, value }` for known ones, `googleConnectionOptions` (hex), `versionInformation`, `grease`, `initialSourceConnectionId`, or `{ name: 'custom', id, value }` |
+| `quic.shuffleTransportParameters` | send them in a random order per connection, as Chrome does |
+| `quic.initialDestinationConnectionIdLength`, `quic.connectionIdLength` | connection ID lengths (Chrome: 8 and 0) |
+| `quic.initialPacketSize` | size every Initial datagram is padded to (Chrome: 1250) |
+| `quic.chaosProtection` | Chrome's randomized layout of the ClientHello across Initial packets |
+| `quic.sharedPacketNumbers` | one packet number sequence across all packet number spaces, starting at 1 |
+| `settings` | HTTP/3 SETTINGS in wire order: `qpackMaxTableCapacity`, `maxFieldSectionSize`, `qpackBlockedStreams`, `enableConnectProtocol`, `h3Datagram` |
+| `greaseSetting`, `greaseFrame` | a reserved SETTINGS entry and a reserved frame on the control stream |
+| `pseudoHeaderOrder` | order of `:method`, `:authority`, `:scheme`, `:path` |
+| `priorityUpdate` | send a PRIORITY_UPDATE frame for requests with a non-default `priority` header |
+| `qpackHuffman` | `'always'` or `'smaller-only'` Huffman coding |
+| `cookieCrumbs` | split `cookie` into one field per pair, as Chrome does |
+
 ### HTTP/1 (`transport.http1`)
 
 | Field | Meaning |
@@ -206,8 +228,9 @@ const custom = defineProfile({
 ```
 
 Bundled Chrome profiles are compared byte-for-byte with a real Chrome of the same version:
-the TLS ClientHello (GREASE values and permuted extensions normalized), the HTTP/1 request
-and the HTTP/2 connection preface, SETTINGS, WINDOW_UPDATE and first HEADERS frame. A
+the TLS ClientHello (GREASE values and permuted extensions normalized), the HTTP/1 request,
+the HTTP/2 connection preface, SETTINGS, WINDOW_UPDATE and first HEADERS frame, and for
+HTTP/3 the decrypted QUIC Initial packets, the control stream and the QPACK field sections. A
 `checkProfile` report and `client.getInfo()` say `verification: 'bundled-verified'` for an
 unmodified bundled profile and `'custom-unverified'` otherwise.
 
@@ -223,7 +246,7 @@ The script drives the installed Chrome against local fixtures (no network), take
 its request headers, HTTP/2 SETTINGS, window, priority and header order, and writes
 `profiles/chrome-<major>-macos.json` starting from the previous version. It then
 compares the new profile with that Chrome byte for byte: 16 TLS first flights,
-HTTP/2 and HTTP/1 on Node and Bun, and TLS 1.2/1.3 resumption. On a match the
+HTTP/2, HTTP/3 and HTTP/1 on Node and Bun, and TLS 1.2/1.3 resumption. On a match the
 captures are saved to `fixtures/references/chrome<major>/` and become regression
 tests, `pnpm generate` registers the name, and `chrome` points to the new version.
 

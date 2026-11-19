@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
 export async function runProfileClient(
   runtime,
-  { profile, ca, url, paths = ['/probe', '/probe?reuse=1'] },
+  { profile, ca, url, paths = ['/probe', '/probe?reuse=1'], options = {} },
 ) {
   const entry = new URL('../packages/omreq/dist/index.mjs', import.meta.url).href;
   const code = `import {createClient,getRuntimeInfo} from ${JSON.stringify(entry)};
-const c=createClient(${JSON.stringify({ profile, ca, trustStore: 'chromium' })});const versions=[];const lengths=[];
+const c=createClient(${JSON.stringify({ profile, ca, trustStore: 'chromium', ...options })});const versions=[];const lengths=[];
 try{for(const path of ${JSON.stringify(paths)}){const r=await c.get(${JSON.stringify(url)}+path);versions.push(r.httpVersion);lengths.push((await r.bytes()).length);}}finally{await c.close();}
 console.log(JSON.stringify({runtime:getRuntimeInfo(),info:c.getInfo(),versions,lengths,stats:c.getStats()}));`;
   return await new Promise((resolve, reject) => {
