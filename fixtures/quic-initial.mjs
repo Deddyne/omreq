@@ -270,9 +270,8 @@ export function normalizedQuicInitial(datagrams) {
           : null,
       pings: initials.every((p) => p.frames.some((f) => f.type === 'ping')),
       splitCrypto: crypto.length > flight.length,
-      spreadPadding: initials.every(
-        (p) => p.frames.filter((f) => f.type === 'padding').length > 1 || p.frames.length < 3,
-      ),
+      // Where SpreadPadding puts padding is random: one draw may take all of it, leaving a
+      // single run, in Chrome as here. The layout itself is tested in quic-proto's chaos.rs.
     },
     clientHello: normalized,
   };
