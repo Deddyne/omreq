@@ -361,6 +361,51 @@ const client = createClient({
 });
 ```
 
+## HTTP/3
+
+Chrome profiles also describe Chrome's HTTP/3 connection: the QUIC Initial packets, transport
+parameters, HTTP/3 SETTINGS and QPACK header encoding. As in Chrome, a client switches to
+HTTP/3 when the server offers it:
+
+- after a response carries `Alt-Svc: h3=":443"`, later requests to that origin use QUIC;
+- before the first request to a host on port 443, a DNS HTTPS record (RFC 9460) that lists
+  `h3` is enough. It is asked from the system's name servers (`/etc/resolv.conf`); on
+  Windows only Alt-Svc is used.
+
+```ts
+const res = await client.get('https://www.example.com/');
+console.log(res.httpVersion); // '3' when the origin offers HTTP/3, else '2' or '1.1'
+console.log(client.getStats().http3Connections);
+```
+
+When the QUIC handshake fails, or takes longer than 3 seconds (UDP blocked on the network),
+the request goes over TCP instead and the origin stays on TCP for five minutes. The same
+happens when the QUIC connection fails, or the server rejects the request, before the response
+headers arrive: the request is sent again over TCP, unless its body is a stream that cannot be
+replayed. HTTP/3 needs direct UDP, so a client with a `proxy` always uses TCP. `http3: false`
+turns it off:
+
+```ts
+createClient({ http3: false }); // TCP only: HTTP/2 or HTTP/1.1 via ALPN
+```
+
+To require HTTP/3 for every HTTPS request, with no TCP fallback, set the profile's
+`httpVersion` to `'3'`. A failed handshake then rejects the request; plain `http://` URLs and
+proxies are rejected.
+
+```ts
+import { createClient, defineProfile, getProfile } from 'omreq';
+
+const base = structuredClone(getProfile('chrome'));
+const h3 = createClient({
+  profile: defineProfile({
+    ...base,
+    id: 'local/chrome-h3',
+    transport: { ...base.transport, httpVersion: '3' },
+  }),
+});
+```
+
 ## Limits and statistics
 
 All limits are enforced natively and can be tuned per client:
@@ -384,6 +429,7 @@ Admission is fair across origins (round-robin) and FIFO within one origin.
 ```ts
 const stats = client.getStats();
 console.log(stats.activeOperations, stats.queuedOperations, stats.connections);
+console.log(stats.http3Connections); // open QUIC connections
 console.log(stats.origins); // per-origin active and waiting counts
 console.log(client.getInfo()); // profile, engine build, state
 ```
@@ -400,7 +446,9 @@ const client = createClient({ ca: readFileSync('./internal-ca.pem', 'utf8') });
 ```
 
 `trustStore: 'bundled'` (default) uses the bundled Mozilla roots; `'chromium'` uses the
-Chromium root store.
+Chromium root store. Chrome profiles also name Chrome's root store anchors in the TLS
+handshake (Trust Anchor IDs), and servers may answer with a chain that ends at one of them,
+so those named Chromium roots are trusted as well.
 
 ## Profiles
 

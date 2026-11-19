@@ -1,0 +1,64 @@
+--- a/src/qpack/decoder.rs
++++ b/src/qpack/decoder.rs
+@@ -125,7 +125,7 @@
+ ///
+ /// See [RFC 9204, Section 4.5.1.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub(crate) struct FieldSectionPrefix {
++pub struct FieldSectionPrefix {
+     required_ref: usize,
+     base: usize,
+ }
+@@ -151,7 +151,7 @@
+ }
+ 
+ impl Decoder {
+-    pub(crate) fn new(
++    pub fn new(
+         max_table_capacity: u64,
+         max_blocked_streams: u64,
+     ) -> Result<Self, DecoderError> {
+@@ -175,7 +175,7 @@
+     /// decoder waits for or copies the payload.
+     ///
+     /// See [RFC 9204, Section 7.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.4).
+-    pub(crate) fn set_max_encoded_string_size(&mut self, max_encoded_string_size: usize) {
++    pub fn set_max_encoded_string_size(&mut self, max_encoded_string_size: usize) {
+         self.max_encoded_string_size = max_encoded_string_size;
+     }
+ 
+@@ -214,7 +214,7 @@
+         self.decode_header_limited(buf, u64::MAX, &mut None)
+     }
+ 
+-    pub(crate) fn decode_header_limited<T: Buf>(
++    pub fn decode_header_limited<T: Buf>(
+         &self,
+         buf: &mut T,
+         max_size: u64,
+@@ -272,7 +272,7 @@
+     /// incomplete part available for the next receive chunk.
+     ///
+     /// See [RFC 9204, Section 4.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.3).
+-    pub(crate) fn on_encoder_recv_buffered<R: Buf + Clone, W: BufMut>(
++    pub fn on_encoder_recv_buffered<R: Buf + Clone, W: BufMut>(
+         &mut self,
+         read: &mut R,
+         write: &mut W,
+--- a/src/qpack/mod.rs
++++ b/src/qpack/mod.rs
+@@ -16,12 +16,12 @@
+ #[cfg(test)]
+ pub(crate) use self::stream::{DynamicTableSizeUpdate, InsertCountIncrement, InsertWithoutNameRef};
+ pub use self::{
+-    decoder::{Decoded, Decoder, DecoderError, ack_header, stream_canceled},
++    decoder::{Decoded, Decoder, DecoderError, FieldSectionPrefix, ack_header, stream_canceled},
+     encoder::{EncoderError, encode_stateless},
+     field::HeaderField,
+ };
+ pub(crate) use self::{
+-    decoder::{FieldSectionPrefix, decode_stateless_limited},
++    decoder::decode_stateless_limited,
+     encoder::Encoder,
+ };
+ use crate::quic::StreamId;

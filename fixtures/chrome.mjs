@@ -3,7 +3,12 @@ import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-export async function launchReferenceChrome({ spki, headless = true, language = 'en-US,en' } = {}) {
+export async function launchReferenceChrome({
+  spki,
+  headless = true,
+  language = 'en-US,en',
+  extraArgs = [],
+} = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'omreq-reference-cdp-'));
   const child = spawn(
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -21,6 +26,7 @@ export async function launchReferenceChrome({ spki, headless = true, language = 
       '--disable-sync',
       ...(spki ? [`--ignore-certificate-errors-spki-list=${spki}`] : []),
       `--user-data-dir=${dir}`,
+      ...extraArgs,
       'about:blank',
     ],
     { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], detached: true },

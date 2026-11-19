@@ -1,0 +1,1421 @@
+use std::{
+    borrow::Cow,
+    convert::TryFrom,
+    fmt,
+    iter::{IntoIterator, Iterator},
+    str::FromStr,
+};
+
+use http::{
+    Extensions, HeaderMap, Method, StatusCode,
+    header::{self, HeaderName, HeaderValue},
+    uri::{self, Authority, Parts, PathAndQuery, Scheme, Uri},
+};
+use smallvec::SmallVec;
+
+use crate::{ext::Protocol, qpack::HeaderField};
+
+define_enum_with_values! {
+    /// Represents the order of HTTP/3 pseudo-header fields in the header block.
+    ///
+    /// HTTP/3 pseudo-header fields are a set of predefined header fields that start with ':'.
+    /// The order of these fields in a header block is significant for fingerprinting purposes.
+    /// This enum defines the possible pseudo-header fields and their default order.
+    @U8
+    pub enum PseudoId {
+        /// The `:method` pseudo-header field.
+        Method => 0x0001,
+        /// The `:scheme` pseudo-header field.
+        Scheme => 0x0002,
+        /// The `:authority` pseudo-header field.
+        Authority => 0x0003,
+        /// The `:path` pseudo-header field.
+        Path => 0x0004,
+        /// The `:protocol` pseudo-header field.
+        Protocol => 0x0005,
+        /// The `:status` pseudo-header field.
+        Status => 0x0006,
+    }
+}
+
+/// Represents the order of HTTP/3 pseudo-header fields in a header block.
+///
+/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`,
+/// etc.) for use when encoding HTTP/3 header blocks. The order of pseudo-headers can be configured
+/// to match specific browser fingerprints (e.g. Chrome uses "masp" = Method, Authority, Scheme,
+/// Path; Firefox uses "msap" = Method, Scheme, Authority, Path).
+///
+/// Typically, a `PseudoOrder` is constructed using the [`PseudoOrderBuilder`] to enforce uniqueness
+/// and correct ordering.
+/// Apply it with [`crate::client::Builder::pseudo_order`] to configure all requests
+/// on a connection. Storing this value in request extensions has no effect.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct PseudoOrder {
+    ids: [PseudoId; PseudoId::DEFAULT_STACK_SIZE],
+}
+
+/// A builder for constructing a [`PseudoOrder`].
+#[derive(Debug)]
+pub struct PseudoOrderBuilder {
+    ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
+    mask: u8,
+}
+
+/// Preserves QPACK's never-indexed marker for pseudo-header fields.
+///
+/// Decoded regular fields carry this information through
+/// [`HeaderValue::is_sensitive`]. Pseudo-header fields have no corresponding
+/// `HeaderValue`, so this value is stored in [`http::Extensions`] when a
+/// request or response is received and read again when it is forwarded.
+///
+/// See [RFC 9204 Section 7.1.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-7.1.3).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PseudoHeaderSensitivity {
+    mask: u8,
+}
+
+impl PseudoHeaderSensitivity {
+    /// Marks a pseudo-header field as sensitive or non-sensitive.
+    pub fn set_sensitive(&mut self, id: PseudoId, sensitive: bool) {
+        if sensitive {
+            self.mask |= id.mask_id();
+        } else {
+            self.mask &= !id.mask_id();
+        }
+    }
+
+    /// Returns whether the pseudo-header field must remain never-indexed.
+    pub fn is_sensitive(&self, id: PseudoId) -> bool {
+        self.mask & id.mask_id() != 0
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.mask == 0
+    }
+}
+
+// ===== impl PseudoOrder =====
+
+impl PseudoOrder {
+    /// Creates a new [`PseudoOrderBuilder`].
+    #[inline]
+    pub fn builder() -> PseudoOrderBuilder {
+        PseudoOrderBuilder {
+            ids: SmallVec::new(),
+            mask: 0,
+        }
+    }
+}
+
+impl Default for PseudoOrder {
+    #[inline]
+    fn default() -> Self {
+        PseudoOrder {
+            ids: PseudoId::DEFAULT_IDS,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a PseudoOrder {
+    type Item = &'a PseudoId;
+    type IntoIter = std::slice::Iter<'a, PseudoId>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.ids.iter()
+    }
+}
+
+// ===== impl PseudoOrderBuilder =====
+
+impl PseudoOrderBuilder {
+    /// Pushes a pseudo-header ID to the order, ignoring duplicates.
+    pub fn push(mut self, id: PseudoId) -> Self {
+        let mask_id = id.mask_id();
+        if mask_id != 0 && self.mask & mask_id == 0 {
+            self.mask |= mask_id;
+            self.ids.push(id);
+        }
+        self
+    }
+
+    /// Extends the order with multiple pseudo-header IDs.
+    pub fn extend(mut self, iter: impl IntoIterator<Item = PseudoId>) -> Self {
+        for id in iter {
+            self = self.push(id);
+        }
+        self
+    }
+
+    /// Builds the [`PseudoOrder`], filling in any missing IDs from the default order.
+    pub fn build(mut self) -> PseudoOrder {
+        if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
+            self = self.extend(PseudoId::DEFAULT_IDS);
+        }
+
+        let mut ids = PseudoId::DEFAULT_IDS;
+        for (target, source) in ids.iter_mut().zip(self.ids) {
+            *target = source;
+        }
+        PseudoOrder { ids }
+    }
+}
+
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Clone))]
+pub struct Header {
+    pseudo: Pseudo,
+    fields: HeaderMap,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl Header {
+    /// Creates a new `Header` frame data suitable for sending a request
+    pub fn request(
+        method: Method,
+        uri: Uri,
+        fields: HeaderMap,
+        ext: Extensions,
+    ) -> Result<Self, HeaderError> {
+        match (uri.authority(), fields.get(header::HOST)) {
+            (None, None) => Err(HeaderError::MissingAuthority),
+            (Some(a), Some(h)) if a.as_str() != h => Err(HeaderError::ContradictedAuthority),
+            _ => Ok(Self {
+                pseudo: Pseudo::request(method, uri, ext),
+                fields,
+            }),
+        }
+    }
+
+    pub fn response(status: StatusCode, fields: HeaderMap, ext: Extensions) -> Self {
+        Self {
+            pseudo: Pseudo::response(status, ext),
+            fields,
+        }
+    }
+
+    pub fn trailer(fields: HeaderMap) -> Self {
+        Self {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+            //# Pseudo-header fields MUST NOT appear in trailer
+            //# sections.
+            pseudo: Pseudo::default(),
+            fields,
+        }
+    }
+
+    /// Extracts request parts, rejecting response pseudo-fields and invalid
+    /// request components. Protocol negotiation remains the caller's concern.
+    /// See [RFC 9114 Section 4.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3).
+    pub fn into_request_parts(
+        self,
+    ) -> Result<
+        (
+            Method,
+            Uri,
+            Option<Protocol>,
+            HeaderMap,
+            PseudoHeaderSensitivity,
+        ),
+        HeaderError,
+    > {
+        if self.pseudo.status.is_some() {
+            return Err(HeaderError::UnexpectedPseudo);
+        }
+        let mut uri = Uri::builder();
+
+        if let Some(path) = self.pseudo.path {
+            uri = uri.path_and_query(path.as_str().as_bytes());
+        }
+
+        if let Some(scheme) = self.pseudo.scheme {
+            uri = uri.scheme(scheme.as_str().as_bytes());
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //# If the :scheme pseudo-header field identifies a scheme that has a
+        //# mandatory authority component (including "http" and "https"), the
+        //# request MUST contain either an :authority pseudo-header field or a
+        //# Host header field.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=TODO
+        //# If the scheme does not have a mandatory authority component and none
+        //# is provided in the request target, the request MUST NOT contain the
+        //# :authority pseudo-header or Host header fields.
+        match (self.pseudo.authority, self.fields.get(header::HOST)) {
+            (None, None) => return Err(HeaderError::MissingAuthority),
+            (Some(a), None) => uri = uri.authority(a.as_str().as_bytes()),
+            (None, Some(h)) => uri = uri.authority(h.as_bytes()),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+            //# If both fields are present, they MUST contain the same value.
+            (Some(a), Some(h)) if a.as_str() != h => {
+                return Err(HeaderError::ContradictedAuthority);
+            }
+            (Some(_), Some(h)) => uri = uri.authority(h.as_bytes()),
+        }
+
+        Ok((
+            self.pseudo.method.ok_or(HeaderError::MissingMethod)?,
+            // When empty host field is built into an uri it fails
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+            //# If these fields are present, they MUST NOT be
+            //# empty.
+            uri.build().map_err(HeaderError::InvalidRequest)?,
+            self.pseudo.protocol,
+            self.fields,
+            PseudoHeaderSensitivity {
+                mask: self.pseudo.sensitive,
+            },
+        ))
+    }
+
+    /// Extracts response parts, requiring a status and rejecting request pseudo-fields.
+    /// See [RFC 9114 Section 4.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3).
+    pub fn into_response_parts(
+        self,
+    ) -> Result<(StatusCode, HeaderMap, PseudoHeaderSensitivity), HeaderError> {
+        if self.fields.contains_key(header::TE) {
+            return Err(HeaderError::invalid_name("te"));
+        }
+        if self.pseudo.method.is_some()
+            || self.pseudo.scheme.is_some()
+            || self.pseudo.authority.is_some()
+            || self.pseudo.path.is_some()
+            || self.pseudo.protocol.is_some()
+        {
+            return Err(HeaderError::UnexpectedPseudo);
+        }
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.2
+        //= type=implication
+        //# For responses, a single ":status" pseudo-header field is defined that
+        //# carries the HTTP status code; see Section 15 of [HTTP].  This pseudo-
+        //# header field MUST be included in all responses; otherwise, the
+        //# response is malformed (see Section 4.1.2).
+        Ok((
+            self.pseudo.status.ok_or(HeaderError::MissingStatus)?,
+            self.fields,
+            PseudoHeaderSensitivity {
+                mask: self.pseudo.sensitive,
+            },
+        ))
+    }
+
+    /// Extracts trailers, rejecting every pseudo-header field.
+    ///
+    /// Unlike initial request/response headers, trailers have no message-control
+    /// fields. See [RFC 9114 Section 4.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3).
+    pub fn into_trailers(self) -> Result<HeaderMap, HeaderError> {
+        if self.fields.contains_key(header::TE) {
+            return Err(HeaderError::invalid_name("te"));
+        }
+        if self.pseudo.len != 0 {
+            return Err(HeaderError::UnexpectedPseudo);
+        }
+        Ok(self.fields)
+    }
+
+    pub fn len(&self) -> usize {
+        self.pseudo.len() + self.fields.len()
+    }
+
+    pub fn size(&self) -> usize {
+        self.pseudo.len() + self.fields.len()
+    }
+
+    /// Sets the pseudo-header field order for this header block.
+    pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
+        self.pseudo.order = Some(order);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authory_mut(&mut self) -> &mut Option<Authority> {
+        &mut self.pseudo.authority
+    }
+}
+
+impl<'a> IntoIterator for &'a Header {
+    type Item = HeaderField<'a>;
+    type IntoIter = HeaderIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        HeaderIter {
+            pseudo: &self.pseudo,
+            pseudo_order_index: 0,
+            fields: self.fields.iter(),
+        }
+    }
+}
+
+pub struct HeaderIter<'a> {
+    pseudo: &'a Pseudo,
+    pseudo_order_index: usize,
+    fields: header::Iter<'a, HeaderValue>,
+}
+
+impl<'a> Iterator for HeaderIter<'a> {
+    type Item = HeaderField<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Pseudo-header fields always precede regular fields. Missing fields
+        // are skipped so the same order works for requests and responses.
+        while self.pseudo_order_index < PseudoId::DEFAULT_STACK_SIZE {
+            let index = self.pseudo_order_index;
+            self.pseudo_order_index += 1;
+            let id = self
+                .pseudo
+                .order
+                .as_ref()
+                .map_or(PseudoId::DEFAULT_IDS[index], |order| order.ids[index]);
+            if let Some(field) = self.pseudo.field_ref(id) {
+                return Some(field);
+            }
+        }
+
+        self.fields.next().map(|(name, value)| {
+            HeaderField::borrowed(
+                name.as_str().as_bytes(),
+                value.as_bytes(),
+                value.is_sensitive(),
+            )
+        })
+    }
+}
+
+impl TryFrom<Vec<HeaderField<'static>>> for Header {
+    type Error = HeaderError;
+    fn try_from(headers: Vec<HeaderField<'static>>) -> Result<Self, Self::Error> {
+        // The decoded field count is peer-controlled, and a valid QPACK block
+        // can exceed HeaderMap's capacity even within the compressed-size limit.
+        let mut fields =
+            HeaderMap::try_with_capacity(headers.len()).map_err(|_| HeaderError::TooManyFields)?;
+        let mut pseudo = Pseudo::default();
+        let mut seen = 0_u8;
+
+        for field in headers.into_iter() {
+            let sensitive = field.is_sensitive();
+            let (name, value) = field.into_inner();
+            let field = Field::parse(name, value)?;
+            if let Some(id) = field.pseudo_id() {
+                // A HeaderMap cannot retain wire order or duplicate pseudo
+                // fields. Validate before inserting either kind of field.
+                // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+                //# Any request or response that contains a
+                //# pseudo-header field that appears in a header section after a regular
+                //# header field MUST be treated as malformed.
+                if !fields.is_empty() {
+                    return Err(HeaderError::PseudoAfterField);
+                }
+                if seen & id.mask_id() != 0 {
+                    return Err(HeaderError::DuplicatePseudo);
+                }
+                seen |= id.mask_id();
+            }
+            match field {
+                Field::Method(m) => {
+                    pseudo.method = Some(m);
+                    pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Method, sensitive);
+                }
+                Field::Scheme(s) => {
+                    pseudo.scheme = Some(s);
+                    pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Scheme, sensitive);
+                }
+                Field::Authority(a) => {
+                    pseudo.authority = Some(a);
+                    pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Authority, sensitive);
+                }
+                Field::Path(p) => {
+                    pseudo.path = Some(p);
+                    pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Path, sensitive);
+                }
+                Field::Status(s) => {
+                    pseudo.status = Some(s);
+                    pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Status, sensitive);
+                }
+                Field::Header((n, mut v)) => {
+                    v.set_sensitive(sensitive);
+                    fields
+                        .try_append(n, v)
+                        .map_err(|_| HeaderError::TooManyFields)?;
+                }
+                Field::Protocol(p) => {
+                    pseudo.protocol = Some(p);
+                    pseudo.len += 1;
+                    pseudo.set_sensitive(PseudoId::Protocol, sensitive);
+                }
+            }
+        }
+
+        Ok(Header { pseudo, fields })
+    }
+}
+
+enum Field {
+    Method(Method),
+    Scheme(Scheme),
+    Authority(Authority),
+    Path(PathAndQuery),
+    Status(StatusCode),
+    Protocol(Protocol),
+    Header((HeaderName, HeaderValue)),
+}
+
+impl Field {
+    /// Identifies message-control fields before their wire order is lost.
+    fn pseudo_id(&self) -> Option<PseudoId> {
+        match self {
+            Self::Method(_) => Some(PseudoId::Method),
+            Self::Scheme(_) => Some(PseudoId::Scheme),
+            Self::Authority(_) => Some(PseudoId::Authority),
+            Self::Path(_) => Some(PseudoId::Path),
+            Self::Status(_) => Some(PseudoId::Status),
+            Self::Protocol(_) => Some(PseudoId::Protocol),
+            Self::Header(_) => None,
+        }
+    }
+
+    fn parse(name: Cow<'static, [u8]>, value: Cow<'static, [u8]>) -> Result<Self, HeaderError> {
+        let name = name.as_ref();
+        if name.is_empty() {
+            return Err(HeaderError::InvalidHeaderName("name is empty".into()));
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
+        //# Requests or responses containing invalid field names MUST be treated
+        //# as malformed.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
+        //# Any request or response that contains a
+        //# character not permitted in a field value MUST be treated as
+        //# malformed.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
+        //= type=implication
+        //# A request or
+        //# response containing uppercase characters in field names MUST be
+        //# treated as malformed.
+
+        if name[0] != b':' {
+            // Connection-specific fields are malformed in HTTP/3. TE is
+            // restricted further by the request/response/trailer context.
+            // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2
+            if matches!(
+                name,
+                b"connection"
+                    | b"proxy-connection"
+                    | b"keep-alive"
+                    | b"transfer-encoding"
+                    | b"upgrade"
+            ) {
+                return Err(HeaderError::invalid_name(name));
+            }
+            if name == b"te" && !value.as_ref().eq_ignore_ascii_case(b"trailers") {
+                return Err(HeaderError::invalid_value(name, value));
+            }
+            let value = match value {
+                Cow::Borrowed(value) => bytes::Bytes::from_static(value),
+                Cow::Owned(value) => bytes::Bytes::from(value),
+            };
+            // The constructor validates and consumes the bytes, so its error
+            // stands in for the value rather than cloning every valid one.
+            return Ok(Field::Header((
+                HeaderName::from_lowercase(name).map_err(|_| HeaderError::invalid_name(name))?,
+                HeaderValue::from_maybe_shared(value)
+                    .map_err(|error| HeaderError::invalid_value_from(name, error))?,
+            )));
+        }
+
+        Ok(match name {
+            b":scheme" => Field::Scheme(try_value(name, value)?),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+            //# If these fields are present, they MUST NOT be
+            //# empty.
+            b":authority" => Field::Authority(try_value(name, value)?),
+            b":path" => Field::Path(try_value(name, value)?),
+            b":method" => Field::Method(
+                Method::from_bytes(value.as_ref())
+                    .map_err(|_| HeaderError::invalid_value(name, value))?,
+            ),
+            b":status" => Field::Status(
+                StatusCode::from_bytes(value.as_ref())
+                    .map_err(|_| HeaderError::invalid_value(name, value))?,
+            ),
+            b":protocol" => Field::Protocol(try_value(name, value)?),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+            //# Endpoints MUST treat a request or response that contains
+            //# undefined or invalid pseudo-header fields as malformed.
+            _ => return Err(HeaderError::invalid_name(name)),
+        })
+    }
+}
+
+fn try_value<N, V, R>(name: N, value: V) -> Result<R, HeaderError>
+where
+    N: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+    R: FromStr,
+{
+    let (name, value) = (name.as_ref(), value.as_ref());
+    let s = std::str::from_utf8(value).map_err(|_| HeaderError::invalid_value(name, value))?;
+    R::from_str(s).map_err(|_| HeaderError::invalid_value(name, value))
+}
+
+/// Pseudo-header fields have the same purpose as data from the first line of HTTP/1.X,
+/// but are conveyed along with other headers. For example ':method' and ':path' in a
+/// request, and ':status' in a response. They must be placed before all other fields,
+/// start with ':', and be lowercase.
+/// See RFC7540 section 8.1.2.1. for more details.
+#[derive(Debug, Default)]
+#[cfg_attr(test, derive(PartialEq, Clone))]
+struct Pseudo {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+    //= type=implication
+    //# Endpoints MUST NOT
+    //# generate pseudo-header fields other than those defined in this
+    //# document.
+
+    // Request
+    method: Option<Method>,
+    scheme: Option<Scheme>,
+    authority: Option<Authority>,
+    path: Option<PathAndQuery>,
+
+    // Response
+    status: Option<StatusCode>,
+
+    protocol: Option<Protocol>,
+
+    // Pseudo-header field order
+    order: Option<PseudoOrder>,
+
+    // QPACK never-indexed bits for pseudo-header fields. Regular fields carry
+    // the same metadata through `HeaderValue::is_sensitive`.
+    sensitive: u8,
+
+    len: usize,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl Pseudo {
+    fn request(method: Method, uri: Uri, ext: Extensions) -> Self {
+        let Parts {
+            scheme,
+            authority,
+            path_and_query,
+            ..
+        } = uri::Parts::from(uri);
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=implication
+        //# This pseudo-header field MUST NOT be empty for "http" or "https"
+        //# URIs; "http" or "https" URIs that do not contain a path component
+        //# MUST include a value of / (ASCII 0x2f).
+        let path = path_and_query.map_or_else(
+            || PathAndQuery::from_static("/"),
+            |path| {
+                if path.path().is_empty() && method != Method::OPTIONS {
+                    PathAndQuery::from_static("/")
+                } else {
+                    path
+                }
+            },
+        );
+
+        // If the method is connect, the `:protocol` pseudo-header MAY be defined
+        //
+        // See: [https://www.rfc-editor.org/rfc/rfc8441#section-4]
+        let protocol = if method == Method::CONNECT {
+            ext.get::<Protocol>().copied()
+        } else {
+            None
+        };
+
+        // For standard CONNECT (that is, without :protocol pseudo-header) scheme and path
+        // are not set. See: [https://www.rfc-editor.org/rfc/rfc9114#section-4.4]
+        let (scheme, path) = if method == Method::CONNECT && protocol.is_none() {
+            (None, None)
+        } else {
+            (scheme.or(Some(Scheme::HTTPS)), Some(path))
+        };
+
+        let len = 3 + authority.is_some() as usize + protocol.is_some() as usize;
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //= type=implication
+        //# Pseudo-header fields defined for requests MUST NOT appear
+        //# in responses; pseudo-header fields defined for responses MUST NOT
+        //# appear in requests.
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=implication
+        //# All HTTP/3 requests MUST include exactly one value for the :method,
+        //# :scheme, and :path pseudo-header fields, unless the request is a
+        //# CONNECT request; see Section 4.4.
+        let sensitive = ext
+            .get::<PseudoHeaderSensitivity>()
+            .copied()
+            .unwrap_or_default()
+            .mask;
+
+        Self {
+            method: Some(method),
+            scheme,
+            authority,
+            path,
+            status: None,
+            protocol,
+            order: None,
+            sensitive,
+            len,
+        }
+    }
+
+    fn response(status: StatusCode, ext: Extensions) -> Self {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //= type=implication
+        //# Pseudo-header fields defined for requests MUST NOT appear
+        //# in responses; pseudo-header fields defined for responses MUST NOT
+        //# appear in requests.
+        Pseudo {
+            method: None,
+            scheme: None,
+            authority: None,
+            path: None,
+            status: Some(status),
+            protocol: None,
+            order: None,
+            sensitive: ext
+                .get::<PseudoHeaderSensitivity>()
+                .copied()
+                .unwrap_or_default()
+                .mask,
+            len: 1,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn set_sensitive(&mut self, id: PseudoId, sensitive: bool) {
+        if sensitive {
+            self.sensitive |= id.mask_id();
+        } else {
+            self.sensitive &= !id.mask_id();
+        }
+    }
+
+    fn is_sensitive(&self, id: PseudoId) -> bool {
+        self.sensitive & id.mask_id() != 0
+    }
+
+    #[inline]
+    fn field_ref(&self, id: PseudoId) -> Option<HeaderField<'_>> {
+        let (name, value): (&[u8], &[u8]) = match id {
+            PseudoId::Method => (b":method", self.method.as_ref()?.as_str().as_bytes()),
+            PseudoId::Scheme => (b":scheme", self.scheme.as_ref()?.as_str().as_bytes()),
+            PseudoId::Authority => (b":authority", self.authority.as_ref()?.as_str().as_bytes()),
+            PseudoId::Path => (b":path", self.path.as_ref()?.as_str().as_bytes()),
+            PseudoId::Status => (b":status", self.status.as_ref()?.as_str().as_bytes()),
+            PseudoId::Protocol => (b":protocol", self.protocol.as_ref()?.as_str().as_bytes()),
+        };
+        Some(HeaderField::borrowed(name, value, self.is_sensitive(id)))
+    }
+}
+
+/// Parses Content-Length for a message that has content; `status` is `None` for requests.
+///
+/// Other messages return `None` without parsing: CONNECT requests, responses to
+/// HEAD, 1xx, 204 and 304, and successful responses to CONNECT, which must ignore it
+/// ([RFC 9110, Section 9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)).
+/// Repeated or listed values must be equal
+/// ([Section 8.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6)).
+pub(crate) fn content_length(
+    headers: &HeaderMap,
+    method: &Method,
+    status: Option<StatusCode>,
+) -> Result<Option<u64>, HeaderError> {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+    //# A response that is
+    //# defined as never having content, even when a Content-Length is
+    //# present, can have a non-zero Content-Length header field even though
+    //# no content is included in DATA frames.
+    let has_content = match status {
+        None => *method != Method::CONNECT,
+        Some(status) => {
+            !(status.is_informational()
+                || status == StatusCode::NO_CONTENT
+                || status == StatusCode::NOT_MODIFIED
+                || *method == Method::HEAD
+                || (*method == Method::CONNECT && status.is_success()))
+        }
+    };
+    if !has_content {
+        return Ok(None);
+    }
+
+    let mut length = None;
+    for value in headers.get_all(header::CONTENT_LENGTH) {
+        for item in value.as_bytes().split(|&byte| byte == b',') {
+            let item = item.trim_ascii();
+            let parsed = item
+                .iter()
+                .all(u8::is_ascii_digit)
+                .then(|| std::str::from_utf8(item).ok()?.parse::<u64>().ok())
+                .flatten()
+                .filter(|&parsed| length.is_none_or(|length| length == parsed))
+                .ok_or_else(|| HeaderError::invalid_value(header::CONTENT_LENGTH, value))?;
+            length = Some(parsed);
+        }
+    }
+    Ok(length)
+}
+
+#[derive(Debug)]
+pub enum HeaderError {
+    InvalidHeaderName(String),
+    InvalidHeaderValue(String),
+    InvalidRequest(http::Error),
+    MissingMethod,
+    MissingStatus,
+    MissingAuthority,
+    ContradictedAuthority,
+    TooManyFields,
+    UnexpectedPseudo,
+    DuplicatePseudo,
+    PseudoAfterField,
+}
+
+impl HeaderError {
+    /// Returns the stream rejection code for a received field section.
+    ///
+    /// Container capacity is a local resource limit, not malformed QPACK or
+    /// HTTP syntax. Reject only this message; other streams can still proceed.
+    /// See [RFC 9114 Section 8.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1)
+    /// and [Section 10.5.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-10.5.1).
+    pub(crate) fn code(&self) -> crate::error::Code {
+        match self {
+            Self::TooManyFields => crate::error::Code::H3_EXCESSIVE_LOAD,
+            _ => crate::error::Code::H3_MESSAGE_ERROR,
+        }
+    }
+
+    fn invalid_name<N>(name: N) -> Self
+    where
+        N: AsRef<[u8]>,
+    {
+        HeaderError::InvalidHeaderName(format!("{:?}", name.as_ref()))
+    }
+
+    fn invalid_value<N, V>(name: N, value: V) -> Self
+    where
+        N: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        HeaderError::InvalidHeaderValue(format!(
+            "{:?} {:?}",
+            String::from_utf8_lossy(name.as_ref()),
+            String::from_utf8_lossy(value.as_ref())
+        ))
+    }
+
+    fn invalid_value_from<N>(name: N, err: header::InvalidHeaderValue) -> Self
+    where
+        N: AsRef<[u8]>,
+    {
+        HeaderError::InvalidHeaderValue(format!(
+            "{:?} {}",
+            String::from_utf8_lossy(name.as_ref()),
+            err
+        ))
+    }
+}
+
+impl std::error::Error for HeaderError {}
+
+impl fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeaderError::InvalidHeaderName(h) => write!(f, "invalid header name: {}", h),
+            HeaderError::InvalidHeaderValue(v) => write!(f, "invalid header value: {}", v),
+            HeaderError::InvalidRequest(r) => write!(f, "invalid request: {}", r),
+            HeaderError::MissingMethod => write!(f, "missing method in request headers"),
+            HeaderError::MissingStatus => write!(f, "missing status in response headers"),
+            HeaderError::MissingAuthority => write!(f, "missing authority"),
+            HeaderError::ContradictedAuthority => {
+                write!(f, "uri and authority field are in contradiction")
+            }
+            HeaderError::TooManyFields => write!(f, "field section exceeds local header capacity"),
+            HeaderError::UnexpectedPseudo => write!(f, "pseudo-header is invalid in this context"),
+            HeaderError::DuplicatePseudo => write!(f, "duplicate pseudo-header"),
+            HeaderError::PseudoAfterField => write!(f, "pseudo-header follows a regular field"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use super::*;
+
+    #[test]
+    fn content_length_is_one_value_for_messages_with_content() {
+        let parse = |values: &[&'static str], method: Method, status: Option<u16>| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(header::CONTENT_LENGTH, HeaderValue::from_static(value));
+            }
+            let status = status.map(|status| StatusCode::from_u16(status).unwrap());
+            content_length(&headers, &method, status).ok()
+        };
+        let request = |values| parse(values, Method::POST, None);
+        assert_eq!(request(&[]), Some(None));
+        assert_eq!(request(&["042"]), Some(Some(42)));
+        assert_eq!(request(&["7", "7, 7"]), Some(Some(7)));
+        for invalid in [
+            &["7", "8"][..],
+            &["7, 8"],
+            &["7,"],
+            &["+7"],
+            &["18446744073709551616"],
+        ] {
+            assert_eq!(request(invalid), None, "{invalid:?}");
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+        //= type=test
+        //# A response that is
+        //# defined as never having content, even when a Content-Length is
+        //# present, can have a non-zero Content-Length header field even though
+        //# no content is included in DATA frames.
+        // Messages without content ignore even an invalid value.
+        for (method, status) in [
+            (Method::CONNECT, None),
+            (Method::HEAD, Some(200)),
+            (Method::GET, Some(103)),
+            (Method::GET, Some(204)),
+            (Method::GET, Some(304)),
+            (Method::CONNECT, Some(200)),
+        ] {
+            assert_eq!(parse(&["x"], method, status), Some(None));
+        }
+        // A HEAD request and a failed CONNECT have content.
+        assert_eq!(parse(&["x"], Method::HEAD, None), None);
+        assert_eq!(parse(&["x"], Method::CONNECT, Some(403)), None);
+    }
+
+    #[test]
+    fn received_pseudo_fields_reject_duplicates_and_late_placement() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //= type=test
+        //# Any request or response that contains a
+        //# pseudo-header field that appears in a header section after a regular
+        //# header field MUST be treated as malformed.
+        for (name, value) in [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "localhost"),
+            (":path", "/"),
+            (":status", "200"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::new(name, value);
+            assert_matches!(
+                Header::try_from(vec![field.clone(), field.clone()]),
+                Err(HeaderError::DuplicatePseudo)
+            );
+            assert_matches!(
+                Header::try_from(vec![HeaderField::new("x-regular", "v"), field]),
+                Err(HeaderError::PseudoAfterField)
+            );
+        }
+    }
+
+    #[test]
+    fn received_pseudo_fields_require_their_message_context() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+        //= type=test
+        //# Endpoints MUST treat a request or response that contains
+        //# undefined or invalid pseudo-header fields as malformed.
+        for (name, value) in [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "localhost"),
+            (":path", "/"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::new(name, value);
+            assert_matches!(
+                Header::try_from(vec![HeaderField::new(":status", "200"), field.clone()])
+                    .unwrap()
+                    .into_response_parts(),
+                Err(HeaderError::UnexpectedPseudo)
+            );
+            assert_matches!(
+                Header::try_from(vec![field]).unwrap().into_trailers(),
+                Err(HeaderError::UnexpectedPseudo)
+            );
+        }
+        let status = HeaderField::new(":status", "200");
+        assert_matches!(
+            Header::try_from(vec![status.clone()])
+                .unwrap()
+                .into_request_parts(),
+            Err(HeaderError::UnexpectedPseudo)
+        );
+        assert_matches!(
+            Header::try_from(vec![status]).unwrap().into_trailers(),
+            Err(HeaderError::UnexpectedPseudo)
+        );
+    }
+
+    #[test]
+    fn valid_received_trailers_preserve_duplicate_sensitive_fields() {
+        let mut field = HeaderField::new("x-trailer", "value");
+        field.sensitive = true;
+        let trailers = Header::try_from(vec![field; 2])
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers.len(), 2);
+        assert!(
+            trailers
+                .get_all("x-trailer")
+                .iter()
+                .all(HeaderValue::is_sensitive)
+        );
+        assert!(
+            Header::try_from(Vec::new())
+                .unwrap()
+                .into_trailers()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn received_connect_context_preserves_standard_and_extended_forms() {
+        for extended in [false, true] {
+            let mut fields = vec![
+                HeaderField::new(":method", "CONNECT"),
+                HeaderField::new(":authority", "localhost:443"),
+            ];
+            if extended {
+                fields.extend([
+                    HeaderField::new(":scheme", "https"),
+                    HeaderField::new(":path", "/session"),
+                    HeaderField::new(":protocol", "webtransport"),
+                ]);
+            }
+            let (method, uri, protocol, _, _) = Header::try_from(fields)
+                .unwrap()
+                .into_request_parts()
+                .unwrap();
+            assert_eq!(method, Method::CONNECT);
+            assert_eq!(uri.authority().unwrap().as_str(), "localhost:443");
+            assert_eq!(
+                protocol.as_ref().map(Protocol::as_str),
+                extended.then_some("webtransport")
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_decoded_field_count_is_a_resource_error() {
+        // Repeated regular fields are valid and compress to a small block; the
+        // limit must be handled even with the default field-section settings.
+        let fields = vec![HeaderField::new("accept", "*/*"); 40_000];
+        let mut encoded = bytes::BytesMut::new();
+        crate::qpack::encode_stateless(&mut encoded, &fields).unwrap();
+        assert!(encoded.len() < crate::config::DEFAULT_QPACK_DECODE_BUFFER_SIZE);
+        let decoded = crate::qpack::Decoder::new(0, 0)
+            .unwrap()
+            .decode_header(&mut encoded)
+            .unwrap();
+        let error = Header::try_from(decoded.fields).unwrap_err();
+        assert_matches!(error, HeaderError::TooManyFields);
+        assert_eq!(error.code(), crate::error::Code::H3_EXCESSIVE_LOAD);
+    }
+
+    #[test]
+    fn regular_duplicate_fields_and_sensitivity_are_preserved() {
+        let mut field = HeaderField::new("set-cookie", "a=b");
+        field.sensitive = true;
+        let header = Header::try_from(vec![field; 128]).unwrap();
+        assert_eq!(header.fields.len(), 128);
+        assert!(
+            header
+                .fields
+                .get_all("set-cookie")
+                .iter()
+                .all(HeaderValue::is_sensitive)
+        );
+    }
+
+    #[test]
+    fn request_has_no_authority_nor_host() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=test
+        //# If the :scheme pseudo-header field identifies a scheme that has a
+        //# mandatory authority component (including "http" and "https"), the
+        //# request MUST contain either an :authority pseudo-header field or a
+        //# Host header field.
+        let headers = Header::try_from(vec![(b":method", Method::GET.as_str()).into()]).unwrap();
+        assert!(headers.pseudo.authority.is_none());
+        assert_matches!(
+            headers.into_request_parts(),
+            Err(HeaderError::MissingAuthority)
+        );
+    }
+
+    #[test]
+    fn request_has_empty_authority() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=test
+        //# If these fields are present, they MUST NOT be
+        //# empty.
+        assert_matches!(
+            Header::try_from(vec![
+                (b":method", Method::GET.as_str()).into(),
+                (b":authority", b"").into(),
+            ]),
+            Err(HeaderError::InvalidHeaderValue(_))
+        );
+    }
+
+    #[test]
+    fn request_has_empty_host() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=test
+        //# If these fields are present, they MUST NOT be
+        //# empty.
+        let headers = Header::try_from(vec![
+            (b":method", Method::GET.as_str()).into(),
+            (b"host", b"").into(),
+        ])
+        .unwrap();
+        assert_matches!(
+            headers.into_request_parts(),
+            Err(HeaderError::InvalidRequest(_))
+        );
+    }
+
+    #[test]
+    fn request_has_authority() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=test
+        //# If the :scheme pseudo-header field identifies a scheme that has a
+        //# mandatory authority component (including "http" and "https"), the
+        //# request MUST contain either an :authority pseudo-header field or a
+        //# Host header field.
+        let headers = Header::try_from(vec![
+            (b":method", Method::GET.as_str()).into(),
+            (b":authority", b"test.com").into(),
+        ])
+        .unwrap();
+        assert_matches!(headers.into_request_parts(), Ok(_));
+    }
+
+    #[test]
+    fn request_has_host() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=test
+        //# If the :scheme pseudo-header field identifies a scheme that has a
+        //# mandatory authority component (including "http" and "https"), the
+        //# request MUST contain either an :authority pseudo-header field or a
+        //# Host header field.
+        let headers = Header::try_from(vec![
+            (b":method", Method::GET.as_str()).into(),
+            (b"host", b"test.com").into(),
+        ])
+        .unwrap();
+        assert!(headers.pseudo.authority.is_none());
+        assert_matches!(headers.into_request_parts(), Ok(_));
+    }
+
+    #[test]
+    fn request_has_same_host_and_authority() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=test
+        //# If both fields are present, they MUST contain the same value.
+        let headers = Header::try_from(vec![
+            (b":method", Method::GET.as_str()).into(),
+            (b":authority", b"test.com").into(),
+            (b"host", b"test.com").into(),
+        ])
+        .unwrap();
+        assert_matches!(headers.into_request_parts(), Ok(_));
+    }
+    #[test]
+    fn request_has_different_host_and_authority() {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //= type=test
+        //# If both fields are present, they MUST contain the same value.
+        let headers = Header::try_from(vec![
+            (b":method", Method::GET.as_str()).into(),
+            (b":authority", b"authority.com").into(),
+            (b"host", b"host.com").into(),
+        ])
+        .unwrap();
+        assert_matches!(
+            headers.into_request_parts(),
+            Err(HeaderError::ContradictedAuthority)
+        );
+    }
+
+    #[test]
+    fn preserves_duplicate_headers() {
+        let headers = Header::try_from(vec![
+            (b":method", Method::GET.as_str()).into(),
+            (b":authority", b"test.com").into(),
+            (b"set-cookie", b"foo=foo").into(),
+            (b"set-cookie", b"bar=bar").into(),
+            (b"other-header", b"other-header-value").into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            (&headers)
+                .into_iter()
+                .filter(|h| h.name.as_ref() == b"set-cookie")
+                .collect::<Vec<_>>(),
+            vec![
+                HeaderField {
+                    name: std::borrow::Cow::Borrowed(b"set-cookie"),
+                    value: std::borrow::Cow::Borrowed(b"foo=foo"),
+                    sensitive: false,
+                },
+                HeaderField {
+                    name: std::borrow::Cow::Borrowed(b"set-cookie"),
+                    value: std::borrow::Cow::Borrowed(b"bar=bar"),
+                    sensitive: false,
+                }
+            ]
+        );
+        assert_eq!(
+            (&headers)
+                .into_iter()
+                .filter(|h| h.name.as_ref() == b"other-header")
+                .collect::<Vec<_>>(),
+            vec![HeaderField {
+                name: std::borrow::Cow::Borrowed(b"other-header"),
+                value: std::borrow::Cow::Borrowed(b"other-header-value"),
+                sensitive: false,
+            },]
+        );
+    }
+
+    #[test]
+    fn decoded_regular_fields_preserve_borrowed_and_owned_values() {
+        let mut owned = Vec::with_capacity(64);
+        owned.extend_from_slice(b"owned-value");
+        let owned_ptr = owned.as_ptr();
+        let borrowed: &'static [u8] = b"0";
+        let borrowed_ptr = borrowed.as_ptr();
+        let headers = Header::try_from(vec![
+            HeaderField {
+                name: Cow::Borrowed(b":status"),
+                value: Cow::Borrowed(b"200"),
+                sensitive: false,
+            },
+            HeaderField {
+                name: Cow::Borrowed(b"content-length"),
+                value: Cow::Borrowed(borrowed),
+                sensitive: true,
+            },
+            HeaderField {
+                name: Cow::Borrowed(b"x-owned"),
+                value: Cow::Owned(owned),
+                sensitive: false,
+            },
+        ])
+        .unwrap();
+
+        let (status, fields, _) = headers.into_response_parts().unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fields["content-length"], "0");
+        assert!(fields["content-length"].is_sensitive());
+        assert_eq!(fields["x-owned"], "owned-value");
+        assert_eq!(fields["content-length"].as_bytes().as_ptr(), borrowed_ptr);
+        assert_eq!(fields["x-owned"].as_bytes().as_ptr(), owned_ptr);
+    }
+
+    #[test]
+    fn decoded_regular_field_errors_preserve_diagnostics() {
+        let borrowed = Header::try_from(vec![HeaderField {
+            name: Cow::Borrowed(b"x-invalid"),
+            value: Cow::Borrowed(b"bad\nvalue"),
+            sensitive: false,
+        }])
+        .unwrap_err();
+        let owned = Header::try_from(vec![HeaderField {
+            name: Cow::Owned(b"x-invalid".to_vec()),
+            value: Cow::Owned(b"bad\nvalue".to_vec()),
+            sensitive: false,
+        }])
+        .unwrap_err();
+
+        assert_matches!(borrowed, HeaderError::InvalidHeaderValue(_));
+        assert_matches!(owned, HeaderError::InvalidHeaderValue(_));
+        assert_eq!(borrowed.to_string(), owned.to_string());
+    }
+
+    #[test]
+    fn request_pseudo_sensitivity_survives_http_parts() {
+        let headers = Header::try_from(vec![
+            HeaderField::from((b":method", b"GET")).with_sensitive(true),
+            HeaderField::from((b":scheme", b"https")),
+            HeaderField::from((b":authority", b"example.com")),
+            HeaderField::from((b":path", b"/")),
+        ])
+        .unwrap();
+        let (method, uri, _protocol, fields, sensitivity) = headers.into_request_parts().unwrap();
+
+        assert!(sensitivity.is_sensitive(PseudoId::Method));
+
+        let mut extensions = Extensions::new();
+        extensions.insert(sensitivity);
+        let forwarded = Header::request(method, uri, fields, extensions).unwrap();
+        let method = (&forwarded)
+            .into_iter()
+            .find(|field| field.name.as_ref() == b":method")
+            .unwrap();
+
+        assert!(method.is_sensitive());
+    }
+
+    #[test]
+    fn response_pseudo_sensitivity_survives_http_parts() {
+        let headers = Header::try_from(vec![
+            HeaderField::from((b":status", b"200")).with_sensitive(true),
+        ])
+        .unwrap();
+        let (status, fields, sensitivity) = headers.into_response_parts().unwrap();
+
+        assert!(sensitivity.is_sensitive(PseudoId::Status));
+
+        let mut extensions = Extensions::new();
+        extensions.insert(sensitivity);
+        let forwarded = Header::response(status, fields, extensions);
+        let status = (&forwarded)
+            .into_iter()
+            .find(|field| field.name.as_ref() == b":status")
+            .unwrap();
+
+        assert!(status.is_sensitive());
+    }
+
+    #[test]
+    fn test_pseudo_order_default() {
+        let order = PseudoOrder::builder().build();
+        assert_eq!(order.ids.len(), PseudoId::DEFAULT_STACK_SIZE);
+        assert_eq!(order.ids, PseudoId::DEFAULT_IDS);
+        assert!(std::mem::size_of::<PseudoOrder>() <= 8);
+        assert!(std::mem::size_of::<Option<PseudoOrder>>() <= 8);
+    }
+
+    #[test]
+    fn test_pseudo_order_duplicate() {
+        let order = PseudoOrder::builder()
+            .push(PseudoId::Scheme)
+            .push(PseudoId::Scheme)
+            .build();
+
+        assert_eq!(order.ids.len(), PseudoId::DEFAULT_IDS.len());
+        assert_eq!(order.ids[0], PseudoId::Scheme);
+        assert_ne!(order.ids[1], PseudoId::Scheme);
+    }
+
+    #[test]
+    fn test_pseudo_order_custom_chrome_masp() {
+        // Chrome uses "masp" order: Method, Authority, Scheme, Path
+        let order = PseudoOrder::builder()
+            .push(PseudoId::Method)
+            .push(PseudoId::Authority)
+            .push(PseudoId::Scheme)
+            .push(PseudoId::Path)
+            .build();
+
+        let mut headers = Header::request(
+            Method::GET,
+            Uri::from_static("https://example.com/test"),
+            HeaderMap::new(),
+            Extensions::default(),
+        )
+        .unwrap();
+        headers.set_pseudo_order(order);
+
+        let pseudo_fields: Vec<_> = (&headers)
+            .into_iter()
+            .filter(|h| h.name.as_ref().starts_with(b":"))
+            .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
+            .collect();
+
+        assert_eq!(
+            pseudo_fields,
+            vec![":method", ":authority", ":scheme", ":path"]
+        );
+    }
+
+    #[test]
+    fn test_pseudo_order_custom_firefox_msap() {
+        // Firefox uses "msap" order: Method, Scheme, Authority, Path
+        let order = PseudoOrder::builder()
+            .push(PseudoId::Method)
+            .push(PseudoId::Scheme)
+            .push(PseudoId::Authority)
+            .push(PseudoId::Path)
+            .build();
+
+        let mut headers = Header::request(
+            Method::GET,
+            Uri::from_static("https://example.com/test"),
+            HeaderMap::new(),
+            Extensions::default(),
+        )
+        .unwrap();
+        headers.set_pseudo_order(order);
+
+        let pseudo_fields: Vec<_> = (&headers)
+            .into_iter()
+            .filter(|h| h.name.as_ref().starts_with(b":"))
+            .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
+            .collect();
+
+        assert_eq!(
+            pseudo_fields,
+            vec![":method", ":scheme", ":authority", ":path"]
+        );
+    }
+
+    #[test]
+    fn test_pseudo_order_default_unchanged() {
+        // Default order should match the original hardcoded behavior
+        let headers = Header::request(
+            Method::GET,
+            Uri::from_static("https://example.com/test"),
+            HeaderMap::new(),
+            Extensions::default(),
+        )
+        .unwrap();
+
+        let pseudo_fields: Vec<_> = (&headers)
+            .into_iter()
+            .filter(|h| h.name.as_ref().starts_with(b":"))
+            .map(|h| String::from_utf8_lossy(h.name.as_ref()).into_owned())
+            .collect();
+
+        assert_eq!(
+            pseudo_fields,
+            vec![":method", ":scheme", ":authority", ":path"]
+        );
+    }
+}

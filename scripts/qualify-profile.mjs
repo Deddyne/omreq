@@ -71,6 +71,16 @@ for (const runtime of ['node', 'bun']) {
   http2.push({ runtime, exactPrefixMatch: true, comparedBytes: report.comparedBytes });
   process.stdout.write(log);
 }
+const http3 = [];
+if (profile.transport.http3)
+  for (const runtime of ['node', 'bun']) {
+    const log = await run('node', ['scripts/profile-http3-reference.mjs', runtime]);
+    const report = JSON.parse(await readFile(`${out}-http3-${runtime}/report.json`, 'utf8'));
+    assert(report.exactMatch);
+    await writeFile(`${out}/http3-${runtime}.json`, `${JSON.stringify(report, null, 2)}\n`);
+    http3.push({ runtime, exactMatch: true, parts: Object.keys(report.matches) });
+    process.stdout.write(log);
+  }
 const http1 = [];
 for (const runtime of ['node', 'bun']) {
   const log = await run('node', ['scripts/profile-http1-reference.mjs', runtime]);
@@ -93,7 +103,9 @@ await writeFile(`${out}/resumption.json`, `${JSON.stringify(resumption, null, 2)
 assert.deepEqual(await artifactIdentity(), identity, 'Artifacts changed during qualification');
 const report = {
   recordedAt: new Date().toISOString(),
-  status: 'matched-in-scoped-TLS-HTTP1-and-HTTP2-tests',
+  status: profile.transport.http3
+    ? 'matched-in-scoped-TLS-HTTP1-HTTP2-and-HTTP3-tests'
+    : 'matched-in-scoped-TLS-HTTP1-and-HTTP2-tests',
   publicVerified: false,
   profileId: profile.id,
   profile: await checkProfile(profile),
@@ -101,6 +113,7 @@ const report = {
   ...identity,
   tls,
   http2,
+  ...(http3.length && { http3 }),
   http1,
   resumption: resumption.scenarios.map((s) => ({
     tlsVersion: s.tlsVersion,
@@ -112,7 +125,7 @@ const report = {
     'Full alpha resource and HTTP policy acceptance; this report does not close those gates',
   ],
   normalization:
-    'fixtures/clienthello.mjs explicitly validates and normalizes random TLS values, extension permutation and the bounded ECH GREASE payload envelope. HTTP2 request prefix comparison is byte-for-byte.',
+    'fixtures/clienthello.mjs explicitly validates and normalizes random TLS values, extension permutation and the bounded ECH GREASE payload envelope. HTTP2 request prefix comparison is byte-for-byte. fixtures/http3-compare.mjs decrypts the QUIC Initial packets, normalizes connection IDs, GREASE and transport parameter order, and compares QPACK field sections byte-for-byte.',
 };
 await writeFile(`${out}/report.json`, `${JSON.stringify(report, null, 2)}\n`);
 console.log(`Saved ${out}/report.json`);
@@ -125,6 +138,10 @@ if (writeReferences) {
     await readFile(`${out}/http2-node.json`, 'utf8'),
   );
   await writeFile(`${refs}/http2-capture.json`, `${JSON.stringify(http2Capture, null, 2)}\n`);
+  if (http3.length) {
+    const { chrome } = JSON.parse(await readFile(`${out}/http3-node.json`, 'utf8'));
+    await writeFile(`${refs}/http3-capture.json`, `${JSON.stringify(chrome, null, 2)}\n`);
+  }
   await writeFile(
     `${refs}/README.md`,
     `# Chrome ${entry.major} reference evidence
@@ -139,6 +156,9 @@ after the profile matched it byte for byte.
 - \`http2-capture.json\`: two document navigations to a local HTTP/2 fixture; exact bytes from
   the client preface through the second HEADERS frame, plus decoded request headers.
 - \`resumption-capture.json\`: fresh and resumed TLS 1.2/1.3 ClientHellos.
+- \`http3-capture.json\` (profiles with HTTP/3): two document navigations over QUIC, reduced
+  by \`fixtures/http3-compare.mjs\`: the decrypted Initial flight, control stream and the exact
+  QPACK field sections.
 
 These are scenario-scoped test vectors used by \`pnpm test\`, not a claim about all browser
 activity.

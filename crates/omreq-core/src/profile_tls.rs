@@ -1,8 +1,9 @@
 use crate::error::{Error, Result};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     io::{self, Read, Write},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
 };
 use wreq::tls::{
     AlpnProtocol, AlpsProtocol, TlsOptions, TlsVersion,
@@ -46,40 +47,75 @@ fn validate_ciphers(input: &Value) -> Result<()> {
     }
     Ok(())
 }
-/// Parsed bundled trust roots, shared by every client in the process. Parsing a
-/// bundle costs more than a millisecond, and clients are created on the
-/// JavaScript thread. `None` for an unknown store name.
-pub fn bundled_roots(name: &str) -> Option<Result<CertStore>> {
-    static BUNDLED: OnceLock<std::result::Result<CertStore, String>> = OnceLock::new();
-    static CHROMIUM: OnceLock<std::result::Result<CertStore, String>> = OnceLock::new();
-    let (cell, certs) = match name {
-        "bundled" => (&BUNDLED, webpki_root_certs::TLS_SERVER_ROOT_CERTS),
-        "chromium" => (&CHROMIUM, chromium_roots::TLS_SERVER_ROOT_CERTS),
-        _ => return None,
-    };
-    let store = cell.get_or_init(|| {
-        CertStore::from_der_certs(certs.iter().map(|c| c.as_ref())).map_err(|e| e.to_string())
-    });
-    Some(store.clone().map_err(|_| {
-        Error::new(
-            "ERR_TLS",
-            "configuration",
-            "Bundled trust roots could not be loaded",
-        )
-    }))
-}
-
-/// Bundled roots plus extra PEM CAs, parsed for one client. `None` for an
-/// unknown store name.
-pub fn trust_roots(name: &str, ca: &str) -> Option<Result<CertStore>> {
+/// The DER roots of a trust store, `None` for an unknown name.
+fn store_certs(name: &str) -> Option<Vec<&'static [u8]>> {
     let certs = match name {
         "bundled" => webpki_root_certs::TLS_SERVER_ROOT_CERTS,
         "chromium" => chromium_roots::TLS_SERVER_ROOT_CERTS,
         _ => return None,
     };
+    Some(certs.iter().map(|c| c.as_ref()).collect())
+}
+
+/// The Chromium roots behind advertised trust anchor IDs (lowercase hex). A server that
+/// supports Trust Anchor IDs may answer with a chain ending at any root the client named, so a
+/// client that names a Chrome root store anchor trusts it, whichever store it verifies with.
+pub(crate) fn advertised_roots(ids: &[String]) -> Vec<&'static [u8]> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut encoded = encode_trust_anchors(ids);
+    let mut wanted = Vec::new();
+    while !encoded.is_empty() {
+        let length = usize::from(encoded[0]);
+        wanted.push(encoded[1..=length].to_vec());
+        encoded.drain(..=length);
+    }
+    chromium_roots::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|c| c.as_ref())
+        .filter(|der| {
+            chromium_roots::trust_anchor_id_for_certificate(der)
+                .is_some_and(|id| wanted.iter().any(|w| w == id))
+        })
+        .collect()
+}
+
+/// The roots a client verifies servers with: its trust store, the Chromium roots its profile
+/// names as trust anchors, and extra PEM CAs. Without extra CAs a store is parsed once per
+/// process and shared (L-10). `None` for an unknown store name.
+pub fn client_roots(name: &str, ca: Option<&str>, anchors: &[String]) -> Option<Result<CertStore>> {
+    type Cache = Mutex<HashMap<(String, Vec<String>), CertStore>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let mut certs = store_certs(name)?;
+    let anchors = if name == "chromium" { &[][..] } else { anchors };
+    certs.extend(advertised_roots(anchors));
+    let failed = || {
+        Error::new(
+            "ERR_TLS",
+            "configuration",
+            "Trust roots could not be loaded",
+        )
+    };
+    let Some(ca) = ca else {
+        let key = (name.to_owned(), anchors.to_vec());
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(store) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Some(Ok(store.clone()));
+        }
+        let store = match CertStore::from_der_certs(certs) {
+            Ok(store) => store,
+            Err(_) => return Some(Err(failed())),
+        };
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, store.clone());
+        return Some(Ok(store));
+    };
     Some(
         CertStore::builder()
-            .add_der_certs(certs.iter().map(|c| c.as_ref()))
+            .add_der_certs(certs)
             .add_stack_pem_certs(ca)
             .build()
             .map_err(Error::from),
@@ -125,6 +161,10 @@ pub fn normalize(input: &Value, version: &str) -> Result<Value> {
 }
 fn flag(v: &Value, name: &str) -> bool {
     v[name].as_bool().expect("normalized boolean")
+}
+/// The trust anchor IDs a TLS block advertises.
+pub(crate) fn trust_anchor_ids(tls: &Value) -> Vec<String> {
+    list(tls, "trustAnchorIds").unwrap_or_default()
 }
 fn list(v: &Value, name: &str) -> Option<Vec<String>> {
     v.get(name).and_then(Value::as_array).map(|a| {
@@ -180,22 +220,7 @@ pub fn build(tls: &Value) -> Result<TlsOptions> {
         options.curves_list = Some(values.join(":").into());
     }
     if let Some(values) = list(tls, "trustAnchorIds") {
-        let mut encoded = Vec::new();
-        for id in values {
-            encoded.push((id.len() / 2) as u8);
-            for pair in id.as_bytes().as_chunks::<2>().0 {
-                // Schema validates even, lowercase hex strings and the one-byte length bound.
-                let digit = |b: u8| {
-                    if b.is_ascii_digit() {
-                        b - b'0'
-                    } else {
-                        b - b'a' + 10
-                    }
-                };
-                encoded.push((digit(pair[0]) << 4) | digit(pair[1]));
-            }
-        }
-        options.trust_anchors = Some(encoded.into());
+        options.trust_anchors = Some(encode_trust_anchors(&values).into());
     }
     if !tls["certificateCompression"]
         .as_array()
@@ -216,52 +241,73 @@ impl CertificateCompressor for BrotliCertificate {
         CertificateCompressionAlgorithm::BROTLI
     }
     fn compress(&self) -> Codec {
-        Codec::Pointer(|input, output| {
-            let mut encoder = brotli::CompressorWriter::new(output, 4096, 5, 22);
-            encoder.write_all(input)?;
-            encoder.flush()
-        })
+        Codec::Pointer(brotli_compress)
     }
     fn decompress(&self) -> Codec {
-        Codec::Pointer(|input, output| {
-            // Limit output independently of certificate-chain limits in the TLS engine.
-            // The decoder writes incrementally into BoringSSL's length-checked writer.
-            let first = *input.first().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Empty Brotli certificate")
-            })?;
-            // RFC 7932 WBITS is encoded in the first seven low-order bits.
-            let n = (first >> 1) & 7;
-            let bits = if first & 1 == 0 {
-                16
-            } else if n != 0 {
-                17 + n
-            } else {
-                let tail = (first >> 4) & 7;
-                if tail == 1 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Large-window Brotli is unsupported",
-                    ));
-                }
-                if tail == 0 { 17 } else { 8 + tail }
-            };
-            if bits > 22 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Brotli certificate window exceeds 4 MiB",
-                ));
-            }
-            let mut decoder = brotli::Decompressor::new(input, 4096).take(4 * 1024 * 1024 + 1);
-            let written = io::copy(&mut decoder, output)?;
-            if written > 4 * 1024 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "TLS certificate decompression exceeds 4 MiB",
-                ));
-            }
-            Ok(())
-        })
+        Codec::Pointer(brotli_decompress)
     }
+}
+pub(crate) fn brotli_compress(input: &[u8], output: &mut dyn Write) -> io::Result<()> {
+    let mut encoder = brotli::CompressorWriter::new(output, 4096, 5, 22);
+    encoder.write_all(input)?;
+    encoder.flush()
+}
+/// Limits output independently of certificate-chain limits in the TLS engine. The decoder
+/// writes incrementally into BoringSSL's length-checked writer.
+pub(crate) fn brotli_decompress(input: &[u8], output: &mut dyn Write) -> io::Result<()> {
+    let first = *input
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty Brotli certificate"))?;
+    // RFC 7932 WBITS is encoded in the first seven low-order bits.
+    let n = (first >> 1) & 7;
+    let bits = if first & 1 == 0 {
+        16
+    } else if n != 0 {
+        17 + n
+    } else {
+        let tail = (first >> 4) & 7;
+        if tail == 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Large-window Brotli is unsupported",
+            ));
+        }
+        if tail == 0 { 17 } else { 8 + tail }
+    };
+    if bits > 22 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Brotli certificate window exceeds 4 MiB",
+        ));
+    }
+    let mut decoder = brotli::Decompressor::new(input, 4096).take(4 * 1024 * 1024 + 1);
+    let written = io::copy(&mut decoder, output)?;
+    if written > 4 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS certificate decompression exceeds 4 MiB",
+        ));
+    }
+    Ok(())
+}
+/// Encodes trust anchor IDs (validated lowercase hex) as the extension's list body.
+pub(crate) fn encode_trust_anchors(values: &[String]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for id in values {
+        encoded.push((id.len() / 2) as u8);
+        for pair in id.as_bytes().as_chunks::<2>().0 {
+            // Schema validates even, lowercase hex strings and the one-byte length bound.
+            let digit = |b: u8| {
+                if b.is_ascii_digit() {
+                    b - b'0'
+                } else {
+                    b - b'a' + 10
+                }
+            };
+            encoded.push((digit(pair[0]) << 4) | digit(pair[1]));
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -319,15 +365,24 @@ mod tests {
         assert!(check(json!({})).is_ok());
     }
     #[test]
-    fn bundled_roots_are_parsed_once_and_shared() {
-        assert!(bundled_roots("bundled").unwrap().is_ok());
+    fn client_roots_are_parsed_once_and_shared() {
+        assert!(client_roots("bundled", None, &[]).unwrap().is_ok());
         let started = std::time::Instant::now();
         for _ in 0..100 {
-            assert!(bundled_roots("bundled").unwrap().is_ok());
+            assert!(client_roots("bundled", None, &[]).unwrap().is_ok());
         }
         // A cached clone is an Arc increment; a parse takes about a millisecond.
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
-        assert!(bundled_roots("chromium").unwrap().is_ok());
-        assert!(bundled_roots("other").is_none());
+        assert!(client_roots("chromium", None, &[]).unwrap().is_ok());
+        assert!(client_roots("other", None, &[]).is_none());
+    }
+    #[test]
+    fn advertised_anchor_ids_add_their_chromium_roots() {
+        let input: Value =
+            serde_json::from_str(include_str!("../../../profiles/chrome-158-macos.json")).unwrap();
+        let ids = list(&input["transport"]["tls"], "trustAnchorIds").unwrap();
+        assert_eq!(advertised_roots(&ids).len(), ids.len());
+        assert!(advertised_roots(&[]).is_empty());
+        assert!(client_roots("bundled", None, &ids).unwrap().is_ok());
     }
 }

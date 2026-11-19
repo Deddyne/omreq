@@ -5,6 +5,7 @@ mod connections;
 mod cookies;
 pub const COOKIE_PSL_VERSION: &str = cookies::PSL_VERSION;
 pub mod error;
+mod h3;
 pub mod profile;
 // These pins constrain upstream's otherwise floating qualification graph.
 use btls as _;

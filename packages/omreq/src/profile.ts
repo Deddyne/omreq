@@ -112,6 +112,39 @@ export function defineProfile(input: unknown): ProfileV1 {
         bad('/transport/http2', 'option conflicts with explicit SETTINGS');
     }
   }
+  const http3 = p.transport.http3;
+  if (version === '3' && !http3)
+    bad('/transport/httpVersion', 'HTTP/3 needs a transport.http3 block');
+  if (http3) {
+    const settings = new Set<string>();
+    for (const setting of http3.settings ?? []) {
+      if (settings.has(setting.name)) bad('/transport/http3/settings', 'duplicate setting');
+      settings.add(setting.name);
+    }
+    const parameters = http3.quic?.transportParameters;
+    if (parameters) {
+      const names = new Set<string>();
+      const windows = new Set<number>();
+      for (const parameter of parameters) {
+        if (parameter.name !== 'custom' && names.has(parameter.name))
+          bad('/transport/http3/quic/transportParameters', 'duplicate parameter');
+        names.add(parameter.name);
+        const bare = ['initialSourceConnectionId', 'versionInformation', 'grease'].includes(
+          parameter.name,
+        );
+        if (bare === (parameter.value !== undefined))
+          bad(
+            '/transport/http3/quic/transportParameters',
+            `${parameter.name} ${bare ? 'takes no' : 'needs a'} value`,
+          );
+        if (parameter.name.startsWith('initialMaxStreamData')) windows.add(Number(parameter.value));
+      }
+      if (windows.size > 1)
+        bad('/transport/http3/quic/transportParameters', 'stream data limits must be equal');
+      if (!names.has('initialSourceConnectionId'))
+        bad('/transport/http3/quic/transportParameters', 'initialSourceConnectionId is required');
+    }
+  }
   // The same forbidden set and limits apply when the profile's headers are
   // merged into a request, so a profile that validates here never fails later.
   let headerBytes = 0;

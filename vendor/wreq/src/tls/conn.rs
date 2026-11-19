@@ -17,7 +17,7 @@ use std::{
 use btls::{
     error::ErrorStack,
     ex_data::Index,
-    ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
+    ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode, Tls13Cipher},
 };
 use ext::SslConnectorBuilderExt;
 use http::{Uri, Version};
@@ -52,7 +52,6 @@ pub struct HandshakeSettings {
     alps_protocols: Option<Cow<'static, [AlpsProtocol]>>,
     alps_use_new_codepoint: bool,
     key_shares: Option<Cow<'static, [KeyShare]>>,
-    random_aes_hw_override: bool,
 }
 
 /// A Connector using BoringSSL to support `http` and `https` schemes.
@@ -146,12 +145,6 @@ impl TlsConnector {
         // Set ECH grease
         cfg.set_enable_ech_grease(self.settings.enable_ech_grease);
 
-        // Set random AES hardware override
-        if self.settings.random_aes_hw_override {
-            let random = (crate::util::fast_random() & 1) == 0;
-            cfg.set_aes_hw_override(random);
-        }
-
         // Set ALPN protocols
         if let Some(version) = descriptor.version() {
             match version {
@@ -179,7 +172,7 @@ impl TlsConnector {
         // Set ALPS protos
         if let Some(ref alps_values) = self.settings.alps_protocols {
             for alps in alps_values.iter() {
-                cfg.add_application_settings(alps.0)?;
+                cfg.add_application_settings(alps.0, None)?;
             }
 
             // By default, the new endpoint is used.
@@ -400,16 +393,30 @@ impl TlsConnectorBuilder {
         // Set TLS signature algorithms list
         set_option_ref_try!(opts, sigalgs_list, connector, set_sigalgs_list);
 
-        // Set TLS prreserve TLS 1.3 cipher list order
-        set_option!(
-            opts,
-            preserve_tls13_cipher_list,
-            connector,
-            set_preserve_tls13_cipher_list
-        );
-
-        // Set TLS cipher list
-        set_option_ref_try!(opts, cipher_list, connector, set_cipher_list);
+        // Set TLS cipher list. BoringSSL keeps TLS 1.3 suites in a separate list, offered in
+        // the order they appear here; the remaining names configure TLS 1.2.
+        if let Some(ref cipher_list) = opts.cipher_list {
+            let mut tls13 = Vec::new();
+            let mut tls12 = Vec::new();
+            for name in cipher_list.split(':').filter(|name| !name.is_empty()) {
+                match name {
+                    "TLS_AES_128_GCM_SHA256" => tls13.push(Tls13Cipher::AES_128_GCM_SHA256),
+                    "TLS_AES_256_GCM_SHA384" => tls13.push(Tls13Cipher::AES_256_GCM_SHA384),
+                    "TLS_CHACHA20_POLY1305_SHA256" => {
+                        tls13.push(Tls13Cipher::CHACHA20_POLY1305_SHA256)
+                    }
+                    other => tls12.push(other),
+                }
+            }
+            if !tls13.is_empty() {
+                connector.set_tls13_ciphers(&tls13).map_err(Error::tls)?;
+            }
+            if !tls12.is_empty() {
+                connector
+                    .set_cipher_list(&tls12.join(":"))
+                    .map_err(Error::tls)?;
+            }
+        }
 
         // Set TLS delegated credentials
         set_option_ref_try!(
@@ -421,9 +428,6 @@ impl TlsConnectorBuilder {
 
         // Set TLS record size limit
         set_option!(opts, record_size_limit, connector, set_record_size_limit);
-
-        // Set TLS aes hardware override
-        set_option!(opts, aes_hw_override, connector, set_aes_hw_override);
 
         // Set TLS extension permutation
         if let Some(ref extension_permutation) = opts.extension_permutation {
@@ -450,7 +454,6 @@ impl TlsConnectorBuilder {
             alps_use_new_codepoint: opts.alps_use_new_codepoint,
             enable_ech_grease: opts.enable_ech_grease,
             key_shares: opts.key_shares.clone(),
-            random_aes_hw_override: opts.random_aes_hw_override,
         };
 
         // If the session cache is disabled, we don't need to set up any callbacks.
