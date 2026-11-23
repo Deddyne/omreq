@@ -1,6 +1,6 @@
 {
   "name": "omreq",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "The fastest HTTP client for Node.js and Bun with a real Chrome TLS fingerprint (JA3/JA4) and HTTP/2 fingerprint. Rust + BoringSSL, browser impersonation, proxies, cookies, streaming.",
   "keywords": ["http-client", "tls-fingerprint", "browser-fingerprint", "ja3", "ja4", "ja3-fingerprint", "ja4-fingerprint", "http2-fingerprint", "tls-client", "curl-impersonate", "akamai", "impersonation", "browser-emulation", "chrome", "cloudflare", "cloudflare-bypass", "anti-bot", "anti-detection", "bot-detection", "tls", "http2", "fetch", "web-scraping", "scraping", "crawler", "proxy", "socks5", "typescript", "nodejs", "bun", "rust", "wreq", "boringssl", "tanstack-intent"],
   "license": "MIT",
@@ -24,8 +24,8 @@
   "engines": { "node": ">=22" },
   "dependencies": { "jsonc-parser": "3.3.1" },
   "optionalDependencies": {
-    "@omreq/darwin-arm64": "workspace:0.2.0",
-    "@omreq/linux-x64-gnu": "workspace:0.2.0",
-    "@omreq/win32-x64-msvc": "workspace:0.2.0"
+    "@omreq/darwin-arm64": "workspace:0.2.1",
+    "@omreq/linux-x64-gnu": "workspace:0.2.1",
+    "@omreq/win32-x64-msvc": "workspace:0.2.1"
   }
 }

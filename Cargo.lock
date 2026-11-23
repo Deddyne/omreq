@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "omreq-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "brotli",
  "btls",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "omreq-h3-fixture"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "btls",
  "quic",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "omreq-napi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "napi",
  "napi-build",

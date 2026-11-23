@@ -34,7 +34,7 @@ test('T22: TS/JSON, canonical effective digest and immutable snapshots', async (
   const object = defineProfile(input);
   const json = parseProfile(profileText);
   input.headers[0][1] = 'mutated';
-  assert.equal(object.headers[0][1], 'Omreq/0.2.0');
+  assert.equal(object.headers[0][1], 'Omreq/0.2.1');
   assert(Object.isFrozen(object.headers[0]));
   const a = await checkProfile(object);
   const b = await checkProfile(json);
