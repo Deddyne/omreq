@@ -231,7 +231,29 @@ test('a proxy rejecting credentials fails with ERR_PROXY and no credential in th
     );
     assert.equal(error.code, 'ERR_PROXY');
     assert.equal(error.phase, 'proxy');
+    assert.match(error.message, /^Proxy authentication failed/);
     assert.doesNotMatch(`${error.message} ${error.stack}`, /wrong-secret|ada:/);
+  } finally {
+    await client.close();
+    await proxy.close();
+    await target.close();
+  }
+});
+
+test('a SOCKS5 proxy rejecting credentials fails with ERR_PROXY authentication', async () => {
+  const target = await fixture();
+  const proxy = await socks5({ user: 'ada', pass: 'right' });
+  const client = createClient({ proxy: `socks5://ada:wrong-secret@127.0.0.1:${proxy.port}` });
+  try {
+    const error = await client.get(`${target.url}/echo`).then(
+      () => assert.fail('expected a proxy failure'),
+      (e) => e,
+    );
+    assert.equal(error.code, 'ERR_PROXY');
+    assert.equal(error.phase, 'proxy');
+    assert.match(error.message, /^Proxy authentication failed/);
+    assert.doesNotMatch(`${error.message} ${error.stack}`, /wrong-secret|ada:/);
+    assert.equal(client.getStats().activeOperations, 0);
   } finally {
     await client.close();
     await proxy.close();
