@@ -25,7 +25,7 @@ for (const [path, expected] of Object.entries(manifest.http2Fixtures)) {
 const lock = readFileSync('Cargo.lock', 'utf8');
 if (
   !lock.includes(
-    'git+https://github.com/0x676e67/btls?rev=5ec1c113a03626a5877b34dd6d2ea8d440897a91#5ec1c113a03626a5877b34dd6d2ea8d440897a91',
+    'git+https://github.com/0x676e67/btls?rev=3c1dd080ba617d78c63cd09285d2ce31abcdcbf9#3c1dd080ba617d78c63cd09285d2ce31abcdcbf9',
   )
 )
   throw Error('TLS source is not pinned to the qualified revision');

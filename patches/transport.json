@@ -2,16 +2,16 @@
   "schemaVersion": 1,
   "base": {
     "crate": "wreq",
-    "version": "0.16.3",
-    "revision": "6073cf683d0a62c49c6d9ab4dc8a3c4727e953f0",
-    "crateSha256": "d2b11a67378558357ed083260fd0bbced0481e4d32e2fb722be9c52b42ee08d4"
+    "version": "0.16.4",
+    "revision": "4ddadc9dded0b3accc3f42600f9aa4ff0e7e88ce",
+    "crateSha256": "b7b694ef977f3cc55d22d4474d765c2ca0b6328123f2927b01aad5570299fcf8"
   },
   "backports": [
     {
       "id": "cancelled-http2-capacity-waiters",
       "source": "Omreq cancellation/total deadline/FIFO fixtures with exhausted peer MAX_CONCURRENT_STREAMS",
       "crates": [
-        "wreq-proto 0.2.3"
+        "wreq-proto 0.2.6"
       ],
       "reason": "Observe queued and pending-open request callback cancellation independently of peer stream capacity. Move existing queued messages into a cooperative FIFO and drop cancelled bodies without closing unrelated streams. Combined channel/FIFO ownership remains bounded by Omreq operation admission; no request/body copies or additional tasks are created.",
       "regressions": [
@@ -24,7 +24,7 @@
       "id": "cancelled-http1-dispatch-abandons-flush",
       "source": "Omreq ownership regression: paused server during multipart upload and cancelled response receiver",
       "crates": [
-        "wreq-proto 0.2.3"
+        "wreq-proto 0.2.6"
       ],
       "reason": "Return a cancelled dispatcher error when its response receiver is gone, rather than waiting for shutdown to flush a blocked request body. This drops the owned upload body and physical socket promptly without draining an aborted HTTP1 request.",
       "regressions": [
@@ -37,7 +37,7 @@
       "id": "physical-tcp-lifetime-hooks",
       "source": "Omreq implementation over the pinned wreq TCP creation and pool-race paths",
       "crates": [
-        "wreq 0.16.3"
+        "wreq 0.16.4"
       ],
       "reason": "Reserve capacity before every raw TCP socket including Happy Eyeballs attempts, release after raw socket drop and support owner-initiated close. A connect that loses the pool race to an idle connection completes in the background into the pool, marked by socket::is_raced_connect so the owner abandons it while it still waits for capacity instead of leaving an orphaned waiter. Also expose the separate inner reused-connection cancelled-request replay switch so Omreq can disable it alongside the outer retry policy. Upstream defaults remain unchanged without explicit options.",
       "removeWhen": "Qualified upstream exposes equivalent physical socket lifetime hooks and bounded pool-race cancellation, verified by the same socket/resource and wire tests."
@@ -57,7 +57,7 @@
       "source": "Omreq implementation; RFC 7541 section 5.2 and controlled Chrome 157 fresh/reused wire comparison",
       "crates": [
         "http2 0.5.20",
-        "wreq-proto 0.2.3"
+        "wreq-proto 0.2.6"
       ],
       "reason": "Expose a per-connection smaller-only Huffman policy. Preserve upstream always-Huffman behavior by default. Chrome uses plain strings when Huffman does not shrink them.",
       "regressions": [
@@ -70,7 +70,7 @@
       "id": "shared-happy-eyeballs-reservation",
       "source": "Omreq audit S-01: dual-stack host with a hung IPv6 path under maxConnectionsPerOrigin",
       "crates": [
-        "wreq 0.16.3"
+        "wreq 0.16.4"
       ],
       "reason": "Reserve socket capacity once per logical connect. Happy Eyeballs candidates of the same connect share the reservation, so a fallback never queues behind its own hung first attempt for the only slot. Overcommit is bounded by the parallel-attempt limit; the winning socket keeps the reservation.",
       "regressions": [
@@ -94,9 +94,9 @@
     },
     {
       "id": "btls-quic-interface",
-      "source": "https://github.com/0x676e67/btls/commit/5ec1c113a03626a5877b34dd6d2ea8d440897a91",
+      "source": "https://github.com/0x676e67/btls/commit/3c1dd080ba617d78c63cd09285d2ce31abcdcbf9",
       "crates": [
-        "wreq 0.16.3"
+        "wreq 0.16.4"
       ],
       "reason": "The btls revision with the QUIC TLS interface drops set_aes_hw_override and set_preserve_tls13_cipher_list and adds a parameter to add_application_settings. TLS 1.3 suites from the profile cipher list are set with set_tls13_ciphers in the same order; the TCP ClientHello stays byte-identical to the captured Chrome reference.",
       "regressions": [
@@ -132,7 +132,7 @@
   ],
   "tls": {
     "source": "https://github.com/0x676e67/btls",
-    "revision": "5ec1c113a03626a5877b34dd6d2ea8d440897a91",
+    "revision": "3c1dd080ba617d78c63cd09285d2ce31abcdcbf9",
     "crates": [
       "btls",
       "btls-sys"
