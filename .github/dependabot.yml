@@ -1,0 +1,50 @@
+# Dependencies that are neither vendored nor tracked by .github/workflows/upstream.yml.
+# The crates listed under `ignore` move only through scripts/upgrade-vendor.mjs, which
+# also updates patches/vendor-manifest.json, the vendored source and our patches.
+# Cargo and npm runtime updates change THIRD_PARTY_NOTICES.md: run `node scripts/notices.mjs`
+# on the branch before merging.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    ignore:
+      - dependency-name: wreq
+      - dependency-name: wreq-proto
+      - dependency-name: wreq-rt
+      - dependency-name: http2
+      - dependency-name: http3
+      - dependency-name: quic
+      - dependency-name: quic-proto
+      - dependency-name: btls
+      - dependency-name: btls-sys
+      - dependency-name: chromium-roots
+      - dependency-name: webpki-root-certs
+    groups:
+      cargo:
+        update-types: [minor, patch]
+    labels: [dependencies]
+
+  - package-ecosystem: npm
+    directories: [/, /packages/omreq]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      npm-dev:
+        dependency-type: development
+        update-types: [minor, patch]
+    labels: [dependencies]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+    labels: [dependencies]
