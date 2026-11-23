@@ -409,7 +409,14 @@ impl CookieJar {
                     && (cookie.name.is_ascii() || entry.latin1 == latin1)
             })
         });
-        let created = existing.map(|index| self.domains[&cookie.domain].entries[index].created);
+        // Like Chromium's CookieMonster, a replacement keeps the creation time
+        // only when its value is unchanged; a new value sorts as a new cookie
+        // among equal-length paths. `store` swept expired records already, so
+        // an expired entry never lends its creation time to a reinsertion.
+        let created = existing
+            .map(|index| &self.domains[&cookie.domain].entries[index])
+            .filter(|entry| entry.cookie.value == cookie.value)
+            .map(|entry| entry.created);
         if let Some(index) = existing {
             let domain = cookie.domain.clone();
             self.remove(&domain, index, false);
@@ -1030,10 +1037,17 @@ mod tests {
             Some("id=root".into())
         );
         set(&mut jar, "other=old; Path=/a", "https://example.com/");
+        // Rewriting the same value keeps the creation time and position.
+        set(&mut jar, "id=default; Path=/a", "https://example.com/");
+        assert_eq!(
+            header(&mut jar, "https://example.com/a"),
+            Some("id=default; other=old; id=root".into())
+        );
+        // A new value is a new cookie for ordering, as in Chromium.
         set(&mut jar, "id=replaced; Path=/a", "https://example.com/");
         assert_eq!(
             header(&mut jar, "https://example.com/a"),
-            Some("id=replaced; other=old; id=root".into())
+            Some("other=old; id=replaced; id=root".into())
         );
         set(
             &mut jar,
@@ -1441,9 +1455,10 @@ mod tests {
         let records = jar.get_cookies(&at, NOW).unwrap();
         assert_eq!(records[0].value, "café", "Latin-1 decoded for the JS view");
         // Latin-1 records still replace by identity and are charged on the wire length.
+        // The new value makes it the newest cookie, so it now sorts last.
         jar.receive_cookie_bytes(b"lat=\xe0\xe1; Path=/", &at, NOW);
         let bytes = jar.header_bytes(&at, NOW).unwrap().unwrap();
-        assert!(bytes.starts_with(b"lat=\xe0\xe1; "));
+        assert_eq!(bytes, b"utf=caf\xc3\xa9; ascii=1; lat=\xe0\xe1");
         // 3 + 4093 wire octets fit (the UTF-8 view is ~8 KiB); one more does not.
         let limit = format!("lat={}", "\u{e9}".repeat(MAX_COOKIE_BYTES - 2));
         let latin1 = limit.chars().map(|c| c as u8).collect::<Vec<_>>();

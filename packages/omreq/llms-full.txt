@@ -642,7 +642,11 @@ createClient({ proxy: 'env' });
 `noProxy` entries are host names (matching subdomains), IP addresses or CIDR ranges;
 `'*'` disables the proxy. Without a `proxy` option the client always connects directly and
 ignores proxy environment variables. HTTPS targets are tunnelled, so the TLS fingerprint
-and certificate verification stay end-to-end. Proxy failures reject with `ERR_PROXY`.
+and certificate verification stay end-to-end. Proxy failures reject with `ERR_PROXY`
+(phase `proxy`); when the proxy rejects or requires credentials (a CONNECT `407` or a SOCKS5
+authentication failure) the message starts with `Proxy authentication failed`. Failing
+to resolve the proxy's own host name, or a timeout reaching it, reports `ERR_DNS` or
+`ERR_TIMEOUT` instead, the same for HTTP and SOCKS proxies.
 
 ### DNS overrides
 

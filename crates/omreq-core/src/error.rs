@@ -38,7 +38,10 @@ impl Error {
             }
             source = cause.source();
         }
-        let (code, phase, summary) = if e.is_timeout() {
+        let (code, phase, summary) = if e.is_proxy_auth() {
+            // CONNECT 407 or SOCKS5 credentials missing/rejected.
+            ("ERR_PROXY", "proxy", "Proxy authentication failed")
+        } else if e.is_timeout() {
             ("ERR_TIMEOUT", "connect", "Transport timed out")
         } else if e.is_dns() {
             ("ERR_DNS", "connect", "DNS resolution failed")
