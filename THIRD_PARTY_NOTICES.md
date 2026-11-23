@@ -4015,7 +4015,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-## chromium-roots 0.1.1
+## chromium-roots 0.1.3
 
 Declared license: BSD-3-Clause
 Source: https://github.com/0x676e67/chromium-roots
@@ -33989,7 +33989,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-## wreq 0.16.3
+## wreq 0.16.4
 
 Declared license: Apache-2.0
 Source: https://github.com/0x676e67/wreq
@@ -34202,7 +34202,7 @@ Source: https://github.com/0x676e67/wreq
 
 ```
 
-## wreq-proto 0.2.3
+## wreq-proto 0.2.6
 
 Declared license: Apache-2.0
 Source: https://github.com/0x676e67/wreq-proto
@@ -34415,7 +34415,7 @@ Source: https://github.com/0x676e67/wreq-proto
 
 ```
 
-## wreq-rt 0.2.2-rc.2
+## wreq-rt 0.2.2-rc.4
 
 Declared license: Apache-2.0
 Source: https://github.com/0x676e67/wreq-proto

@@ -1,6 +1,6 @@
 # Omreq transport backport
 
-Base: published wreq 0.16.3, VCS 6073cf683d0a62c49c6d9ab4dc8a3c4727e953f0.
+Base: published wreq 0.16.4, VCS 4ddadc9dded0b3accc3f42600f9aa4ff0e7e88ce.
 The additional optional
 `trust_anchors` and `grease_sigalgs_enabled` fields and connector application
 come from upstream cd76bcdf1307153de289d34e072528bdf0510a3b. Their defaults

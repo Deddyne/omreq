@@ -17,7 +17,7 @@ license = "MIT"
 rust-version = "1.100"
 
 [workspace.dependencies]
-wreq = { version = "=0.16.3", default-features = false, features = ["tokio-rt", "webpki-roots", "stream", "socks"] }
+wreq = { version = "=0.16.4", default-features = false, features = ["tokio-rt", "webpki-roots", "stream", "socks"] }
 napi = { version = "=3.16.2", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "=3.7.1"
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -49,5 +49,5 @@ wreq = { path = "vendor/wreq" }
 quic = { path = "vendor/quic" }
 quic-proto = { path = "vendor/quic-proto" }
 http3 = { path = "vendor/http3" }
-btls = { git = "https://github.com/0x676e67/btls", rev = "5ec1c113a03626a5877b34dd6d2ea8d440897a91" }
-btls-sys = { git = "https://github.com/0x676e67/btls", rev = "5ec1c113a03626a5877b34dd6d2ea8d440897a91" }
+btls = { git = "https://github.com/0x676e67/btls", rev = "3c1dd080ba617d78c63cd09285d2ce31abcdcbf9" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "3c1dd080ba617d78c63cd09285d2ce31abcdcbf9" }

@@ -1,8 +1,8 @@
 # Omreq protocol backports
 
-Base: published wreq-proto 0.2.3. Original source and LICENSE are retained.
+Base: published wreq-proto 0.2.6 (VCS 6481a17b03abaf205a88b39a0f8dd6c5e3b07033, published from a dirty tree; the manifest pins the crate archive). Original source and LICENSE are retained.
 `patches/vendor-manifest.json` pins the published and effective source files;
-`patches/wreq-proto-0.2.3.patch` contains every change.
+`patches/wreq-proto-0.2.6.patch` contains every change.
 
 The HTTP2 adapter forwards Omreq's per-connection smaller-only HPACK Huffman
 policy to the pinned HTTP2 implementation. The upstream default is unchanged.
