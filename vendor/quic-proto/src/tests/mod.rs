@@ -5328,3 +5328,119 @@ fn qlog_packet_lost_trigger() {
         ]
     );
 }
+
+fn chromium_client_config() -> ClientConfig {
+    let mut cfg = client_config();
+    let mut transport = TransportConfig::default();
+    transport.chromium_sending(true);
+    // MTU probes carry PINGs of their own.
+    transport.mtu_discovery_config(None);
+    cfg.transport = Arc::new(transport);
+    cfg
+}
+
+/// The end of the first QUIC packet of a datagram that starts with an Initial packet.
+fn initial_packet_end(datagram: &[u8]) -> Option<usize> {
+    fn varint(bytes: &[u8], at: usize) -> (u64, usize) {
+        let len = 1usize << (bytes[at] >> 6);
+        let mut value = u64::from(bytes[at] & 0x3f);
+        for byte in &bytes[at + 1..at + len] {
+            value = (value << 8) | u64::from(*byte);
+        }
+        (value, at + len)
+    }
+    if datagram[0] & 0x80 == 0 || (datagram[0] >> 4) & 3 != 0 {
+        return None;
+    }
+    let mut at = 5;
+    at += 1 + datagram[at] as usize;
+    at += 1 + datagram[at] as usize;
+    let (token, next) = varint(datagram, at);
+    let (length, next) = varint(datagram, next + token as usize);
+    Some(next + length as usize)
+}
+
+#[test]
+fn chromium_sending_initial_fills_its_datagram() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(chromium_client_config());
+    let mut initials = 0;
+    for _ in 0..100 {
+        // Every client datagram is inspected before the server reads it.
+        pair.drive_client();
+        for (_, _, datagram) in &pair.server.inbound {
+            if let Some(end) = initial_packet_end(datagram) {
+                initials += 1;
+                assert_eq!(
+                    end,
+                    datagram.len(),
+                    "nothing is coalesced after an Initial packet"
+                );
+            }
+        }
+        pair.drive_server();
+        if !pair.client_conn_mut(client_ch).is_handshaking() {
+            break;
+        }
+        if pair.client.inbound.is_empty() {
+            match min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                Some(t) => pair.time = pair.time.max(t),
+                None => break,
+            }
+        }
+    }
+    assert!(
+        initials >= 2,
+        "the client's Initial and its ACK of the server's Initial"
+    );
+    assert!(!pair.client_conn_mut(client_ch).is_handshaking());
+}
+
+#[test]
+fn chromium_sending_probe_resends_data_without_ping() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(chromium_client_config());
+    // The client's first flight is lost.
+    pair.drive_client();
+    pair.server.inbound.clear();
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+    // One packet was outstanding, so one probe resent it; no PING made up the second probe.
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.frame_tx.ping, 0);
+}
+
+#[test]
+fn chromium_sending_keeps_the_anti_deadlock_probe() {
+    let _guard = subscribe();
+    let (cert, key) = big_cert_and_key();
+    let server = server_config_with_cert(cert.clone(), key);
+    let mut client = client_config_with_certs(vec![cert]);
+    let mut transport = TransportConfig::default();
+    transport.chromium_sending(true);
+    client.transport = Arc::new(transport);
+    let mut pair = Pair::new(Default::default(), server);
+    let client_ch = pair.begin_connect(client);
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    pair.server.inbound.clear();
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+}

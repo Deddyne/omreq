@@ -66,6 +66,11 @@ pub(super) struct PacketSpace {
     pub(super) loss_time: Option<Instant>,
     /// Number of tail loss probes to send
     pub(super) loss_probes: u32,
+    /// With [`TransportConfig::chromium_sending`](crate::TransportConfig::chromium_sending):
+    /// the first packet number sent after the probe timeout fired. Probes resend only packets
+    /// numbered below it, as QUICHE picks its probes among the packets outstanding when the
+    /// timer fired, so a probe never repeats another probe.
+    pub(super) probe_limit: Option<u64>,
     pub(super) ping_pending: bool,
     pub(super) immediate_ack_pending: bool,
     /// Number of packets sent in the current key phase
@@ -98,6 +103,7 @@ impl PacketSpace {
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,
             loss_probes: 0,
+            probe_limit: None,
             ping_pending: false,
             immediate_ack_pending: false,
             sent_with_keys: 0,
@@ -143,13 +149,23 @@ impl PacketSpace {
             return;
         }
 
-        // Retransmit the data of the oldest in-flight packet
-        for packet in self.sent_packets.values_mut() {
-            if !packet.retransmits.is_empty(streams) {
-                // Remove retransmitted data from the old packet so we don't end up retransmitting
-                // it *again* even if the copy we're sending now gets acknowledged.
-                self.pending |= mem::take(&mut packet.retransmits);
-                return;
+        if let Some(limit) = self.probe_limit {
+            // Only packets outstanding when the probe timeout fired, never an earlier probe.
+            for packet in self.sent_packets.values_mut_below(limit) {
+                if !packet.retransmits.is_empty(streams) {
+                    self.pending |= mem::take(&mut packet.retransmits);
+                    return;
+                }
+            }
+        } else {
+            // Retransmit the data of the oldest in-flight packet
+            for packet in self.sent_packets.values_mut() {
+                if !packet.retransmits.is_empty(streams) {
+                    // Remove retransmitted data from the old packet so we don't end up retransmitting
+                    // it *again* even if the copy we're sending now gets acknowledged.
+                    self.pending |= mem::take(&mut packet.retransmits);
+                    return;
+                }
             }
         }
 
@@ -159,6 +175,14 @@ impl PacketSpace {
         if !self.immediate_ack_pending {
             self.ping_pending = true;
         }
+    }
+
+    /// Packets numbered below `limit` that still carry data to retransmit.
+    pub(super) fn retransmittable_below(&self, limit: u64, streams: &StreamsState) -> usize {
+        self.sent_packets
+            .range(..limit)
+            .filter(|(_, packet)| !packet.retransmits.is_empty(streams))
+            .count()
     }
 
     /// Get the next outgoing packet number in this space
@@ -886,7 +910,7 @@ impl PacketNumberFilter {
         }
     }
 
-    #[cfg(test)]
+    /// A filter that skips nothing on its own; see [`Self::skipped`].
     pub(super) fn disabled() -> Self {
         Self {
             next_skipped_packet_number: u64::MAX,
@@ -922,6 +946,11 @@ impl PacketNumberFilter {
         self.exponent = next_exponent;
 
         space.get_tx_number()
+    }
+
+    /// Records a packet number the connection skipped itself, so an ACK for it is rejected.
+    pub(super) fn skipped(&mut self, pn: u64) {
+        self.prev_skipped_packet_number = Some(pn);
     }
 
     pub(super) fn check_ack(

@@ -52,8 +52,11 @@ fn random_below(rng: &mut StdRng, bound: u64) -> u64 {
 /// Fills the rest of a client Initial packet, `buf[..max_size]`, with the pending CRYPTO data
 /// that fits, PING and PADDING frames in Chromium's randomized layout.
 ///
-/// Returns the CRYPTO frames written, for retransmission. When nothing is pending, writes
-/// nothing and returns an empty list.
+/// Returns the CRYPTO data written, for retransmission, as the frames it was taken in before
+/// the random split: like QUICHE, where the chaos protector works on a copy of the queued
+/// frames, a lost packet is resent from those and split afresh, so retransmissions do not
+/// fragment further with every loss. When nothing is pending, writes nothing and returns an
+/// empty list.
 pub(super) fn write_crypto(
     pending: &mut VecDeque<frame::Crypto>,
     rng: &mut StdRng,
@@ -123,6 +126,7 @@ pub(super) fn write_crypto(
         .iter()
         .map(|f| overhead(f.offset, f.data.len()) + f.data.len())
         .sum::<usize>();
+    let unsplit = frames.clone();
     let mut padding = free - used;
     let mut items: Vec<Item> = frames.iter().cloned().map(Item::Crypto).collect();
     if padding > 0 {
@@ -135,21 +139,19 @@ pub(super) fn write_crypto(
         }
     }
 
-    let mut written = Vec::new();
     for item in items {
         match item {
             Item::Crypto(frame) => {
                 trace!("CRYPTO: off {} len {} (chaos)", frame.offset, frame.data.len());
                 frame.encode(buf);
                 stats.crypto += 1;
-                written.push(frame);
             }
             Item::Ping => buf.write(FrameType::PING),
             Item::Padding(n) => buf.put_bytes(0, n),
         }
     }
     debug_assert_eq!(buf.len(), max_size, "chaos layout must fill the packet");
-    written
+    unsplit
 }
 
 /// Head and tail lengths for the first packet of a ClientHello that needs several packets,
@@ -316,6 +318,28 @@ mod tests {
     }
 
     #[test]
+    fn retransmission_keeps_the_unsplit_frames() {
+        for seed in 0..64 {
+            let (first, second) = layout(1874, 1210, seed);
+            // Head and tail in the first packet, the middle in one frame in the second.
+            assert_eq!(first.len(), 2);
+            assert_eq!(first[0].offset, 0);
+            assert_eq!(first[1].offset + first[1].data.len() as u64, 1874);
+            assert_eq!(second.len(), 1);
+            // Resending the first packet splits head and tail once more, not its fragments.
+            let mut pending = VecDeque::from(first.clone());
+            let mut rng = StdRng::seed_from_u64(seed + 1000);
+            let mut buf = Vec::new();
+            let mut stats = FrameStats::default();
+            let resent = write_crypto(&mut pending, &mut rng, &mut buf, 1210, &mut stats);
+            assert!(pending.is_empty());
+            assert_eq!(buf.len(), 1210);
+            assert_eq!(resent.len(), 2);
+            assert!(stats.crypto <= 2 + MAX_ADDED_CRYPTO_FRAMES);
+        }
+    }
+
+    #[test]
     fn single_packet_layout_adds_pings_and_padding() {
         let mut pending = VecDeque::from([frame::Crypto {
             offset: 0,
@@ -328,7 +352,8 @@ mod tests {
         assert!(pending.is_empty());
         assert_eq!(buf.len(), 1210);
         assert_eq!(frames.iter().map(|f| f.data.len()).sum::<usize>(), 600);
-        assert!(frames.len() >= 2, "the CRYPTO frame was split");
+        assert_eq!(frames.len(), 1, "retransmissions keep the unsplit frame");
+        assert!(stats.crypto >= 2, "the CRYPTO frame was split on the wire");
         assert!(stats.ping >= 2);
     }
 }

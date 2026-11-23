@@ -60,6 +60,14 @@ impl SentPackets {
         self.packets.values_mut()
     }
 
+    /// Mutably iterate present entries numbered below `limit`, in increasing packet-number order.
+    pub(super) fn values_mut_below(
+        &mut self,
+        limit: u64,
+    ) -> impl Iterator<Item = &mut SentPacket> + '_ {
+        self.packets.range_mut(..limit).map(|(_, packet)| packet)
+    }
+
     /// Consume the map, yielding present entries in increasing packet-number order.
     pub(super) fn into_values(self) -> impl Iterator<Item = SentPacket> {
         self.packets.into_values()

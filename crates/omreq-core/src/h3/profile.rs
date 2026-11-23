@@ -296,6 +296,10 @@ impl Http3Profile {
         transport.shared_packet_numbers(quic["sharedPacketNumbers"] == true);
         // QUICHE's `kInitialRttMs`; it sets the first retransmission and pacing timers.
         transport.initial_rtt(std::time::Duration::from_millis(100));
+        // Chromium's loss probes, packet number skipping and handshake datagram layout.
+        transport.chromium_sending(true);
+        // A Chromium client sends no path MTU probes: its packets stay at the initial size.
+        transport.mtu_discovery_config(None);
 
         let settings = http3["settings"]
             .as_array()

@@ -1,15 +1,16 @@
 --- a/src/config/transport.rs
 +++ b/src/config/transport.rs
-@@ -41,6 +41,8 @@
+@@ -41,6 +41,9 @@
      pub(crate) min_mtu: u16,
      pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
      pub(crate) pad_to_mtu: bool,
 +    pub(crate) initial_chaos_protection: bool,
 +    pub(crate) shared_packet_numbers: bool,
++    pub(crate) chromium_sending: bool,
      pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
      pub(crate) max_outgoing_bytes_per_second: Option<u64>,
  
-@@ -251,9 +253,26 @@
+@@ -251,6 +254,34 @@
      /// too large to be coalesced.
      pub fn pad_to_mtu(&mut self, value: bool) -> &mut Self {
          self.pad_to_mtu = value;
@@ -23,9 +24,9 @@
 +    /// with PING and PADDING frames in random order, filling the packet. Defaults to `false`.
 +    pub fn initial_chaos_protection(&mut self, value: bool) -> &mut Self {
 +        self.initial_chaos_protection = value;
-         self
-     }
- 
++        self
++    }
++
 +    /// Numbers packets of every packet number space from one sequence starting at 1, as
 +    /// Chromium does, instead of a sequence per space starting at 0. Defaults to `false`.
 +    pub fn shared_packet_numbers(&mut self, value: bool) -> &mut Self {
@@ -33,39 +34,50 @@
 +        self
 +    }
 +
-     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
-     ///
-     /// The provided configuration will be ignored if the peer does not support the acknowledgement
-@@ -426,6 +445,8 @@
++    /// Recovers lost handshake packets and lays out handshake datagrams as a Chromium client
++    ///
++    /// When a probe timeout fires, one packet number is skipped, and the probes resend only
++    /// packets that were in flight when it fired, so a probe never repeats another probe. A
++    /// client's Initial packet fills its datagram alone, and a Handshake ACK goes out on its
++    /// own before the client's Handshake CRYPTO data. Defaults to `false`.
++    pub fn chromium_sending(&mut self, value: bool) -> &mut Self {
++        self.chromium_sending = value;
+         self
+     }
+ 
+@@ -426,6 +457,9 @@
              min_mtu: INITIAL_MTU,
              mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
              pad_to_mtu: false,
 +            initial_chaos_protection: false,
 +            shared_packet_numbers: false,
++            chromium_sending: false,
              ack_frequency_config: None,
              max_outgoing_bytes_per_second: None,
  
-@@ -467,6 +488,8 @@
+@@ -467,6 +501,9 @@
              min_mtu,
              mtu_discovery_config,
              pad_to_mtu,
 +            initial_chaos_protection,
 +            shared_packet_numbers,
++            chromium_sending,
              ack_frequency_config,
              max_outgoing_bytes_per_second,
              persistent_congestion_threshold,
-@@ -499,6 +522,8 @@
+@@ -499,6 +536,9 @@
              .field("min_mtu", min_mtu)
              .field("mtu_discovery_config", mtu_discovery_config)
              .field("pad_to_mtu", pad_to_mtu)
 +            .field("initial_chaos_protection", initial_chaos_protection)
 +            .field("shared_packet_numbers", shared_packet_numbers)
++            .field("chromium_sending", chromium_sending)
              .field("ack_frequency_config", ack_frequency_config)
              .field(
                  "max_outgoing_bytes_per_second",
 --- a/src/connection/chaos.rs
 +++ b/src/connection/chaos.rs
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,359 @@
 +//! Chromium-style chaos protection for client Initial packets.
 +//!
 +//! Chromium's QUIC stack (QUICHE) randomizes the layout of the ClientHello in its Initial
@@ -120,8 +132,11 @@
 +/// Fills the rest of a client Initial packet, `buf[..max_size]`, with the pending CRYPTO data
 +/// that fits, PING and PADDING frames in Chromium's randomized layout.
 +///
-+/// Returns the CRYPTO frames written, for retransmission. When nothing is pending, writes
-+/// nothing and returns an empty list.
++/// Returns the CRYPTO data written, for retransmission, as the frames it was taken in before
++/// the random split: like QUICHE, where the chaos protector works on a copy of the queued
++/// frames, a lost packet is resent from those and split afresh, so retransmissions do not
++/// fragment further with every loss. When nothing is pending, writes nothing and returns an
++/// empty list.
 +pub(super) fn write_crypto(
 +    pending: &mut VecDeque<frame::Crypto>,
 +    rng: &mut StdRng,
@@ -191,6 +206,7 @@
 +        .iter()
 +        .map(|f| overhead(f.offset, f.data.len()) + f.data.len())
 +        .sum::<usize>();
++    let unsplit = frames.clone();
 +    let mut padding = free - used;
 +    let mut items: Vec<Item> = frames.iter().cloned().map(Item::Crypto).collect();
 +    if padding > 0 {
@@ -203,21 +219,19 @@
 +        }
 +    }
 +
-+    let mut written = Vec::new();
 +    for item in items {
 +        match item {
 +            Item::Crypto(frame) => {
 +                trace!("CRYPTO: off {} len {} (chaos)", frame.offset, frame.data.len());
 +                frame.encode(buf);
 +                stats.crypto += 1;
-+                written.push(frame);
 +            }
 +            Item::Ping => buf.write(FrameType::PING),
 +            Item::Padding(n) => buf.put_bytes(0, n),
 +        }
 +    }
 +    debug_assert_eq!(buf.len(), max_size, "chaos layout must fill the packet");
-+    written
++    unsplit
 +}
 +
 +/// Head and tail lengths for the first packet of a ClientHello that needs several packets,
@@ -384,6 +398,28 @@
 +    }
 +
 +    #[test]
++    fn retransmission_keeps_the_unsplit_frames() {
++        for seed in 0..64 {
++            let (first, second) = layout(1874, 1210, seed);
++            // Head and tail in the first packet, the middle in one frame in the second.
++            assert_eq!(first.len(), 2);
++            assert_eq!(first[0].offset, 0);
++            assert_eq!(first[1].offset + first[1].data.len() as u64, 1874);
++            assert_eq!(second.len(), 1);
++            // Resending the first packet splits head and tail once more, not its fragments.
++            let mut pending = VecDeque::from(first.clone());
++            let mut rng = StdRng::seed_from_u64(seed + 1000);
++            let mut buf = Vec::new();
++            let mut stats = FrameStats::default();
++            let resent = write_crypto(&mut pending, &mut rng, &mut buf, 1210, &mut stats);
++            assert!(pending.is_empty());
++            assert_eq!(buf.len(), 1210);
++            assert_eq!(resent.len(), 2);
++            assert!(stats.crypto <= 2 + MAX_ADDED_CRYPTO_FRAMES);
++        }
++    }
++
++    #[test]
 +    fn single_packet_layout_adds_pings_and_padding() {
 +        let mut pending = VecDeque::from([frame::Crypto {
 +            offset: 0,
@@ -396,7 +432,8 @@
 +        assert!(pending.is_empty());
 +        assert_eq!(buf.len(), 1210);
 +        assert_eq!(frames.iter().map(|f| f.data.len()).sum::<usize>(), 600);
-+        assert!(frames.len() >= 2, "the CRYPTO frame was split");
++        assert_eq!(frames.len(), 1, "retransmissions keep the unsplit frame");
++        assert!(stats.crypto >= 2, "the CRYPTO frame was split on the wire");
 +        assert!(stats.ping >= 2);
 +    }
 +}
@@ -421,15 +458,153 @@
  
      //
      // Queued non-retransmittable 1-RTT data
-@@ -342,6 +347,7 @@
+@@ -336,12 +341,19 @@
+             early_1rtt: Vec::new(),
+             error: None,
+             #[cfg(test)]
+-            packet_number_filter: match config.deterministic_packet_numbers {
++            packet_number_filter: match config.deterministic_packet_numbers
++                || config.chromium_sending
++            {
+                 false => PacketNumberFilter::new(&mut rng),
+                 true => PacketNumberFilter::disabled(),
              },
++            // QUICHE skips packet numbers only when a probe timeout fires.
              #[cfg(not(test))]
-             packet_number_filter: PacketNumberFilter::new(&mut rng),
+-            packet_number_filter: PacketNumberFilter::new(&mut rng),
++            packet_number_filter: match config.chromium_sending {
++                false => PacketNumberFilter::new(&mut rng),
++                true => PacketNumberFilter::disabled(),
++            },
 +            next_shared_packet_number: 1,
  
              path_responses: PathResponses::default(),
              close: false,
-@@ -3429,6 +3435,21 @@
+@@ -580,6 +592,19 @@
+             if space_id == SpaceId::Data {
+                 ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
+             }
++            // A Chromium client acknowledges the server's Handshake packets in a packet of its
++            // own, then sends its Finished with the first 1-RTT data.
++            let acks_only = self.config.chromium_sending
++                && self.side.is_client()
++                && space_id == SpaceId::Handshake
++                && !close
++                && can_send.acks
++                && !self.spaces[space_id].pending.crypto.is_empty()
++                && !self.spaces[space_id].ping_pending
++                && self.spaces[space_id].loss_probes == 0;
++            if acks_only {
++                ack_eliciting = false;
++            }
+ 
+             pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
+ 
+@@ -814,6 +839,12 @@
+                 self,
+             )?);
+             coalesce = coalesce && !builder.short_header;
++            if self.config.chromium_sending && self.side.is_client() && space_id == SpaceId::Initial
++            {
++                // A Chromium client pads every Initial packet to the full datagram itself, so
++                // nothing is coalesced after it.
++                coalesce = false;
++            }
+ 
+             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
+             pad_datagram |=
+@@ -912,8 +943,14 @@
+                 });
+             }
+ 
+-            let sent =
+-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
++            let sent = self.populate_packet(
++                now,
++                space_id,
++                buf,
++                builder.max_size,
++                builder.exact_number,
++                acks_only,
++            );
+ 
+             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
+             // any other reason, there is a bug which leads to one component announcing write
+@@ -939,6 +976,10 @@
+ 
+             // Keep information about the packet around until it gets finalized
+             sent_frames = Some(sent);
++            if acks_only {
++                // The client's CRYPTO data follows in a datagram of its own.
++                break;
++            }
+ 
+             // Don't increment space_idx.
+             // We stay in the current space and check if there is more data to send.
+@@ -1743,7 +1784,7 @@
+             "PTO fired"
+         );
+ 
+-        let count = match self.path.in_flight.ack_eliciting {
++        let mut count = match self.path.in_flight.ack_eliciting {
+             // A PTO when we're not expecting any ACKs must be due to handshake anti-amplification
+             // deadlock preventions
+             0 => {
+@@ -1753,6 +1794,35 @@
+             // Conventional loss probe
+             _ => 2,
+         };
++        if self.config.chromium_sending {
++            let shared = self.config.shared_packet_numbers;
++            let next_shared = self.next_shared_packet_number;
++            let state = &mut self.spaces[space];
++            let next = if shared {
++                state.next_packet_number.max(next_shared)
++            } else {
++                state.next_packet_number
++            };
++            if space != SpaceId::Data {
++                // QUICHE (`QuicSentPacketManager::MaybeSendProbePacket`) probes with the
++                // packets outstanding when the timer fired, at most two, and sends fewer
++                // probes rather than repeating one.
++                state.probe_limit = Some(next);
++                let outstanding = state.retransmittable_below(next, &self.streams);
++                if count > 1 && outstanding > 0 {
++                    count = count.min(outstanding as u32);
++                }
++            }
++            // QUICHE (`QuicConnection::OnRetransmissionAlarm`) skips a packet number whenever
++            // a probe timeout fires, to elicit an immediate ACK.
++            state.next_packet_number = next + 1;
++            if shared {
++                self.next_shared_packet_number = next + 1;
++            }
++            if space == SpaceId::Data {
++                self.packet_number_filter.skipped(next);
++            }
++        }
+         self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
+         self.pto_count = self.pto_count.saturating_add(1);
+         self.set_loss_detection_timer(now);
+@@ -3324,6 +3394,7 @@
+         buf: &mut Vec<u8>,
+         max_size: usize,
+         pn: u64,
++        acks_only: bool,
+     ) -> SentFrames {
+         let mut sent = SentFrames::default();
+         let space = &mut self.spaces[space_id];
+@@ -3369,6 +3440,9 @@
+                 max_size,
+             );
+         }
++        if acks_only {
++            return sent;
++        }
+ 
+         // ACK_FREQUENCY
+         if mem::replace(&mut space.pending.ack_frequency, false) {
+@@ -3429,6 +3503,21 @@
          }
  
          // CRYPTO
@@ -521,6 +696,237 @@
              buffer[partial_encode.start] ^= FIXED_BIT;
          }
  
+--- a/src/connection/sent_packets.rs
++++ b/src/connection/sent_packets.rs
+@@ -60,6 +60,14 @@
+         self.packets.values_mut()
+     }
+ 
++    /// Mutably iterate present entries numbered below `limit`, in increasing packet-number order.
++    pub(super) fn values_mut_below(
++        &mut self,
++        limit: u64,
++    ) -> impl Iterator<Item = &mut SentPacket> + '_ {
++        self.packets.range_mut(..limit).map(|(_, packet)| packet)
++    }
++
+     /// Consume the map, yielding present entries in increasing packet-number order.
+     pub(super) fn into_values(self) -> impl Iterator<Item = SentPacket> {
+         self.packets.into_values()
+--- a/src/connection/spaces.rs
++++ b/src/connection/spaces.rs
+@@ -66,6 +66,11 @@
+     pub(super) loss_time: Option<Instant>,
+     /// Number of tail loss probes to send
+     pub(super) loss_probes: u32,
++    /// With [`TransportConfig::chromium_sending`](crate::TransportConfig::chromium_sending):
++    /// the first packet number sent after the probe timeout fired. Probes resend only packets
++    /// numbered below it, as QUICHE picks its probes among the packets outstanding when the
++    /// timer fired, so a probe never repeats another probe.
++    pub(super) probe_limit: Option<u64>,
+     pub(super) ping_pending: bool,
+     pub(super) immediate_ack_pending: bool,
+     /// Number of packets sent in the current key phase
+@@ -98,6 +103,7 @@
+             time_of_last_ack_eliciting_packet: None,
+             loss_time: None,
+             loss_probes: 0,
++            probe_limit: None,
+             ping_pending: false,
+             immediate_ack_pending: false,
+             sent_with_keys: 0,
+@@ -143,14 +149,24 @@
+             return;
+         }
+ 
+-        // Retransmit the data of the oldest in-flight packet
+-        for packet in self.sent_packets.values_mut() {
+-            if !packet.retransmits.is_empty(streams) {
+-                // Remove retransmitted data from the old packet so we don't end up retransmitting
+-                // it *again* even if the copy we're sending now gets acknowledged.
+-                self.pending |= mem::take(&mut packet.retransmits);
+-                return;
++        if let Some(limit) = self.probe_limit {
++            // Only packets outstanding when the probe timeout fired, never an earlier probe.
++            for packet in self.sent_packets.values_mut_below(limit) {
++                if !packet.retransmits.is_empty(streams) {
++                    self.pending |= mem::take(&mut packet.retransmits);
++                    return;
++                }
+             }
++        } else {
++            // Retransmit the data of the oldest in-flight packet
++            for packet in self.sent_packets.values_mut() {
++                if !packet.retransmits.is_empty(streams) {
++                    // Remove retransmitted data from the old packet so we don't end up retransmitting
++                    // it *again* even if the copy we're sending now gets acknowledged.
++                    self.pending |= mem::take(&mut packet.retransmits);
++                    return;
++                }
++            }
+         }
+ 
+         // Nothing new to send and nothing to retransmit, so fall back on a ping. This should only
+@@ -159,6 +175,14 @@
+         if !self.immediate_ack_pending {
+             self.ping_pending = true;
+         }
++    }
++
++    /// Packets numbered below `limit` that still carry data to retransmit.
++    pub(super) fn retransmittable_below(&self, limit: u64, streams: &StreamsState) -> usize {
++        self.sent_packets
++            .range(..limit)
++            .filter(|(_, packet)| !packet.retransmits.is_empty(streams))
++            .count()
+     }
+ 
+     /// Get the next outgoing packet number in this space
+@@ -886,7 +910,7 @@
+         }
+     }
+ 
+-    #[cfg(test)]
++    /// A filter that skips nothing on its own; see [`Self::skipped`].
+     pub(super) fn disabled() -> Self {
+         Self {
+             next_skipped_packet_number: u64::MAX,
+@@ -924,6 +948,11 @@
+         space.get_tx_number()
+     }
+ 
++    /// Records a packet number the connection skipped itself, so an ACK for it is rejected.
++    pub(super) fn skipped(&mut self, pn: u64) {
++        self.prev_skipped_packet_number = Some(pn);
++    }
++
+     pub(super) fn check_ack(
+         &self,
+         space_id: SpaceId,
+--- a/src/tests/mod.rs
++++ b/src/tests/mod.rs
+@@ -5326,5 +5326,121 @@
+             PacketLostTrigger::TimeThreshold,
+             PacketLostTrigger::ReorderingThreshold
+         ]
++    );
++}
++
++fn chromium_client_config() -> ClientConfig {
++    let mut cfg = client_config();
++    let mut transport = TransportConfig::default();
++    transport.chromium_sending(true);
++    // MTU probes carry PINGs of their own.
++    transport.mtu_discovery_config(None);
++    cfg.transport = Arc::new(transport);
++    cfg
++}
++
++/// The end of the first QUIC packet of a datagram that starts with an Initial packet.
++fn initial_packet_end(datagram: &[u8]) -> Option<usize> {
++    fn varint(bytes: &[u8], at: usize) -> (u64, usize) {
++        let len = 1usize << (bytes[at] >> 6);
++        let mut value = u64::from(bytes[at] & 0x3f);
++        for byte in &bytes[at + 1..at + len] {
++            value = (value << 8) | u64::from(*byte);
++        }
++        (value, at + len)
++    }
++    if datagram[0] & 0x80 == 0 || (datagram[0] >> 4) & 3 != 0 {
++        return None;
++    }
++    let mut at = 5;
++    at += 1 + datagram[at] as usize;
++    at += 1 + datagram[at] as usize;
++    let (token, next) = varint(datagram, at);
++    let (length, next) = varint(datagram, next + token as usize);
++    Some(next + length as usize)
++}
++
++#[test]
++fn chromium_sending_initial_fills_its_datagram() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let client_ch = pair.begin_connect(chromium_client_config());
++    let mut initials = 0;
++    for _ in 0..100 {
++        // Every client datagram is inspected before the server reads it.
++        pair.drive_client();
++        for (_, _, datagram) in &pair.server.inbound {
++            if let Some(end) = initial_packet_end(datagram) {
++                initials += 1;
++                assert_eq!(
++                    end,
++                    datagram.len(),
++                    "nothing is coalesced after an Initial packet"
++                );
++            }
++        }
++        pair.drive_server();
++        if !pair.client_conn_mut(client_ch).is_handshaking() {
++            break;
++        }
++        if pair.client.inbound.is_empty() {
++            match min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
++                Some(t) => pair.time = pair.time.max(t),
++                None => break,
++            }
++        }
++    }
++    assert!(
++        initials >= 2,
++        "the client's Initial and its ACK of the server's Initial"
+     );
++    assert!(!pair.client_conn_mut(client_ch).is_handshaking());
+ }
++
++#[test]
++fn chromium_sending_probe_resends_data_without_ping() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let client_ch = pair.begin_connect(chromium_client_config());
++    // The client's first flight is lost.
++    pair.drive_client();
++    pair.server.inbound.clear();
++    pair.drive();
++    assert_matches!(
++        pair.client_conn_mut(client_ch).poll(),
++        Some(Event::HandshakeDataReady)
++    );
++    assert_matches!(
++        pair.client_conn_mut(client_ch).poll(),
++        Some(Event::Connected)
++    );
++    // One packet was outstanding, so one probe resent it; no PING made up the second probe.
++    let stats = pair.client_conn_mut(client_ch).stats();
++    assert_eq!(stats.frame_tx.ping, 0);
++}
++
++#[test]
++fn chromium_sending_keeps_the_anti_deadlock_probe() {
++    let _guard = subscribe();
++    let (cert, key) = big_cert_and_key();
++    let server = server_config_with_cert(cert.clone(), key);
++    let mut client = client_config_with_certs(vec![cert]);
++    let mut transport = TransportConfig::default();
++    transport.chromium_sending(true);
++    client.transport = Arc::new(transport);
++    let mut pair = Pair::new(Default::default(), server);
++    let client_ch = pair.begin_connect(client);
++    pair.drive_client();
++    pair.drive_server();
++    pair.drive_client();
++    pair.server.inbound.clear();
++    pair.drive();
++    assert_matches!(
++        pair.client_conn_mut(client_ch).poll(),
++        Some(Event::HandshakeDataReady)
++    );
++    assert_matches!(
++        pair.client_conn_mut(client_ch).poll(),
++        Some(Event::Connected)
++    );
++}
 --- a/src/transport_parameters.rs
 +++ b/src/transport_parameters.rs
 @@ -298,14 +298,24 @@

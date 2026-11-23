@@ -341,12 +341,18 @@ impl Connection {
             early_1rtt: Vec::new(),
             error: None,
             #[cfg(test)]
-            packet_number_filter: match config.deterministic_packet_numbers {
+            packet_number_filter: match config.deterministic_packet_numbers
+                || config.chromium_sending
+            {
                 false => PacketNumberFilter::new(&mut rng),
                 true => PacketNumberFilter::disabled(),
             },
+            // QUICHE skips packet numbers only when a probe timeout fires.
             #[cfg(not(test))]
-            packet_number_filter: PacketNumberFilter::new(&mut rng),
+            packet_number_filter: match config.chromium_sending {
+                false => PacketNumberFilter::new(&mut rng),
+                true => PacketNumberFilter::disabled(),
+            },
             next_shared_packet_number: 1,
 
             path_responses: PathResponses::default(),
@@ -586,6 +592,19 @@ impl Connection {
             if space_id == SpaceId::Data {
                 ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
             }
+            // A Chromium client acknowledges the server's Handshake packets in a packet of its
+            // own, then sends its Finished with the first 1-RTT data.
+            let acks_only = self.config.chromium_sending
+                && self.side.is_client()
+                && space_id == SpaceId::Handshake
+                && !close
+                && can_send.acks
+                && !self.spaces[space_id].pending.crypto.is_empty()
+                && !self.spaces[space_id].ping_pending
+                && self.spaces[space_id].loss_probes == 0;
+            if acks_only {
+                ack_eliciting = false;
+            }
 
             pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
 
@@ -820,6 +839,12 @@ impl Connection {
                 self,
             )?);
             coalesce = coalesce && !builder.short_header;
+            if self.config.chromium_sending && self.side.is_client() && space_id == SpaceId::Initial
+            {
+                // A Chromium client pads every Initial packet to the full datagram itself, so
+                // nothing is coalesced after it.
+                coalesce = false;
+            }
 
             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
             pad_datagram |=
@@ -918,8 +943,14 @@ impl Connection {
                 });
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = self.populate_packet(
+                now,
+                space_id,
+                buf,
+                builder.max_size,
+                builder.exact_number,
+                acks_only,
+            );
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -945,6 +976,10 @@ impl Connection {
 
             // Keep information about the packet around until it gets finalized
             sent_frames = Some(sent);
+            if acks_only {
+                // The client's CRYPTO data follows in a datagram of its own.
+                break;
+            }
 
             // Don't increment space_idx.
             // We stay in the current space and check if there is more data to send.
@@ -1749,7 +1784,7 @@ impl Connection {
             "PTO fired"
         );
 
-        let count = match self.path.in_flight.ack_eliciting {
+        let mut count = match self.path.in_flight.ack_eliciting {
             // A PTO when we're not expecting any ACKs must be due to handshake anti-amplification
             // deadlock preventions
             0 => {
@@ -1759,6 +1794,35 @@ impl Connection {
             // Conventional loss probe
             _ => 2,
         };
+        if self.config.chromium_sending {
+            let shared = self.config.shared_packet_numbers;
+            let next_shared = self.next_shared_packet_number;
+            let state = &mut self.spaces[space];
+            let next = if shared {
+                state.next_packet_number.max(next_shared)
+            } else {
+                state.next_packet_number
+            };
+            if space != SpaceId::Data {
+                // QUICHE (`QuicSentPacketManager::MaybeSendProbePacket`) probes with the
+                // packets outstanding when the timer fired, at most two, and sends fewer
+                // probes rather than repeating one.
+                state.probe_limit = Some(next);
+                let outstanding = state.retransmittable_below(next, &self.streams);
+                if count > 1 && outstanding > 0 {
+                    count = count.min(outstanding as u32);
+                }
+            }
+            // QUICHE (`QuicConnection::OnRetransmissionAlarm`) skips a packet number whenever
+            // a probe timeout fires, to elicit an immediate ACK.
+            state.next_packet_number = next + 1;
+            if shared {
+                self.next_shared_packet_number = next + 1;
+            }
+            if space == SpaceId::Data {
+                self.packet_number_filter.skipped(next);
+            }
+        }
         self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
         self.pto_count = self.pto_count.saturating_add(1);
         self.set_loss_detection_timer(now);
@@ -3330,6 +3394,7 @@ impl Connection {
         buf: &mut Vec<u8>,
         max_size: usize,
         pn: u64,
+        acks_only: bool,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
         let space = &mut self.spaces[space_id];
@@ -3374,6 +3439,9 @@ impl Connection {
                 &mut self.stats,
                 max_size,
             );
+        }
+        if acks_only {
+            return sent;
         }
 
         // ACK_FREQUENCY
