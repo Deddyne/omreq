@@ -1,0 +1,318 @@
+# Notices new upstream releases of the crates omreq vendors or pins (scripts/upstream.mjs) and
+# new Chrome stable majors. Each crate update is re-vendored with our patch, built and checked
+# on the three CI platforms, then opened as a pull request — or, when the patch no longer
+# applies or a check fails, as an issue with the log. See "Upstream updates" in AGENTS.md.
+name: Upstream
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+    inputs:
+      retry:
+        description: Retry updates that already failed on this commit or whose pull request was closed
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: upstream
+  cancel-in-progress: false
+env:
+  NODE_VERSION: '26.13.1'
+  BUN_VERSION: '1.4.4'
+  PNPM_VERSION: '11.22.0'
+  RUST_TOOLCHAIN: '1.100.0'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      updates: ${{ steps.find.outputs.updates }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: gh label create upstream --color 0e8a16 --description 'Upstream crate or Chrome update' --force
+      - id: find
+        env:
+          UPSTREAM_RETRY: ${{ inputs.retry }}
+        run: node scripts/upstream-check.mjs
+      # A new Chrome major needs a capture from a real Chrome (pnpm profile:new on a Mac).
+      - if: steps.find.outputs.chrome != ''
+        env:
+          CHROME: ${{ steps.find.outputs.chrome }}
+        run: |
+          major=$(jq -r .major <<<"$CHROME")
+          version=$(jq -r .version <<<"$CHROME")
+          profile=$(jq -r .profile <<<"$CHROME")
+          title="Capture a Chrome $major profile"
+          if gh issue list --label upstream --state all --limit 500 --json title |
+            jq -e --arg t "$title" 'any(.[]; .title == $t)' >/dev/null; then
+            echo "Issue already exists: $title"
+            exit 0
+          fi
+          gh issue create --label upstream --title "$title" --body-file - <<EOF
+          Chrome $version is the stable release on macOS. The newest bundled profile is \`profiles/chrome-$profile-macos.json\`.
+
+          On a Mac with Chrome $major installed:
+
+          \`\`\`bash
+          pnpm build
+          pnpm profile:new
+          \`\`\`
+
+          \`profile:new\` captures Chrome against local fixtures, writes \`profiles/chrome-$major-macos.json\` and the references in \`fixtures/references/chrome$major/\`, and qualifies them. Commit those with the regenerated docs (\`pnpm docs:llms\`).
+          EOF
+
+  prepare:
+    name: prepare (${{ matrix.update.id }})
+    needs: check
+    if: needs.check.outputs.updates != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        update: ${{ fromJSON(needs.check.outputs.updates) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm install --global pnpm@${{ env.PNPM_VERSION }}
+      - run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+      - run: pnpm install --frozen-lockfile
+      # A patch that no longer applies is reported as an issue, not a failed run.
+      - id: upgrade
+        continue-on-error: true
+        env:
+          ARGS: ${{ matrix.update.args }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/upstream"
+          # ARGS holds "<crate> <version|rev>" pairs.
+          # shellcheck disable=SC2086
+          node scripts/upgrade-vendor.mjs --summary "$RUNNER_TEMP/upstream/summary.json" $ARGS 2>&1 |
+            tee "$RUNNER_TEMP/upstream/upgrade.log"
+      - if: steps.upgrade.outcome == 'success'
+        run: |
+          git add --all
+          git diff --cached --binary > "$RUNNER_TEMP/upstream/change.patch"
+          git diff --cached --stat
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-${{ matrix.update.id }}-prepare
+          path: ${{ runner.temp }}/upstream
+          retention-days: 14
+
+  verify:
+    name: verify (${{ matrix.update.id }}, ${{ matrix.platform.target }})
+    needs: [check, prepare]
+    if: ${{ !cancelled() && needs.check.outputs.updates != '[]' }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        update: ${{ fromJSON(needs.check.outputs.updates) }}
+        platform:
+          - { os: macos-26, target: darwin-arm64 }
+          - { os: ubuntu-22.04, target: linux-x64 }
+          - { os: windows-2025, target: win32-x64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: |
+          echo "LOGS=$RUNNER_TEMP/upstream-logs" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/upstream-logs"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-${{ matrix.update.id }}-prepare
+          path: ${{ runner.temp }}/prepare
+      - id: apply
+        continue-on-error: true
+        run: |
+          test -s "$RUNNER_TEMP/prepare/change.patch"
+          git apply --binary "$RUNNER_TEMP/prepare/change.patch"
+      - if: steps.apply.outcome == 'success'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - if: steps.apply.outcome == 'success'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - if: steps.apply.outcome == 'success'
+        run: |
+          npm install --global pnpm@${{ env.PNPM_VERSION }}
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --component rustfmt --component clippy
+      # Restore only: caches are saved by ci.yml on main.
+      - if: steps.apply.outcome == 'success'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.platform.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'vendor/**/Cargo.toml') }}
+          restore-keys: cargo-${{ matrix.platform.os }}-
+      - id: build
+        if: steps.apply.outcome == 'success'
+        continue-on-error: true
+        run: |
+          { pnpm install --frozen-lockfile && pnpm build; } 2>&1 | tee "$LOGS/build.log"
+      - id: check
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: pnpm check 2>&1 | tee "$LOGS/check.log"
+      - id: transport
+        if: steps.build.outcome == 'success' && runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          { pnpm test:transport && node scripts/notices.mjs --check; } 2>&1 | tee "$LOGS/transport.log"
+      # Qualification drives the installed Chrome and needs the exact version the newest
+      # profile was captured from.
+      - id: chrome
+        if: steps.build.outcome == 'success' && runner.os == 'macOS'
+        run: |
+          node --input-type=module -e "
+            import { execFileSync } from 'node:child_process';
+            import { readFileSync } from 'node:fs';
+            import { latestChrome } from './scripts/profile-catalog.mjs';
+            const wanted = JSON.parse(readFileSync(latestChrome().path, 'utf8')).target.version;
+            let installed = 'none';
+            try {
+              installed = execFileSync('defaults', ['read', '/Applications/Google Chrome.app/Contents/Info', 'CFBundleShortVersionString'], { encoding: 'utf8' }).trim();
+            } catch {}
+            console.log(installed === wanted ? 'match=true' : 'match=false\nnote=runner Chrome ' + installed + ', profile ' + wanted);
+          " | tee -a "$GITHUB_OUTPUT"
+      - id: qualify
+        if: steps.chrome.outputs.match == 'true'
+        continue-on-error: true
+        run: pnpm profile:qualify 2>&1 | tee "$LOGS/qualify.log"
+      - if: always()
+        env:
+          TARGET: ${{ matrix.platform.target }}
+          APPLY: ${{ steps.apply.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          CHECK: ${{ steps.check.outcome }}
+          TRANSPORT: ${{ steps.transport.outcome }}
+          QUALIFY: ${{ steps.qualify.outcome }}
+          QUALIFY_NOTE: ${{ steps.chrome.outputs.note }}
+        run: |
+          node -e "
+            const e = process.env;
+            const steps = [
+              { name: 'apply', outcome: e.APPLY },
+              { name: 'build', outcome: e.BUILD, log: 'build.log' },
+              { name: 'check', outcome: e.CHECK, log: 'check.log' },
+              { name: 'transport', outcome: e.TRANSPORT, log: 'transport.log' },
+              { name: 'qualify', outcome: e.QUALIFY, log: 'qualify.log', note: e.QUALIFY_NOTE || undefined },
+            ].filter((s) => s.outcome !== 'skipped' || s.note);
+            require('node:fs').writeFileSync(process.env.LOGS + '/status.json', JSON.stringify({ target: e.TARGET, steps }, null, 2));
+          "
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-${{ matrix.update.id }}-${{ matrix.platform.target }}
+          path: ${{ env.LOGS }}
+          retention-days: 14
+
+  report:
+    name: report (${{ matrix.update.id }})
+    needs: [check, prepare, verify]
+    if: ${{ !cancelled() && needs.check.outputs.updates != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        update: ${{ fromJSON(needs.check.outputs.updates) }}
+    env:
+      # A token other than GITHUB_TOKEN lets the pushed branch trigger ci.yml on the PR.
+      GH_TOKEN: ${{ secrets.UPSTREAM_TOKEN || github.token }}
+      UPDATE: ${{ toJSON(matrix.update) }}
+      ID: ${{ matrix.update.id }}
+      KEY: ${{ matrix.update.key }}
+      BRANCH: ${{ matrix.update.branch }}
+      TITLE: ${{ matrix.update.title }}
+      BASE: ${{ github.event.repository.default_branch }}
+      BASE_SHA: ${{ github.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          token: ${{ secrets.UPSTREAM_TOKEN || github.token }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: upstream-${{ matrix.update.id }}-*
+          path: ${{ runner.temp }}/artifacts
+      - id: render
+        run: |
+          cd "$RUNNER_TEMP/artifacts"
+          for dir in upstream-"$ID"-*; do mv "$dir" "${dir#upstream-"$ID"-}"; done
+          cd "$GITHUB_WORKSPACE"
+          ok=$(node scripts/upstream-report.mjs "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/body.md" | jq -r .ok)
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/body.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Open or update the pull request
+        if: steps.render.outputs.ok == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch --create "$BRANCH"
+          git apply --binary --index "$RUNNER_TEMP/artifacts/prepare/change.patch"
+          git commit --quiet --message "$TITLE" --message "Automated by .github/workflows/upstream.yml: $RUN_URL"
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --base "$BASE" --head "$BRANCH" --label upstream --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+            number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          fi
+          # This update's failure issue and older updates of the same crate are done.
+          gh issue list --label upstream --state open --limit 500 --json number,body |
+            jq -r --arg key "<!-- upstream-key: $KEY -->" '.[] | select(.body | contains($key)) | .number' |
+            while read -r issue; do gh issue close "$issue" --comment "Superseded by #$number."; done
+          gh pr list --label upstream --state open --limit 500 --json number,body,headRefName |
+            jq -r --arg key "<!-- upstream-key: $KEY -->" --arg branch "$BRANCH" \
+              '.[] | select((.body | contains($key)) and .headRefName != $branch) | .number' |
+            while read -r pr; do gh pr close "$pr" --delete-branch --comment "Superseded by #$number."; done
+      - name: Open or update the issue
+        if: steps.render.outputs.ok != 'true'
+        run: |
+          title="Upstream update needs work: ${TITLE#Update }"
+          number=$(gh issue list --label upstream --state open --limit 500 --json number,body |
+            jq -r --arg id "<!-- upstream-id: $ID -->" '[.[] | select(.body | contains($id))][0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+            gh issue comment "$number" --body "Retried in $RUN_URL; still failing."
+          else
+            gh issue create --label upstream --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          fi
+          # Failures of older versions of the same crate are superseded by this one.
+          gh issue list --label upstream --state open --limit 500 --json number,body |
+            jq -r --arg key "<!-- upstream-key: $KEY -->" --arg id "<!-- upstream-id: $ID -->" \
+              '.[] | select((.body | contains($key)) and (.body | contains($id) | not)) | .number' |
+            while read -r issue; do gh issue close "$issue" --reason "not planned" --comment "Superseded by the issue for $ID."; done
