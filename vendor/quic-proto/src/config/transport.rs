@@ -43,6 +43,7 @@ pub struct TransportConfig {
     pub(crate) pad_to_mtu: bool,
     pub(crate) initial_chaos_protection: bool,
     pub(crate) shared_packet_numbers: bool,
+    pub(crate) chromium_sending: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
     pub(crate) max_outgoing_bytes_per_second: Option<u64>,
 
@@ -273,6 +274,17 @@ impl TransportConfig {
         self
     }
 
+    /// Recovers lost handshake packets and lays out handshake datagrams as a Chromium client
+    ///
+    /// When a probe timeout fires, one packet number is skipped, and the probes resend only
+    /// packets that were in flight when it fired, so a probe never repeats another probe. A
+    /// client's Initial packet fills its datagram alone, and a Handshake ACK goes out on its
+    /// own before the client's Handshake CRYPTO data. Defaults to `false`.
+    pub fn chromium_sending(&mut self, value: bool) -> &mut Self {
+        self.chromium_sending = value;
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -447,6 +459,7 @@ impl Default for TransportConfig {
             pad_to_mtu: false,
             initial_chaos_protection: false,
             shared_packet_numbers: false,
+            chromium_sending: false,
             ack_frequency_config: None,
             max_outgoing_bytes_per_second: None,
 
@@ -490,6 +503,7 @@ impl fmt::Debug for TransportConfig {
             pad_to_mtu,
             initial_chaos_protection,
             shared_packet_numbers,
+            chromium_sending,
             ack_frequency_config,
             max_outgoing_bytes_per_second,
             persistent_congestion_threshold,
@@ -524,6 +538,7 @@ impl fmt::Debug for TransportConfig {
             .field("pad_to_mtu", pad_to_mtu)
             .field("initial_chaos_protection", initial_chaos_protection)
             .field("shared_packet_numbers", shared_packet_numbers)
+            .field("chromium_sending", chromium_sending)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "max_outgoing_bytes_per_second",
