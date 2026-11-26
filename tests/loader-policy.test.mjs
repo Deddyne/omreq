@@ -183,7 +183,7 @@ test('T21/T24: malformed native manifests produce structured mismatch errors in 
     engineBuildId: `omreq-engine-sha256:${'0'.repeat(64)}`,
     capabilities: [],
     bundledTrustStores: [],
-    transport: 'wreq/0.16.4',
+    transport: 'wreq/0.16.5',
     tls: 'btls/test',
     boringSslRevision: '0'.repeat(40),
     stage: 'internal-prototype',

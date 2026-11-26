@@ -423,16 +423,14 @@
              enforce_http: false,
              connect_timeout,
              happy_eyeballs_timeout,
-@@ -910,9 +960,85 @@
- 
-     fn ipv6(last: u16) -> SocketAddr {
+@@ -912,6 +962,82 @@
          (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last), 443).into()
-+    }
-+
+     }
+ 
 +    struct SemaphoreObserver {
 +        semaphore: Arc<::tokio::sync::Semaphore>,
 +        reservations: Arc<std::sync::atomic::AtomicUsize>,
-     }
++    }
 +    struct SemaphoreLease(::tokio::sync::OwnedSemaphorePermit);
 +    impl crate::socket::SocketLease for SemaphoreLease {
 +        fn established(&self) { let _ = &self.0; }
@@ -455,8 +453,8 @@
 +        options.connection_origin = Some("https://controlled.test/".parse().unwrap());
 +        (semaphore, reservations)
 +    }
- 
-     #[::tokio::test(start_paused = true)]
++
++    #[::tokio::test(start_paused = true)]
 +    async fn observer_reserves_once_per_logical_connect_before_socket_creation_and_releases_on_timeout() {
 +        let mut options = tcp_options(Some(Duration::from_millis(10)), Some(Duration::from_millis(200)));
 +        let (semaphore, reservations) = observed(2, &mut options);
@@ -505,13 +503,12 @@
 +        assert_eq!(semaphore.available_permits(), 1);
 +    }
 +
-+    #[::tokio::test(start_paused = true)]
+     #[::tokio::test(start_paused = true)]
      async fn races_resolved_addresses_in_order_with_a_bounded_set() {
          let result =
-             connect_with_timeout(std::future::ready(Ok(())), Some(std::future::ready(()))).await;
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -319,6 +319,7 @@
+@@ -321,6 +321,7 @@
  pub mod header;
  pub mod redirect;
  pub mod retry;

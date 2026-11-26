@@ -74,7 +74,7 @@ fn input_err() -> Error {
 }
 #[napi(catch_unwind)]
 pub fn build_info() -> String {
-    serde_json::json!({"version":env!("CARGO_PKG_VERSION"), "bridgeAbi":serde_json::from_str::<serde_json::Value>(include_str!("../../../bridge.json")).expect("bundled bridge version")["abi"],"nodeApi":8,"engineBuildId":BUILD_ID,"capabilities":CAPABILITIES,"transport":"wreq/0.16.4", "tls":"btls/0.5.6+3c1dd080ba617d78c63cd09285d2ce31abcdcbf9", "boringSslRevision":"427ec40cc8edc545253289232e885708c409e5ea", "bundledTrustStores":["webpki-root-certs/1.0.12","chromium-roots/0.1.3"], "cookiePslVersion":omreq_core::COOKIE_PSL_VERSION,"stage":"internal-prototype"}).to_string()
+    serde_json::json!({"version":env!("CARGO_PKG_VERSION"), "bridgeAbi":serde_json::from_str::<serde_json::Value>(include_str!("../../../bridge.json")).expect("bundled bridge version")["abi"],"nodeApi":8,"engineBuildId":BUILD_ID,"capabilities":CAPABILITIES,"transport":"wreq/0.16.5", "tls":"btls/0.5.6+3c1dd080ba617d78c63cd09285d2ce31abcdcbf9", "boringSslRevision":"427ec40cc8edc545253289232e885708c409e5ea", "bundledTrustStores":["webpki-root-certs/1.0.12","chromium-roots/0.1.3"], "cookiePslVersion":omreq_core::COOKIE_PSL_VERSION,"stage":"internal-prototype"}).to_string()
 }
 #[napi(catch_unwind)]
 pub fn check_profile(text: String) -> Result<String> {

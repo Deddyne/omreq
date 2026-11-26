@@ -3,10 +3,10 @@
   "packages": [
     {
       "name": "wreq",
-      "version": "0.16.4",
-      "baseRevision": "4ddadc9dded0b3accc3f42600f9aa4ff0e7e88ce",
-      "crateSha256": "b7b694ef977f3cc55d22d4474d765c2ca0b6328123f2927b01aad5570299fcf8",
-      "patch": "patches/wreq-0.16.4.patch",
+      "version": "0.16.5",
+      "baseRevision": "bb52ee29b1a990fdf9b78a3861c2c92a5e90f6d7",
+      "crateSha256": "9bd7407ff4feea0ca2f386fb3e0187314fd93692230487e10ef67933af3e7f57",
+      "patch": "patches/wreq-0.16.5.patch",
       "modifiedFiles": [
         "src/client.rs",
         "src/client/layer/client.rs",
@@ -21,7 +21,7 @@
         "src/util.rs"
       ],
       "baseFiles": {
-        "Cargo.toml": "53f6e0a7adc8cd6bec4d7b46164758727f8e13fe0885a2cd8934e9a614a41a34",
+        "Cargo.toml": "6a1d0ec3758c8c4ec1fb1b0306bb040689aeab2bfe29a7180d358a20eef9701c",
         "LICENSE": "92caec58166a8afc9d5054ba03c96c1c351f4e788bbf647ba058ba0318e9078f",
         "src/client.rs": "84b946c8da952e794af25ff286cf7de858daf022afe4af8332e9b482e4555c9c",
         "src/client/body.rs": "85dfc87881da5d96f3e10a91709e761425f471c7ace04400ae0871c535fea61e",
@@ -69,8 +69,8 @@
         "src/conn/tls_info.rs": "5a1742dee6721062fffb25bfe0ddc0b3607758295bcefe1ca3c27a0f4e73d7c8",
         "src/conn/verbose.rs": "88c7e121bdbf009afff22751beb958fffd5f4bd3f67063401df19ce3f604ec68",
         "src/cookie.rs": "0cb7662d9db3a98a0d8efba9017095e40b90339c533929b8e33378b20eb5caa4",
-        "src/cookie/jar.rs": "b192b5f2137f7d0341bea3cc874e7355a9c49c24142c3d486e285d7690f38d06",
-        "src/cookie/store.rs": "83e7febd7a8e02b490e53a8feadbf257f26d0a18f2b86ad779e6e6a915aae168",
+        "src/cookie/jar.rs": "b201e9d8c6fcfb2a7da8ec8d827fc066e565a4e4f917211edbe348045a82ec3b",
+        "src/cookie/store.rs": "b3135896a15484702cd520a8437051c4a1839195bdcf6a72c187cc1af2e5ddac",
         "src/dns.rs": "0cf00941c0b4739097c1dd8d6ad251c24950cc52b23ed561173fb544f4b282f3",
         "src/dns/gai.rs": "3c6de13b53325af6df9caa4e78019fd959a5e6cc7bfd4fcc15f68f3d100cc0bb",
         "src/dns/gai/compio.rs": "3b44a9b59b72b2105ff939d722d5d05cee92b8a6ef3016eba146b5ce3e7f49ea",
@@ -82,7 +82,7 @@
         "src/group.rs": "3ff28b6ecf4b81f4100897606a154cf0847a3897f9aaa53795aa98a575defe5b",
         "src/header.rs": "e79eddaa937dab00116341211b0ab210b4cfd70a4e73a804c4fba3b306061dda",
         "src/into_uri.rs": "ad8759eb3bce549db25d0695d6ec630ae666ca0c2e3b38f89624c3905f93aea2",
-        "src/lib.rs": "4d441e3bab003e2a08fc5458d62edf326f5e4dac3dc1ef887138bfc606922d19",
+        "src/lib.rs": "4d84ba19027cbac1e62811bcce76d2f955996c3fe7fd422bf9ab98c67caec3cc",
         "src/proxy.rs": "9b5c2e23c33f2a7910f81659207cb45e14737208889cd21db62846ed6266d33c",
         "src/proxy/mac.rs": "f37ddc2ee8705abc65bddd58e70b5debe7d53ab532a25ca7462761a9f4dde6d0",
         "src/proxy/matcher.rs": "47a873fb2f5b94c07c434ddbd321cd6b2fcd2358079d1945258e8b2099ac5100",
@@ -108,7 +108,7 @@
         "src/util.rs": "9c1962729c5f8289d1b85428f2c9dcaca7a8fa97f3fbb8c2a75c167963c112ef"
       },
       "effectiveFiles": {
-        "Cargo.toml": "53f6e0a7adc8cd6bec4d7b46164758727f8e13fe0885a2cd8934e9a614a41a34",
+        "Cargo.toml": "6a1d0ec3758c8c4ec1fb1b0306bb040689aeab2bfe29a7180d358a20eef9701c",
         "LICENSE": "92caec58166a8afc9d5054ba03c96c1c351f4e788bbf647ba058ba0318e9078f",
         "src/client.rs": "2cf72c06be62ce060d19e683efee584f23f12e0387cd6b8365b2b6e93a043dfc",
         "src/client/body.rs": "85dfc87881da5d96f3e10a91709e761425f471c7ace04400ae0871c535fea61e",
@@ -156,8 +156,8 @@
         "src/conn/tls_info.rs": "5a1742dee6721062fffb25bfe0ddc0b3607758295bcefe1ca3c27a0f4e73d7c8",
         "src/conn/verbose.rs": "88c7e121bdbf009afff22751beb958fffd5f4bd3f67063401df19ce3f604ec68",
         "src/cookie.rs": "0cb7662d9db3a98a0d8efba9017095e40b90339c533929b8e33378b20eb5caa4",
-        "src/cookie/jar.rs": "b192b5f2137f7d0341bea3cc874e7355a9c49c24142c3d486e285d7690f38d06",
-        "src/cookie/store.rs": "83e7febd7a8e02b490e53a8feadbf257f26d0a18f2b86ad779e6e6a915aae168",
+        "src/cookie/jar.rs": "b201e9d8c6fcfb2a7da8ec8d827fc066e565a4e4f917211edbe348045a82ec3b",
+        "src/cookie/store.rs": "b3135896a15484702cd520a8437051c4a1839195bdcf6a72c187cc1af2e5ddac",
         "src/dns.rs": "0cf00941c0b4739097c1dd8d6ad251c24950cc52b23ed561173fb544f4b282f3",
         "src/dns/gai.rs": "3c6de13b53325af6df9caa4e78019fd959a5e6cc7bfd4fcc15f68f3d100cc0bb",
         "src/dns/gai/compio.rs": "3b44a9b59b72b2105ff939d722d5d05cee92b8a6ef3016eba146b5ce3e7f49ea",
@@ -169,7 +169,7 @@
         "src/group.rs": "3ff28b6ecf4b81f4100897606a154cf0847a3897f9aaa53795aa98a575defe5b",
         "src/header.rs": "e79eddaa937dab00116341211b0ab210b4cfd70a4e73a804c4fba3b306061dda",
         "src/into_uri.rs": "ad8759eb3bce549db25d0695d6ec630ae666ca0c2e3b38f89624c3905f93aea2",
-        "src/lib.rs": "3f7a94fa49b9d1136dc5c98cb7399df1ab1457829067bcb3a22e6e97ddc39156",
+        "src/lib.rs": "8ac4b4e8022d9eb36d407486a2ed2680a324a6678d1b6d42655c4308b97a5569",
         "src/proxy.rs": "9b5c2e23c33f2a7910f81659207cb45e14737208889cd21db62846ed6266d33c",
         "src/proxy/mac.rs": "f37ddc2ee8705abc65bddd58e70b5debe7d53ab532a25ca7462761a9f4dde6d0",
         "src/proxy/matcher.rs": "47a873fb2f5b94c07c434ddbd321cd6b2fcd2358079d1945258e8b2099ac5100",

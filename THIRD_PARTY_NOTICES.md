@@ -33989,7 +33989,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-## wreq 0.16.4
+## wreq 0.16.5
 
 Declared license: Apache-2.0
 Source: https://github.com/0x676e67/wreq

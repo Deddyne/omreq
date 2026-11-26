@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "base": {
     "crate": "wreq",
-    "version": "0.16.4",
-    "revision": "4ddadc9dded0b3accc3f42600f9aa4ff0e7e88ce",
-    "crateSha256": "b7b694ef977f3cc55d22d4474d765c2ca0b6328123f2927b01aad5570299fcf8"
+    "version": "0.16.5",
+    "revision": "bb52ee29b1a990fdf9b78a3861c2c92a5e90f6d7",
+    "crateSha256": "9bd7407ff4feea0ca2f386fb3e0187314fd93692230487e10ef67933af3e7f57"
   },
   "backports": [
     {
@@ -37,7 +37,7 @@
       "id": "physical-tcp-lifetime-hooks",
       "source": "Omreq implementation over the pinned wreq TCP creation and pool-race paths",
       "crates": [
-        "wreq 0.16.4"
+        "wreq 0.16.5"
       ],
       "reason": "Reserve capacity before every raw TCP socket including Happy Eyeballs attempts, release after raw socket drop and support owner-initiated close. A connect that loses the pool race to an idle connection completes in the background into the pool, marked by socket::is_raced_connect so the owner abandons it while it still waits for capacity instead of leaving an orphaned waiter. Also expose the separate inner reused-connection cancelled-request replay switch so Omreq can disable it alongside the outer retry policy. Upstream defaults remain unchanged without explicit options.",
       "removeWhen": "Qualified upstream exposes equivalent physical socket lifetime hooks and bounded pool-race cancellation, verified by the same socket/resource and wire tests."
@@ -70,7 +70,7 @@
       "id": "shared-happy-eyeballs-reservation",
       "source": "Omreq audit S-01: dual-stack host with a hung IPv6 path under maxConnectionsPerOrigin",
       "crates": [
-        "wreq 0.16.4"
+        "wreq 0.16.5"
       ],
       "reason": "Reserve socket capacity once per logical connect. Happy Eyeballs candidates of the same connect share the reservation, so a fallback never queues behind its own hung first attempt for the only slot. Overcommit is bounded by the parallel-attempt limit; the winning socket keeps the reservation.",
       "regressions": [
@@ -96,7 +96,7 @@
       "id": "btls-quic-interface",
       "source": "https://github.com/0x676e67/btls/commit/3c1dd080ba617d78c63cd09285d2ce31abcdcbf9",
       "crates": [
-        "wreq 0.16.4"
+        "wreq 0.16.5"
       ],
       "reason": "The btls revision with the QUIC TLS interface drops set_aes_hw_override and set_preserve_tls13_cipher_list and adds a parameter to add_application_settings. TLS 1.3 suites from the profile cipher list are set with set_tls13_ciphers in the same order; the TCP ClientHello stays byte-identical to the captured Chrome reference.",
       "regressions": [
